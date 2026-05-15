@@ -1,0 +1,8 @@
+.env
+tenderboard_results.csv
+Tender/Excel Sheets/*.csv
+Tender/Excel Sheets/*.xlsx
+streamlit.err.log
+streamlit.out.log
+__pycache__/
+*.pyc
