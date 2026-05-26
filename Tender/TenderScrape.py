@@ -14,14 +14,22 @@ from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
 try:
-    from TenderProcess import RawTenderResult, TenderResult, clean_value, process_raw_results, save_results
-except ModuleNotFoundError:
-    from Tender.TenderProcess import (
+    from TenderProcess import (
         RawTenderResult,
+        SaveSummary,
         TenderResult,
         clean_value,
         process_raw_results,
-        save_results,
+        save_results_to_database,
+    )
+except ModuleNotFoundError:
+    from Tender.TenderProcess import (
+        RawTenderResult,
+        SaveSummary,
+        TenderResult,
+        clean_value,
+        process_raw_results,
+        save_results_to_database,
     )
 
 
@@ -266,7 +274,7 @@ def scrape_raw_pages(driver: webdriver.Chrome, log_fn: LogFn = log) -> list[RawT
     return raw_results
 
 
-def scrape_tenderboard(headless: bool = False, log_fn: LogFn = log) -> tuple[list[TenderResult], Path]:
+def scrape_tenderboard(headless: bool = False, log_fn: LogFn = log) -> tuple[list[TenderResult], SaveSummary]:
     load_local_env()
 
     username = os.getenv("TENDERBOARD_USERNAME")
@@ -287,9 +295,17 @@ def scrape_tenderboard(headless: bool = False, log_fn: LogFn = log) -> tuple[lis
         log_fn(f"Processing {len(raw_results)} raw rows...")
         results = process_raw_results(raw_results)
 
-        saved_path = save_results(results)
-        log_fn(f"Saved {len(results)} processed rows to {saved_path.resolve()}")
-        return results, saved_path
+        save_summary = save_results_to_database(results)
+        log_fn(
+            f"Database updated at {save_summary.database_path.resolve()} "
+            f"({save_summary.new_count} new, {save_summary.updated_count} updated, "
+            f"{save_summary.database_count} total rows)."
+        )
+        if save_summary.new_output_path is not None:
+            log_fn(f"Saved new rows to {save_summary.new_output_path.resolve()}")
+        else:
+            log_fn("No new rows found, so no dated Excel file was created.")
+        return results, save_summary
     finally:
         driver.quit()
         log_fn("Browser closed.")

@@ -8,8 +8,10 @@ import streamlit as st
 from streamlit.runtime.scriptrunner import get_script_run_ctx
 
 try:
+    from TenderProcess import process_latest_tenderboard_file
     from TenderScrape import log, scrape_tenderboard
 except ModuleNotFoundError:
+    from Tender.TenderProcess import process_latest_tenderboard_file
     from Tender.TenderScrape import log, scrape_tenderboard
 
 
@@ -39,19 +41,45 @@ def render_streamlit_page() -> None:
         ui_log = streamlit_logger(log_box)
         with st.spinner("Logging in, scraping, and processing tender rows..."):
             try:
-                extracted_results, saved_path = scrape_tenderboard(headless=headless, log_fn=ui_log)
+                extracted_results, save_summary = scrape_tenderboard(headless=headless, log_fn=ui_log)
             except Exception as exc:
                 st.exception(exc)
             else:
                 dataframe = pd.DataFrame([result.as_dict() for result in extracted_results])
-                st.success(f"Extracted {len(dataframe)} tender rows and saved {saved_path.name}.")
+                if save_summary.new_output_path is None:
+                    st.success(
+                        f"Extracted {len(dataframe)} tender rows. "
+                        f"No new tenders found. Database has {save_summary.database_count} rows."
+                    )
+                else:
+                    st.success(
+                        f"Extracted {len(dataframe)} tender rows. "
+                        f"Added {save_summary.new_count} new and updated {save_summary.updated_count}. "
+                        f"Saved {save_summary.new_output_path.name}."
+                    )
                 st.dataframe(dataframe, use_container_width=True)
-                st.download_button(
-                    "Download Excel",
-                    saved_path.read_bytes(),
-                    file_name=saved_path.name,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
+                if save_summary.new_output_path is not None:
+                    st.download_button(
+                        "Download New Excel",
+                        save_summary.new_output_path.read_bytes(),
+                        file_name=save_summary.new_output_path.name,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+
+    st.divider()
+    process_latest = st.button("Process latest TenderBoard Excel")
+
+    if process_latest:
+        summary = process_latest_tenderboard_file()
+        if summary.source_path is None:
+            st.info("Nothing is detected.")
+        else:
+            st.success(
+                f"Processed {summary.source_path.name}: "
+                f"{summary.processed_count} accepted, {summary.rejected_count} rejected."
+            )
+            st.write(f"Created {summary.processed_path.name}")
+            st.write(f"Created {summary.rejected_path.name}")
 
 
 def running_inside_streamlit() -> bool:

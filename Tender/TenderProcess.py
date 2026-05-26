@@ -9,6 +9,43 @@ import pandas as pd
 ROOT_DIR = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = ROOT_DIR / "Tender" / "Excel Sheets"
 OUTPUT_NAME = "TenderBoard"
+DATABASE_PATH = OUTPUT_DIR / "Database.xlsx"
+PROCESSED_OUTPUT_NAME = "ProcessedTenderBoard"
+REJECTED_OUTPUT_NAME = "RejectedTenderBoard"
+MIN_DAYS_TO_CLOSE = 14
+
+GROUP_KEYWORDS = [
+    "Coaching",
+    "Consult",
+    "Consultancy",
+    "Contract",
+    "Facilities",
+    "Fitness",
+    "Gym",
+    "lifestyle",
+    "doctor",
+    "pilates",
+    "wellness",
+    "Health",
+    "Healthcare",
+    "Human resource",
+    "Instructor",
+    "Manpower",
+    "Managed services",
+    "Management",
+    "Outsourcing",
+    "Procure",
+    "Procurement",
+    "Provision",
+    "Process",
+    "Recruitment",
+    "Services",
+    "Staff",
+    "Staffing",
+    "Trainer",
+    "Nurse",
+]
+BRIEFING_PATTERN = re.compile(r"\b(briefing|showround|show\s+round)\b", re.IGNORECASE)
 
 CSV_FIELDS = [
     "tender_title",
@@ -19,6 +56,27 @@ CSV_FIELDS = [
     "published_date",
     "closing_date",
 ]
+PROCESSED_FIELDS = CSV_FIELDS + ["duration_days", "keyword_group"]
+REJECTED_FIELDS = PROCESSED_FIELDS + ["rejection_reason"]
+
+
+@dataclass
+class SaveSummary:
+    database_path: Path
+    new_output_path: Path | None
+    scraped_count: int
+    new_count: int
+    updated_count: int
+    database_count: int
+
+
+@dataclass
+class ProcessedTenderSummary:
+    source_path: Path | None
+    processed_path: Path | None
+    rejected_path: Path | None
+    processed_count: int = 0
+    rejected_count: int = 0
 
 
 @dataclass
@@ -54,10 +112,163 @@ def clean_value(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip(" :-\t\r\n")
 
 
-def output_excel_path(name: str = OUTPUT_NAME) -> Path:
+def clean_dataframe(dataframe: pd.DataFrame) -> pd.DataFrame:
+    dataframe = dataframe.copy()
+
+    for field in CSV_FIELDS:
+        if field not in dataframe.columns:
+            dataframe[field] = ""
+
+    dataframe = dataframe[CSV_FIELDS]
+    dataframe = dataframe.fillna("")
+    for field in CSV_FIELDS:
+        dataframe[field] = dataframe[field].map(clean_value)
+
+    return dataframe
+
+
+def tender_identity(row: pd.Series | dict[str, str]) -> str:
+    tender_link = clean_value(row.get("tender_link", "")).lower()
+    if tender_link:
+        return f"link:{tender_link.rstrip('/')}"
+
+    reference = clean_value(row.get("tender_reference_number", "")).lower()
+    if reference:
+        return f"reference:{reference}"
+
+    title = clean_value(row.get("tender_title", "")).lower()
+    company = clean_value(row.get("company_organisation_name", "")).lower()
+    closing_date = clean_value(row.get("closing_date", "")).lower()
+    return f"fallback:{title}|{company}|{closing_date}"
+
+
+def output_excel_path(name: str = OUTPUT_NAME, output_dir: Path = OUTPUT_DIR) -> Path:
     timestamp = datetime.now().strftime("%d%H%M")
     safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") or "TenderBoard"
-    return OUTPUT_DIR / f"{timestamp}_{safe_name}.xlsx"
+    return output_dir / f"{timestamp}_{safe_name}.xlsx"
+
+
+def output_excel_path_for_prefix(prefix: str, name: str, output_dir: Path = OUTPUT_DIR) -> Path:
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") or name
+    return output_dir / f"{prefix}_{safe_name}.xlsx"
+
+
+def find_latest_unprocessed_tenderboard(output_dir: Path = OUTPUT_DIR) -> Path | None:
+    if not output_dir.exists():
+        return None
+
+    candidates = []
+    for path in output_dir.glob("*_TenderBoard.xlsx"):
+        name_lower = path.name.lower()
+        if any(blocked in name_lower for blocked in ["database", "processed", "rejected"]):
+            continue
+        candidates.append(path)
+
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def parse_tender_date(value: str) -> datetime | None:
+    value = clean_value(value)
+    if not value:
+        return None
+
+    parsed = pd.to_datetime(value, dayfirst=True, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return parsed.to_pydatetime()
+
+
+def keyword_group(row: pd.Series | dict[str, str]) -> str:
+    searchable_text = " ".join(clean_value(row.get(field, "")) for field in CSV_FIELDS).lower()
+    matches = [keyword for keyword in GROUP_KEYWORDS if keyword.lower() in searchable_text]
+    if not matches:
+        return ""
+    return sorted(matches, key=str.lower)[0]
+
+
+def has_briefing(row: pd.Series | dict[str, str]) -> bool:
+    searchable_text = " ".join(clean_value(row.get(field, "")) for field in CSV_FIELDS)
+    return bool(BRIEFING_PATTERN.search(searchable_text))
+
+
+def process_latest_tenderboard_file(
+    output_dir: Path = OUTPUT_DIR,
+    today: datetime | None = None,
+) -> ProcessedTenderSummary:
+    source_path = find_latest_unprocessed_tenderboard(output_dir=output_dir)
+    if source_path is None:
+        return ProcessedTenderSummary(
+            source_path=None,
+            processed_path=None,
+            rejected_path=None,
+        )
+
+    today = today or datetime.now()
+    today_start = datetime(today.year, today.month, today.day)
+    source_dataframe = clean_dataframe(pd.read_excel(source_path))
+
+    processed_rows: list[dict[str, str | int]] = []
+    rejected_rows: list[dict[str, str | int]] = []
+
+    for row in source_dataframe.to_dict("records"):
+        closing_date = parse_tender_date(row.get("closing_date", ""))
+        duration_days = (closing_date - today_start).days if closing_date else ""
+        reasons: list[str] = []
+
+        if closing_date is None:
+            reasons.append("Missing or unreadable closing date")
+        elif duration_days < MIN_DAYS_TO_CLOSE:
+            reasons.append(f"Less than {MIN_DAYS_TO_CLOSE} days to closing")
+
+        if has_briefing(row):
+            reasons.append("Tender has briefing/showround")
+
+        enriched_row = {
+            **row,
+            "duration_days": duration_days,
+            "keyword_group": keyword_group(row),
+        }
+
+        if reasons:
+            rejected_rows.append({**enriched_row, "rejection_reason": "; ".join(reasons)})
+        else:
+            processed_rows.append(enriched_row)
+
+    processed_dataframe = pd.DataFrame(processed_rows, columns=PROCESSED_FIELDS)
+    rejected_dataframe = pd.DataFrame(rejected_rows, columns=REJECTED_FIELDS)
+
+    sort_columns = ["duration_days"]
+    if not processed_dataframe.empty:
+        processed_dataframe = processed_dataframe.sort_values(
+            by=sort_columns,
+            ascending=[False],
+            kind="stable",
+        )
+    if not rejected_dataframe.empty:
+        rejected_dataframe = rejected_dataframe.sort_values(
+            by=sort_columns,
+            ascending=[False],
+            kind="stable",
+        )
+
+    prefix = source_path.name.split("_", 1)[0]
+    processed_path = output_excel_path_for_prefix(prefix, PROCESSED_OUTPUT_NAME, output_dir=source_path.parent)
+    rejected_path = output_excel_path_for_prefix(prefix, REJECTED_OUTPUT_NAME, output_dir=source_path.parent)
+
+    processed_dataframe.to_excel(processed_path, index=False)
+    rejected_dataframe.to_excel(rejected_path, index=False)
+    source_path.unlink()
+
+    return ProcessedTenderSummary(
+        source_path=source_path,
+        processed_path=processed_path,
+        rejected_path=rejected_path,
+        processed_count=len(processed_dataframe),
+        rejected_count=len(rejected_dataframe),
+    )
 
 
 def parse_date_range(text: str) -> tuple[str, str]:
@@ -257,6 +468,68 @@ def save_results(results: list[TenderResult], output_path: Path | None = None) -
     dataframe = pd.DataFrame([result.as_dict() for result in results], columns=CSV_FIELDS)
     dataframe.to_excel(output_path, index=False)
     return output_path
+
+
+def save_results_to_database(
+    results: list[TenderResult],
+    database_path: Path = DATABASE_PATH,
+) -> SaveSummary:
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+
+    scraped_dataframe = clean_dataframe(pd.DataFrame([result.as_dict() for result in results]))
+    if database_path.exists():
+        database_dataframe = clean_dataframe(pd.read_excel(database_path))
+    else:
+        database_dataframe = clean_dataframe(pd.DataFrame(columns=CSV_FIELDS))
+
+    database_rows = database_dataframe.to_dict("records")
+    row_indexes_by_key = {
+        tender_identity(row): index
+        for index, row in enumerate(database_rows)
+        if tender_identity(row) != "fallback:||"
+    }
+
+    new_rows: list[dict[str, str]] = []
+    updated_count = 0
+
+    for row in scraped_dataframe.to_dict("records"):
+        key = tender_identity(row)
+        existing_index = row_indexes_by_key.get(key)
+
+        if existing_index is None:
+            row_indexes_by_key[key] = len(database_rows)
+            database_rows.append(row)
+            new_rows.append(row)
+            continue
+
+        existing_row = database_rows[existing_index]
+        merged_row = {
+            field: clean_value(row.get(field, "")) or clean_value(existing_row.get(field, ""))
+            for field in CSV_FIELDS
+        }
+        if merged_row != existing_row:
+            database_rows[existing_index] = merged_row
+            updated_count += 1
+
+    merged_database = clean_dataframe(pd.DataFrame(database_rows, columns=CSV_FIELDS))
+    merged_database.to_excel(database_path, index=False)
+
+    new_output_path = None
+    if new_rows:
+        new_output_path = output_excel_path(output_dir=database_path.parent)
+        clean_dataframe(pd.DataFrame(new_rows, columns=CSV_FIELDS)).to_excel(
+            new_output_path,
+            index=False,
+        )
+
+    return SaveSummary(
+        database_path=database_path,
+        new_output_path=new_output_path,
+        scraped_count=len(scraped_dataframe),
+        new_count=len(new_rows),
+        updated_count=updated_count,
+        database_count=len(merged_database),
+    )
 
 
 def main() -> None:
