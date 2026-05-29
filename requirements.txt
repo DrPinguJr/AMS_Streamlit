@@ -4,3 +4,4 @@ webdriver-manager>=4.0
 beautifulsoup4>=4.12
 pandas>=2.2
 openpyxl>=3.1
+python-docx>=1.1

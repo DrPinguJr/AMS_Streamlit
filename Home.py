@@ -8,6 +8,7 @@ st.subheader("Projects")
 
 st.page_link("Tender/Tender.py", label="TenderBoard Scraper", icon=":material/search:")
 st.page_link("Sesami/Sesami.py", label="Sesami Scraper", icon=":material/business_center:")
+st.page_link("pages/Recruitment_Tracker.py", label="Recruitment Tracker", icon=":material/groups:")
 
 st.divider()
 
