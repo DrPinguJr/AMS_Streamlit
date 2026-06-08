@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import html
 import os
 import platform
 import re
 import subprocess
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+import xml.etree.ElementTree as ET
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import PatternFill
 
@@ -365,21 +370,50 @@ def preview_pdf(path: Path, height: int = 560) -> None:
 
 
 def preview_docx_text(path: Path) -> None:
+    def render_text(text: str) -> None:
+        if text.strip():
+            st.text_area("Text preview", text[:8000], height=360, disabled=True)
+        else:
+            st.info("No readable text found in this DOCX file.")
+
     try:
         import docx  # type: ignore
     except Exception:
-        st.info("DOCX text preview is unavailable because python-docx is not installed.")
+        fallback_text = extract_docx_text_fallback(path)
+        if fallback_text:
+            render_text(fallback_text)
+        else:
+            st.info("DOCX text preview is unavailable because python-docx is not installed.")
         return
 
     try:
         document = docx.Document(path)
         text = "\n".join(p.text for p in document.paragraphs if p.text.strip())
-        if text:
-            st.text_area("Text preview", text[:8000], height=360, disabled=True)
-        else:
-            st.info("No readable text found in this DOCX file.")
+        render_text(text)
     except Exception as exc:
-        st.warning(f"DOCX preview failed: {exc}")
+        fallback_text = extract_docx_text_fallback(path)
+        if fallback_text:
+            st.info("Standard DOCX preview had trouble with this file, so a fallback text preview is shown.")
+            render_text(fallback_text)
+        else:
+            st.warning(f"DOCX preview failed: {exc}")
+
+
+def extract_docx_text_fallback(path: Path) -> str:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            xml_bytes = archive.read("word/document.xml")
+        root = ET.fromstring(xml_bytes)
+        namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        paragraphs = []
+        for paragraph in root.findall(".//w:p", namespace):
+            parts = [node.text or "" for node in paragraph.findall(".//w:t", namespace)]
+            line = "".join(parts).strip()
+            if line:
+                paragraphs.append(line)
+        return "\n".join(paragraphs)
+    except Exception:
+        return ""
 
 
 def preview_image(path: Path) -> None:
@@ -387,6 +421,22 @@ def preview_image(path: Path) -> None:
         st.image(str(path), use_container_width=True)
     except Exception as exc:
         st.warning(f"Image preview failed: {exc}")
+
+
+def preview_text_file(path: Path) -> None:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        st.text_area("Text preview", text[:12000], height=360, disabled=True)
+    except Exception as exc:
+        st.warning(f"Text preview failed: {exc}")
+
+
+def preview_spreadsheet(path: Path) -> None:
+    try:
+        df = pd.read_excel(path, nrows=100)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+    except Exception as exc:
+        st.info(f"Spreadsheet preview is not available for this file. Use Open or Download. Details: {exc}")
 
 
 def render_file_viewer(
@@ -412,17 +462,32 @@ def render_file_viewer(
         ok, message = open_local_file(path)
         (st.success if ok else st.error)(message)
 
+    download_key = f"download_{key_prefix}_{label}_{relative_path}".replace("/", "_").replace("\\", "_")
+    try:
+        st.download_button(
+            f"Download {label}",
+            data=path.read_bytes(),
+            file_name=path.name,
+            key=download_key,
+        )
+    except Exception as exc:
+        st.warning(f"Download is unavailable: {exc}")
+
     suffix = path.suffix.lower()
     if suffix == ".pdf":
         preview_pdf(path)
     elif suffix == ".docx":
         preview_docx_text(path)
     elif suffix == ".doc":
-        st.info("DOC preview is not available in Streamlit. Use the open button.")
-    elif suffix in {".png", ".jpg", ".jpeg"}:
+        st.info("Legacy DOC preview is not available in Streamlit. Use Open or Download.")
+    elif suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}:
         preview_image(path)
+    elif suffix in {".txt", ".csv", ".md", ".rtf", ".json", ".xml"}:
+        preview_text_file(path)
+    elif suffix in {".xlsx", ".xlsm", ".xls"}:
+        preview_spreadsheet(path)
     else:
-        st.info("Preview is not available for this file type.")
+        st.info(f"No inline preview is available for `{suffix or 'this file type'}`. Use Open or Download.")
 
 
 def get_active_roles(roles_df: pd.DataFrame) -> pd.DataFrame:
@@ -521,6 +586,68 @@ def format_candidates_tab_copy(candidates: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
+def render_copy_text_button(text: str, label: str = "Copy entire text", height: int = 44) -> None:
+    encoded_text = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    button_label = html.escape(label)
+    components.html(
+        f"""
+        <button id="copy-btn" type="button">{button_label}</button>
+        <span id="copy-status" aria-live="polite"></span>
+        <script>
+        const text = new TextDecoder().decode(
+            Uint8Array.from(atob("{encoded_text}"), c => c.charCodeAt(0))
+        );
+        const button = document.getElementById("copy-btn");
+        const status = document.getElementById("copy-status");
+        button.addEventListener("click", async () => {{
+            try {{
+                await navigator.clipboard.writeText(text);
+                status.textContent = "Copied";
+            }} catch (error) {{
+                const helper = document.createElement("textarea");
+                helper.value = text;
+                helper.style.position = "fixed";
+                helper.style.opacity = "0";
+                document.body.appendChild(helper);
+                helper.focus();
+                helper.select();
+                const copied = document.execCommand("copy");
+                helper.remove();
+                status.textContent = copied ? "Copied" : "Press Ctrl+C in the text box";
+            }}
+            window.setTimeout(() => status.textContent = "", 1800);
+        }});
+        </script>
+        <style>
+        body {{
+            margin: 0;
+            font-family: "Source Sans Pro", sans-serif;
+        }}
+        #copy-btn {{
+            border: 1px solid rgba(49, 51, 63, 0.2);
+            border-radius: 6px;
+            background: rgb(255, 255, 255);
+            color: rgb(49, 51, 63);
+            cursor: pointer;
+            font-size: 14px;
+            min-height: 38px;
+            padding: 0 14px;
+        }}
+        #copy-btn:hover {{
+            border-color: rgb(255, 75, 75);
+            color: rgb(255, 75, 75);
+        }}
+        #copy-status {{
+            color: rgb(9, 171, 59);
+            font-size: 13px;
+            margin-left: 10px;
+        }}
+        </style>
+        """,
+        height=height,
+    )
+
+
 def render_role_management() -> None:
     roles_df = load_roles()
     st.header("Role Management")
@@ -530,7 +657,6 @@ def render_role_management() -> None:
             role_name = st.text_input("Role Name")
             jd_file = st.file_uploader(
                 "JD upload file",
-                type=["pdf", "docx", "doc", "png"],
                 accept_multiple_files=False,
             )
             update_existing = st.checkbox("Update existing role")
@@ -639,7 +765,7 @@ def render_add_candidate() -> None:
         name = st.text_input("Name")
         contact = st.text_input("Contact")
         remarks = st.text_area("Remarks")
-        resume_file = st.file_uploader("Resume uploader", type=["pdf", "docx", "doc", "png"])
+        resume_file = st.file_uploader("Resume uploader")
         update_existing = st.checkbox("Update existing candidate instead")
         submitted = st.form_submit_button("Add Candidate")
 
@@ -738,128 +864,134 @@ def render_candidate_tracker() -> None:
         selected_id = visible_ids[0]
         st.session_state["selected_candidate_id"] = selected_id
 
-    left, right = st.columns([1.05, 1.25], gap="large")
-    with left:
-        st.subheader("Candidates")
-        st.caption(f"Showing {len(filtered_df)} of {len(candidates_df)} candidates")
+    selected_export_ids = [
+        candidate_id
+        for candidate_id in candidates_df["CandidateID"].tolist()
+        if st.session_state.get(f"select_candidate_{candidate_id}", False)
+    ]
+    selected_export_df = candidates_df[candidates_df["CandidateID"].isin(selected_export_ids)].copy()
+    selected_copy_text = format_candidates_tab_copy(selected_export_df)
 
-        if filtered_df.empty:
-            st.info("No candidates match the current filters.")
+    st.subheader("Actions")
+    action_cols = st.columns([1, 1, 1.4, 1, 1, 1], vertical_alignment="center")
+    if action_cols[0].button("Select visible", key="select_visible_candidates", disabled=filtered_df.empty):
+        for candidate_id in filtered_df["CandidateID"].tolist():
+            st.session_state[f"select_candidate_{candidate_id}"] = True
+        st.rerun()
+    if action_cols[1].button("Clear selected", key="clear_selected_candidates", disabled=not selected_export_ids):
+        for candidate_id in candidates_df["CandidateID"].tolist():
+            st.session_state[f"select_candidate_{candidate_id}"] = False
+        st.rerun()
+    with action_cols[2]:
+        if selected_export_df.empty:
+            st.caption("Select candidates to copy")
         else:
-            select_actions = st.columns([1, 1, 2])
-            if select_actions[0].button("Select visible", key="select_visible_candidates"):
-                for candidate_id in filtered_df["CandidateID"].tolist():
-                    st.session_state[f"select_candidate_{candidate_id}"] = True
-                st.rerun()
-            if select_actions[1].button("Clear selected", key="clear_selected_candidates"):
-                for candidate_id in candidates_df["CandidateID"].tolist():
-                    st.session_state[f"select_candidate_{candidate_id}"] = False
-                st.rerun()
+            render_copy_text_button(selected_copy_text)
+    if action_cols[3].button("Export CSV", disabled=selected_export_df.empty):
+        path = export_dataframe(selected_export_df, "selected_candidates", "csv")
+        st.success(f"Exported to {path}")
+    if action_cols[4].button("Export Excel", disabled=selected_export_df.empty):
+        path = export_dataframe(selected_export_df, "selected_candidates", "xlsx")
+        st.success(f"Exported to {path}")
+    if action_cols[5].button("Export filtered", disabled=filtered_df.empty):
+        path = export_dataframe(filtered_df, "filtered_candidates", "csv")
+        st.success(f"Exported to {path}")
 
-            header = st.columns([0.55, 1.2, 1, 2.2, 0.65])
-            header[0].markdown("**Select**")
-            header[1].markdown("**Name**")
-            header[2].markdown("**Contact**")
-            header[3].markdown("**Remarks**")
-            header[4].markdown("**Open**")
-            st.divider()
-
-            for _, row in filtered_df.iterrows():
-                is_selected = row["CandidateID"] == st.session_state.get("selected_candidate_id", "")
-                marker = "**" if is_selected else ""
-                remarks = row["Remarks"].strip() or "-"
-                if len(remarks) > 95:
-                    remarks = f"{remarks[:92]}..."
-
-                row_cols = st.columns([0.55, 1.2, 1, 2.2, 0.65], vertical_alignment="center")
-                row_cols[0].checkbox(
-                    "Select candidate",
-                    key=f"select_candidate_{row['CandidateID']}",
-                    label_visibility="collapsed",
-                )
-                row_cols[1].markdown(f"{marker}{row['Name'] or '-'}{marker}")
-                row_cols[2].markdown(f"{marker}{row['Contact'] or '-'}{marker}")
-                row_cols[3].caption(remarks)
-                if row_cols[4].button("Open", key=f"open_candidate_{row['CandidateID']}"):
-                    st.session_state["selected_candidate_id"] = row["CandidateID"]
-                    st.rerun()
-
-        selected_export_ids = [
-            candidate_id
-            for candidate_id in candidates_df["CandidateID"].tolist()
-            if st.session_state.get(f"select_candidate_{candidate_id}", False)
-        ]
-        selected_export_df = candidates_df[candidates_df["CandidateID"].isin(selected_export_ids)].copy()
-        st.caption(f"{len(selected_export_df)} candidate(s) selected for export")
-
-        with st.expander("Copy selected candidates", expanded=not selected_export_df.empty):
-            if selected_export_df.empty:
-                st.info("Tick one or more candidates to build a copy-ready list.")
-            else:
-                st.caption("Tab-separated format: Name, Contact, Remarks. Click inside, press Ctrl+A, then Ctrl+C.")
-                st.text_area(
-                    "Selected candidates copy text",
-                    value=format_candidates_tab_copy(selected_export_df),
-                    height=max(90, min(260, 46 * len(selected_export_df))),
-                    key="selected_candidates_tab_copy",
-                    label_visibility="collapsed",
-                )
-
-        export_col1, export_col2, export_col3 = st.columns(3)
-        with export_col1:
-            if st.button("Export selected CSV", disabled=selected_export_df.empty):
-                path = export_dataframe(selected_export_df, "selected_candidates", "csv")
-                st.success(f"Exported to {path}")
-        with export_col2:
-            if st.button("Export selected Excel", disabled=selected_export_df.empty):
-                path = export_dataframe(selected_export_df, "selected_candidates", "xlsx")
-                st.success(f"Exported to {path}")
-        with export_col3:
-            if st.button("Export filtered CSV", disabled=filtered_df.empty):
-                path = export_dataframe(filtered_df, "filtered_candidates", "csv")
-                st.success(f"Exported to {path}")
-
-        with st.expander("Export by selected role/JD", expanded=False):
-            role_export_options = {
-                f"{row['RoleName']} | JD: {row['JDFileName'] or 'No JD attached'}": row["RoleID"]
-                for _, row in roles_df.iterrows()
-            }
-            selected_role_labels = st.multiselect(
-                "Select roles/JDs to export candidates for",
-                list(role_export_options.keys()),
+    st.caption(f"{len(selected_export_df)} candidate(s) selected")
+    if not selected_export_df.empty:
+        selected_signature = hashlib.md5("|".join(selected_export_ids).encode("utf-8")).hexdigest()
+        with st.expander("Selected copy text", expanded=True):
+            st.text_area(
+                "Selected candidates copy text",
+                value=selected_copy_text,
+                height=max(90, min(260, 46 * len(selected_export_df))),
+                key=f"selected_candidates_tab_copy_{selected_signature}",
+                label_visibility="collapsed",
             )
-            selected_role_ids = [role_export_options[label] for label in selected_role_labels]
-            role_export_df = candidates_df[candidates_df["RoleID"].isin(selected_role_ids)].copy()
-            st.caption(f"{len(role_export_df)} candidate(s) match selected role/JD choice")
-            role_export_cols = st.columns(2)
-            if role_export_cols[0].button("Export role/JD CSV", disabled=role_export_df.empty):
-                path = export_dataframe(role_export_df, "role_jd_candidates", "csv")
-                st.success(f"Exported to {path}")
-            if role_export_cols[1].button("Export role/JD Excel", disabled=role_export_df.empty):
-                path = export_dataframe(role_export_df, "role_jd_candidates", "xlsx")
-                st.success(f"Exported to {path}")
 
-    with right:
-        st.subheader("Selected candidate")
-        selected_id = st.session_state.get("selected_candidate_id", "")
-        selected_rows = candidates_df[candidates_df["CandidateID"] == selected_id]
-        if filtered_df.empty or selected_rows.empty:
-            st.info("No candidate selected.")
-            return
+    st.subheader("Candidates")
+    st.caption(f"Showing {len(filtered_df)} of {len(candidates_df)} candidates")
 
-        selected = selected_rows.iloc[0]
-
-        st.markdown(f"**{selected['Name']}**")
-        detail_cols = st.columns(2)
-        detail_cols[0].write(f"Contact: {selected['Contact']}")
-        detail_cols[1].write(f"Role: {selected['Role']}")
-        detail_cols[0].write(f"Platform: {selected['Platform']}")
-        detail_cols[1].write(f"Candidate ID: {selected['CandidateID']}")
-        detail_cols[0].write(f"Date added: {selected['DateAdded'] or '-'}")
-        detail_cols[1].write(f"Last updated: {selected['LastUpdated'] or '-'}")
-
+    if filtered_df.empty:
+        st.info("No candidates match the current filters.")
+    else:
+        header = st.columns([0.45, 1.35, 1.05, 2.4, 0.65])
+        header[0].markdown("**Select**")
+        header[1].markdown("**Name**")
+        header[2].markdown("**Contact**")
+        header[3].markdown("**Remarks**")
+        header[4].markdown("**Open**")
         st.divider()
-        st.markdown("**Update candidate**")
+
+        for _, row in filtered_df.iterrows():
+            is_selected = row["CandidateID"] == st.session_state.get("selected_candidate_id", "")
+            marker = "**" if is_selected else ""
+            remarks = row["Remarks"].strip() or "-"
+            if len(remarks) > 120:
+                remarks = f"{remarks[:117]}..."
+
+            row_cols = st.columns([0.45, 1.35, 1.05, 2.4, 0.65], vertical_alignment="center")
+            row_cols[0].checkbox(
+                "Select candidate",
+                key=f"select_candidate_{row['CandidateID']}",
+                label_visibility="collapsed",
+            )
+            row_cols[1].markdown(f"{marker}{row['Name'] or '-'}{marker}")
+            row_cols[2].markdown(f"{marker}{row['Contact'] or '-'}{marker}")
+            row_cols[3].caption(remarks)
+            if row_cols[4].button("Open", key=f"open_candidate_{row['CandidateID']}"):
+                st.session_state["selected_candidate_id"] = row["CandidateID"]
+                st.rerun()
+
+    with st.expander("Export by selected role/JD", expanded=False):
+        role_export_options = {
+            f"{row['RoleName']} | JD: {row['JDFileName'] or 'No JD attached'}": row["RoleID"]
+            for _, row in roles_df.iterrows()
+        }
+        selected_role_labels = st.multiselect(
+            "Select roles/JDs to export candidates for",
+            list(role_export_options.keys()),
+        )
+        selected_role_ids = [role_export_options[label] for label in selected_role_labels]
+        role_export_df = candidates_df[candidates_df["RoleID"].isin(selected_role_ids)].copy()
+        st.caption(f"{len(role_export_df)} candidate(s) match selected role/JD choice")
+        role_export_cols = st.columns(2)
+        if role_export_cols[0].button("Export role/JD CSV", disabled=role_export_df.empty):
+            path = export_dataframe(role_export_df, "role_jd_candidates", "csv")
+            st.success(f"Exported to {path}")
+        if role_export_cols[1].button("Export role/JD Excel", disabled=role_export_df.empty):
+            path = export_dataframe(role_export_df, "role_jd_candidates", "xlsx")
+            st.success(f"Exported to {path}")
+
+    selected_id = st.session_state.get("selected_candidate_id", "")
+    selected_rows = candidates_df[candidates_df["CandidateID"] == selected_id]
+    if filtered_df.empty or selected_rows.empty:
+        st.info("No candidate selected.")
+        return
+
+    selected = selected_rows.iloc[0]
+    role_row = find_role_by_id(roles_df, selected.get("RoleID", ""))
+    resume_path_value = str(selected.get("ResumePath", "") or "")
+    jd_path_value = str(role_row.get("JDPath", "") or "") if role_row is not None else ""
+
+    st.subheader("Selected candidate")
+    info_cols = st.columns([1.4, 1.1, 0.7, 0.7], vertical_alignment="center")
+    info_cols[0].markdown(f"**{selected['Name'] or '-'}**")
+    info_cols[1].write(f"Contact: {selected['Contact'] or '-'}")
+    if info_cols[2].button("Open Resume", key=f"quick_open_resume_{selected_id}", disabled=not resume_path_value):
+        ok, message = open_local_file(resolve_storage_path(resume_path_value))
+        (st.success if ok else st.error)(message)
+    if info_cols[3].button("Open JD", key=f"quick_open_jd_{selected_id}", disabled=not jd_path_value):
+        ok, message = open_local_file(resolve_storage_path(jd_path_value))
+        (st.success if ok else st.error)(message)
+
+    cdd_col, resume_col, jd_col = st.columns([1, 1, 1], gap="large")
+    with cdd_col:
+        st.markdown("**CDD details**")
+        st.write(f"Role: {selected['Role'] or '-'}")
+        st.write(f"Candidate ID: {selected['CandidateID']}")
+        st.write(f"Date added: {selected['DateAdded'] or '-'}")
+        st.write(f"Last updated: {selected['LastUpdated'] or '-'}")
         platform_value = st.text_input(
             "Platform",
             value=selected["Platform"],
@@ -874,11 +1006,11 @@ def render_candidate_tracker() -> None:
         remarks_value = st.text_area(
             "Remarks",
             value=selected["Remarks"],
-            height=120,
+            height=180,
             key=f"selected_remarks_{selected_id}",
         )
 
-        if st.button("Save Candidate Changes", type="primary", key=f"save_selected_{selected_id}"):
+        if st.button("Save CDD details", type="primary", key=f"save_selected_{selected_id}"):
             updated = candidates_df.copy()
             idx = updated.index[updated["CandidateID"] == selected_id][0]
             before = updated.loc[idx].copy()
@@ -907,53 +1039,33 @@ def render_candidate_tracker() -> None:
                     selected_id,
                     selected["Name"],
                     selected["Contact"],
-                    "Selected candidate panel save",
+                    "CDD details save",
                 )
                 save_candidates(updated)
-                st.success("Candidate changes saved.")
+                st.success("CDD details saved.")
                 st.rerun()
             else:
                 st.info("No changes to save.")
 
-        with st.expander("Stored file details", expanded=False):
-            st.write(f"Resume file: `{selected['ResumeFileName'] or '-'}`")
-            st.write(f"Resume path: `{selected['ResumePath'] or '-'}`")
+    with resume_col:
+        render_file_viewer(
+            "Resume",
+            selected.get("ResumePath", ""),
+            selected.get("ResumeFileName", ""),
+            key_prefix=f"candidate_resume_{selected.get('CandidateID', '')}",
+        )
 
-        with st.expander("Copy for email", expanded=True):
-            st.text_area(
-                "Candidate information",
-                value=format_candidate_for_email(selected),
-                height=150,
-                key=f"copy_candidate_{selected_id}",
-                help="Click inside the box, press Ctrl+A, then Ctrl+C.",
-            )
-            st.text_area(
-                "Spreadsheet paste format",
-                value=format_candidates_tab_copy(pd.DataFrame([selected])),
-                height=80,
-                key=f"copy_candidate_tab_{selected_id}",
-                help="Tab-separated: Name, Contact, Remarks. Paste into Excel or an email table.",
-            )
-
-        with st.expander("Resume", expanded=True):
+    with jd_col:
+        if role_row is None:
+            st.subheader("JD")
+            st.warning("No matching role found for this candidate.")
+        else:
             render_file_viewer(
-                "Resume",
-                selected.get("ResumePath", ""),
-                selected.get("ResumeFileName", ""),
-                key_prefix=f"candidate_resume_{selected.get('CandidateID', '')}",
+                "JD",
+                role_row.get("JDPath", ""),
+                role_row.get("JDFileName", ""),
+                key_prefix=f"candidate_jd_{selected.get('CandidateID', '')}",
             )
-
-        role_row = find_role_by_id(roles_df, selected.get("RoleID", ""))
-        with st.expander("Role JD", expanded=True):
-            if role_row is None:
-                st.warning("No matching role found for this candidate.")
-            else:
-                render_file_viewer(
-                    "JD",
-                    role_row.get("JDPath", ""),
-                    role_row.get("JDFileName", ""),
-                    key_prefix=f"candidate_jd_{selected.get('CandidateID', '')}",
-                )
 
 
 def render_diagnostics() -> None:
