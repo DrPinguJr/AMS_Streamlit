@@ -11,11 +11,12 @@ recruitment = st.Page(
     title="Recruitment Tracker",
     icon=":material/groups:",
 )
+converter = st.Page("Converter/Converter.py", title="Converter", icon=":material/transform:")
 
 pages = st.navigation(
     {
         "Workspace": [home],
-        "Projects": [tender, sesami, recruitment],
+        "Projects": [tender, sesami, recruitment, converter],
     }
 )
 

@@ -4,7 +4,7 @@ from typing import Callable
 from urllib.parse import urljoin
 
 from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.common.exceptions import NoSuchElementException, StaleElementReferenceException, TimeoutException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -180,20 +180,51 @@ def wait_for_results(driver: webdriver.Chrome, log_fn: LogFn = log) -> list[WebE
 def extract_raw_tender(row: WebElement) -> RawTenderResult:
     title = ""
     link = ""
+    raw_text = row.text
 
     try:
         title_link = row.find_element(By.CSS_SELECTOR, TITLE_LINK_SELECTOR)
         title = clean_value(title_link.text)
         link = urljoin(TENDERS_URL, title_link.get_attribute("href") or "")
     except NoSuchElementException:
-        lines = [clean_value(line) for line in row.text.splitlines() if clean_value(line)]
+        lines = [clean_value(line) for line in raw_text.splitlines() if clean_value(line)]
         title = lines[0] if lines else ""
 
     return RawTenderResult(
         tender_title=title,
         tender_link=link,
-        raw_text=row.text,
+        raw_text=raw_text,
     )
+
+
+def extract_raw_tender_at_index(
+    driver: webdriver.Chrome,
+    row_index: int,
+    max_attempts: int = 4,
+    log_fn: LogFn = log,
+) -> RawTenderResult | None:
+    for attempt in range(1, max_attempts + 1):
+        try:
+            rows = driver.find_elements(By.CSS_SELECTOR, ROW_SELECTOR)
+            if row_index >= len(rows):
+                log_fn(f"Row {row_index + 1} disappeared before it could be read.")
+                return None
+            return extract_raw_tender(rows[row_index])
+        except StaleElementReferenceException:
+            if attempt == max_attempts:
+                log_fn(f"Row {row_index + 1} stayed stale after {max_attempts} attempts; skipping it.")
+                return None
+            try:
+                WebDriverWait(
+                    driver,
+                    10,
+                    ignored_exceptions=(StaleElementReferenceException,),
+                ).until(lambda d: len(d.find_elements(By.CSS_SELECTOR, ROW_SELECTOR)) > row_index)
+            except TimeoutException:
+                log_fn(f"Row {row_index + 1} did not return after the table refreshed; skipping it.")
+                return None
+
+    return None
 
 
 def active_page_number(driver: webdriver.Chrome) -> str:
@@ -255,9 +286,12 @@ def scrape_raw_pages(driver: webdriver.Chrome, log_fn: LogFn = log) -> list[RawT
         log_fn(f"Processing page {current_page}...")
         rows = wait_for_results(driver, log_fn=log_fn)
 
-        for index, row in enumerate(rows, start=1):
-            log_fn(f"Processing {current_page}.. {index}...")
-            result = extract_raw_tender(row)
+        for index in range(len(rows)):
+            display_index = index + 1
+            log_fn(f"Processing {current_page}.. {display_index}...")
+            result = extract_raw_tender_at_index(driver, index, log_fn=log_fn)
+            if result is None:
+                continue
             unique_key = result.tender_link or f"{result.tender_title}|{result.raw_text}"
             if unique_key in seen_links:
                 continue
