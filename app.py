@@ -12,11 +12,17 @@ recruitment = st.Page(
     icon=":material/groups:",
 )
 converter = st.Page("Converter/Converter.py", title="Converter", icon=":material/transform:")
+whatsapp = st.Page("whatsapp/WhatsApp.py", title="WhatsApp Monitor", icon=":material/chat:")
+bluesg = st.Page(
+    "BlueSG/Vehicle_Route_Optimiser.py",
+    title="Vehicle Route Optimiser",
+    icon=":material/route:",
+)
 
 pages = st.navigation(
     {
         "Workspace": [home],
-        "Projects": [tender, sesami, recruitment, converter],
+        "Projects": [tender, sesami, recruitment, converter, whatsapp, bluesg],
     }
 )
 
