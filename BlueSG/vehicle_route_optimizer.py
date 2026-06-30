@@ -116,7 +116,6 @@ DEFAULT_MAX_ADJUSTED_DURATION_MIN = 180.0
 DEFAULT_EMPTY_TRAVEL_DURATION_MULTIPLIER = 1.5
 DEFAULT_EMPTY_TRAVEL_WAIT_BUFFER_MIN = 6.0
 DEFAULT_CLUSTER_PRESSURE_BONUS_PER_JOB = 8.0
-FORCE_COMPLETE_CAP_STAGES = [180.0, 195.0, 210.0]
 ONEMAP_SEARCH_URL = "https://www.onemap.gov.sg/api/common/elastic/search"
 ONEMAP_ROUTE_URL = "https://www.onemap.gov.sg/api/public/routingsvc/route"
 CACHE_DIR = Path(__file__).resolve().parent / "cache"
@@ -866,8 +865,6 @@ def _job_uploaded_row(job: dict[str, Any]) -> int:
 def _route_status_for_adjusted_duration(adjusted_duration: float, base_cap: float) -> str:
     if adjusted_duration <= base_cap:
         return "OK"
-    if adjusted_duration <= max(FORCE_COMPLETE_CAP_STAGES):
-        return "Accepted under force-complete mode"
     return "Fail"
 
 
@@ -1295,13 +1292,7 @@ def optimise_vehicle_routes(
         rider_sequences[rider.name].append(job)
         remaining.pop(job_index)
 
-    cap_stages = [max_adjusted_duration_min]
-    if force_complete_assignment:
-        cap_stages = []
-        for cap in [max_adjusted_duration_min] + FORCE_COMPLETE_CAP_STAGES:
-            if cap not in cap_stages:
-                cap_stages.append(float(cap))
-
+    cap_stages = [max_adjusted_duration_min] if force_complete_assignment else []
     cap_used = max_adjusted_duration_min
     if remaining:
         for cap in cap_stages:

@@ -535,7 +535,7 @@ with st.expander("Advanced Settings", expanded=False):
     force_complete_assignment = st.checkbox(
         "Force complete assignment where possible",
         value=True,
-        help="If enabled, the optimiser will try harder to assign all jobs before leaving any unassigned.",
+        help="If enabled, the optimiser retries unassigned jobs in different route positions, but never exceeds the max adjusted minutes cap.",
     )
     if st.button("Reset to Recommended Defaults"):
         for key, value in scoring_defaults.items():
