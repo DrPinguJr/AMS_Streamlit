@@ -12,6 +12,9 @@ from BlueSG.vehicle_route_optimizer import (
     DEFAULT_LOADED_WEIGHT,
     DEFAULT_MAX_ADJUSTED_DURATION_MIN,
     DEFAULT_MAX_JOB_OVERAGE_PENALTY,
+    DEFAULT_EMPTY_TRAVEL_DURATION_MULTIPLIER,
+    DEFAULT_EMPTY_TRAVEL_WAIT_BUFFER_MIN,
+    DEFAULT_CLUSTER_PRESSURE_BONUS_PER_JOB,
     DEFAULT_SOFT_ADJUSTED_DURATION_MIN,
     DEFAULT_SOFT_WORKLOAD_MIN,
     DEFAULT_WORKLOAD_PENALTY_PER_MIN,
@@ -21,6 +24,7 @@ from BlueSG.vehicle_route_optimizer import (
     WEEKDAY_SHEETS,
     ensure_rider_roster_workbook,
     export_routes_to_excel,
+    build_unassigned_jobs_df,
     get_cost_explanation,
     get_cached_geocode,
     load_and_validate_jobs,
@@ -341,39 +345,51 @@ def get_onemap_token_from_env() -> str:
 
 
 st.title("Vehicle Route Optimiser")
-st.caption("Assign fixed pickup-to-drop-off vehicle relocation jobs across multiple riders.")
+st.caption("Upload vehicle relocation jobs, confirm riders, optimise routes, and download dispatch instructions.")
 
 st.info(
-    "This optimiser treats each vehicle as a fixed pickup-to-drop-off job. Before every pickup, "
-    "the rider's empty travel from their current location is counted. After each drop-off, that "
-    "drop-off becomes the rider's new current location for the next assignment. OneMap is used "
-    "for Singapore distance/time estimates where available; fallback estimates are used only when "
-    "OneMap lookup fails."
+    "How to use:\n"
+    "1. Upload the job Excel file.\n"
+    "2. Check the rider roster.\n"
+    "3. Click Optimise Routes.\n"
+    "4. Review the map and download the output."
 )
 
-with st.expander("Required Excel format", expanded=False):
-    st.write("Required headers:")
-    st.write(", ".join(REQUIRED_JOB_HEADERS))
-    st.write("Optional headers: Date, Fuel %, Pickup Time, Notes")
+with st.expander("How the route optimiser works", expanded=False):
+    st.write(
+        "Each job is a fixed pickup-to-drop-off vehicle relocation. The rider first travels "
+        "to the pickup location without the car, then drives the car to the drop-off location. "
+        "The empty travel duration is adjusted upward to allow for public transport, walking, and waiting time. "
+        "After each drop-off, that drop-off becomes the rider's next starting point. OneMap is "
+        "used where available; fallback zone estimates are used when a lookup is unavailable."
+    )
 
+st.subheader("1. Upload Job List")
 uploaded_file = st.file_uploader("Upload vehicle jobs Excel file", type=["xlsx", "xls"])
 
 jobs_df = pd.DataFrame()
 file_is_valid = False
+missing_headers: list[str] = []
+validation_warnings: list[str] = []
+upload_error = ""
 
-if uploaded_file is not None:
+if uploaded_file is None:
+    st.caption("Upload an Excel file to begin.")
+else:
     try:
         jobs_df, missing_headers, validation_warnings = load_and_validate_jobs(uploaded_file)
     except ValueError as exc:
-        st.error(str(exc))
+        upload_error = str(exc)
+        st.error(upload_error)
     else:
         if missing_headers:
             st.error("Missing required header(s): " + ", ".join(missing_headers))
         else:
             file_is_valid = True
-            for warning in validation_warnings:
-                st.warning(warning)
-            st.success(f"Loaded {len(jobs_df)} valid job(s).")
+            skipped_rows = int(jobs_df.attrs.get("blank_address_rows_dropped", 0))
+            status_cols = st.columns(2)
+            status_cols[0].metric("Valid Jobs", len(jobs_df))
+            status_cols[1].metric("Skipped Rows", skipped_rows)
             preview_columns = [
                 "Car Plate",
                 "Pickup Address",
@@ -384,15 +400,22 @@ if uploaded_file is not None:
             ]
             st.dataframe(jobs_df[preview_columns], use_container_width=True, hide_index=True)
 
-st.subheader("Riders")
-roster_path = ensure_rider_roster_workbook()
-st.caption(f"Persistent roster workbook: {roster_path}")
+with st.expander("Excel format and data checks", expanded=False):
+    st.write("Required headers:")
+    st.write(", ".join(REQUIRED_JOB_HEADERS))
+    st.write("Optional headers: Date, Fuel %, Pickup Time, Notes")
+    if upload_error:
+        st.error(upload_error)
+    if missing_headers:
+        st.error("Missing required header(s): " + ", ".join(missing_headers))
+    for warning in validation_warnings:
+        st.warning(warning)
 
-roster_left, roster_right = st.columns([1, 2])
-with roster_left:
-    selected_roster_day = st.selectbox("Roster day", WEEKDAY_SHEETS)
-with roster_right:
-    st.write("Edit the roster below, then save it back to the Excel workbook.")
+st.subheader("2. Confirm Riders")
+roster_path = ensure_rider_roster_workbook()
+
+selected_roster_day = st.selectbox("Roster day", WEEKDAY_SHEETS)
+st.caption("Max Jobs is a soft guide. The optimiser may exceed it only when the route still makes operational sense.")
 
 if st.session_state.get("bluesg_roster_day") != selected_roster_day:
     st.session_state.bluesg_roster_day = selected_roster_day
@@ -422,42 +445,58 @@ rider_df = st.data_editor(
 )
 st.session_state.bluesg_riders = rider_df
 
-roster_actions = st.columns([1, 1, 1, 2])
-with roster_actions[0]:
-    if st.button("Save Roster", type="secondary"):
-        try:
-            saved_path = save_rider_roster(selected_roster_day, rider_df)
-        except PermissionError:
-            st.error("Could not save roster. Close the Excel workbook if it is open, then try again.")
-        except Exception as exc:
-            st.error(f"Could not save roster: {exc}")
-        else:
-            st.success(f"Saved {selected_roster_day} roster to {saved_path}")
-with roster_actions[1]:
-    if st.button("Reload From Excel"):
-        try:
-            st.session_state.bluesg_riders = load_rider_roster(selected_roster_day)
-        except Exception as exc:
-            st.error(f"Could not reload roster: {exc}")
-        else:
-            st.rerun()
-with roster_actions[2]:
-    if st.button("Open Excel File"):
-        try:
-            os.startfile(ROSTER_FILE)
-        except Exception as exc:
-            st.error(f"Could not open roster workbook: {exc}")
-with roster_actions[3]:
-    st.download_button(
-        "Download Roster Workbook",
-        data=read_rider_roster_file(),
-        file_name="rider_roster.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+if st.button("Save Roster", type="secondary"):
+    try:
+        saved_path = save_rider_roster(selected_roster_day, rider_df)
+    except PermissionError:
+        st.error("Could not save roster. Close the Excel workbook if it is open, then try again.")
+    except Exception as exc:
+        st.error(f"Could not save roster: {exc}")
+    else:
+        st.success(f"Saved {selected_roster_day} roster to {saved_path}")
 
-st.subheader("Optimisation Settings")
-settings_left, settings_right = st.columns(2)
-with settings_left:
+with st.expander("Roster file options", expanded=False):
+    st.caption(f"Persistent roster workbook: {roster_path}")
+    roster_actions = st.columns(3)
+    with roster_actions[0]:
+        if st.button("Reload From Excel"):
+            try:
+                st.session_state.bluesg_riders = load_rider_roster(selected_roster_day)
+            except Exception as exc:
+                st.error(f"Could not reload roster: {exc}")
+            else:
+                st.rerun()
+    with roster_actions[1]:
+        if st.button("Open Excel File"):
+            try:
+                os.startfile(ROSTER_FILE)
+            except Exception as exc:
+                st.error(f"Could not open roster workbook: {exc}")
+    with roster_actions[2]:
+        st.download_button(
+            "Download Roster Workbook",
+            data=read_rider_roster_file(),
+            file_name="rider_roster.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+scoring_defaults = {
+    "empty_weight": DEFAULT_EMPTY_WEIGHT,
+    "loaded_weight": DEFAULT_LOADED_WEIGHT,
+    "soft_workload_min": DEFAULT_SOFT_WORKLOAD_MIN,
+    "workload_penalty_per_min": DEFAULT_WORKLOAD_PENALTY_PER_MIN,
+    "soft_adjusted_duration_min": DEFAULT_SOFT_ADJUSTED_DURATION_MIN,
+    "duration_penalty_per_min": DEFAULT_DURATION_PENALTY_PER_MIN,
+    "max_job_overage_penalty": DEFAULT_MAX_JOB_OVERAGE_PENALTY,
+    "duration_buffer_multiplier": DEFAULT_DURATION_BUFFER_MULTIPLIER,
+    "max_adjusted_duration_min": DEFAULT_MAX_ADJUSTED_DURATION_MIN,
+    "empty_travel_duration_multiplier": DEFAULT_EMPTY_TRAVEL_DURATION_MULTIPLIER,
+    "empty_travel_wait_buffer_min": DEFAULT_EMPTY_TRAVEL_WAIT_BUFFER_MIN,
+    "cluster_pressure_bonus_per_job": DEFAULT_CLUSTER_PRESSURE_BONUS_PER_JOB,
+}
+
+with st.expander("Advanced Settings", expanded=False):
+    st.markdown("**Routing Engine**")
     use_onemap = st.toggle("Use OneMap distance/time if available", value=True)
     onemap_token = st.text_input(
         "OneMap access token",
@@ -466,108 +505,146 @@ with settings_left:
         help="Required for OneMap routing distance/time. If blank or invalid, the app will use fallback estimates.",
         disabled=not use_onemap,
     )
-with settings_right:
-    optimise_by_label = st.radio(
-        "Optimise by",
-        ["Duration", "Distance"],
-        horizontal=True,
-        captions=["Lowest total minutes", "Lowest total kilometres"],
-    )
-optimise_by = optimise_by_label.lower()
-
-if use_onemap and not onemap_token:
-    st.warning(
-        "OneMap is enabled, but no OneMap access token is set. Address lookup may work, "
-        "but route distance/time calls will return 401 Unauthorized and use fallback estimates."
-    )
-
-with st.expander("Fallback travel cost table", expanded=False):
-    st.write(
-        "Exact address matches cost 0. Known zone-to-zone pairs use this table for distance and duration. "
-        "Unknown zones use a higher default fallback cost."
-    )
+    st.write("Fallback travel cost table")
     st.dataframe(cached_cost_explanation(), use_container_width=True, hide_index=True)
 
-with st.expander("Advanced assignment scoring", expanded=False):
-    st.caption(
-        "Zone is a strong score adjustment, not an absolute first sort. "
-        "Workload is based on projected route time, and Max Jobs is a progressive soft cap."
+    st.markdown("**Public Transport Empty Leg**")
+    st.caption("Empty travel is rider movement to the car, so it includes walking, waiting, and transfer buffer.")
+    pt_col_a, pt_col_b = st.columns(2)
+    with pt_col_a:
+        empty_travel_duration_multiplier = st.number_input(
+            "Empty travel duration multiplier",
+            value=scoring_defaults["empty_travel_duration_multiplier"],
+            min_value=1.0,
+            max_value=3.0,
+            step=0.1,
+            key="bluesg_empty_travel_duration_multiplier",
+        )
+    with pt_col_b:
+        empty_travel_wait_buffer_min = st.number_input(
+            "Empty travel wait/walk buffer min",
+            value=scoring_defaults["empty_travel_wait_buffer_min"],
+            min_value=0.0,
+            max_value=30.0,
+            step=1.0,
+            key="bluesg_empty_travel_wait_buffer_min",
+        )
+
+    st.markdown("**Assignment Scoring**")
+    st.caption("Recommended defaults prioritise shorter rider-to-car travel while preventing routes from becoming too long.")
+    force_complete_assignment = st.checkbox(
+        "Force complete assignment where possible",
+        value=True,
+        help="If enabled, the optimiser will try harder to assign all jobs before leaving any unassigned.",
     )
+    if st.button("Reset to Recommended Defaults"):
+        for key, value in scoring_defaults.items():
+            st.session_state[f"bluesg_{key}"] = value
+
     score_col_a, score_col_b = st.columns(2)
     with score_col_a:
         empty_weight = st.number_input(
             "Empty leg weight",
-            value=DEFAULT_EMPTY_WEIGHT,
+            value=scoring_defaults["empty_weight"],
             min_value=1.0,
             max_value=10.0,
             step=0.5,
+            key="bluesg_empty_weight",
         )
     with score_col_b:
         loaded_weight = st.number_input(
             "Loaded leg weight",
-            value=DEFAULT_LOADED_WEIGHT,
+            value=scoring_defaults["loaded_weight"],
             min_value=0.5,
             max_value=5.0,
             step=0.5,
+            key="bluesg_loaded_weight",
         )
     workload_col_a, workload_col_b, workload_col_c, workload_col_d = st.columns(4)
     with workload_col_a:
         soft_workload_min = st.number_input(
             "Soft workload minutes",
-            value=DEFAULT_SOFT_WORKLOAD_MIN,
+            value=scoring_defaults["soft_workload_min"],
             min_value=30.0,
             max_value=180.0,
             step=5.0,
+            key="bluesg_soft_workload_min",
         )
     with workload_col_b:
         workload_penalty_per_min = st.number_input(
             "Workload penalty/min",
-            value=DEFAULT_WORKLOAD_PENALTY_PER_MIN,
+            value=scoring_defaults["workload_penalty_per_min"],
             min_value=0.0,
             max_value=10.0,
             step=0.5,
+            key="bluesg_workload_penalty_per_min",
         )
     with workload_col_c:
         soft_adjusted_duration_min = st.number_input(
             "Soft adjusted minutes",
-            value=DEFAULT_SOFT_ADJUSTED_DURATION_MIN,
+            value=scoring_defaults["soft_adjusted_duration_min"],
             min_value=60.0,
             max_value=240.0,
             step=5.0,
+            key="bluesg_soft_adjusted_duration_min",
         )
     with workload_col_d:
         duration_penalty_per_min = st.number_input(
             "Duration penalty/min",
-            value=DEFAULT_DURATION_PENALTY_PER_MIN,
+            value=scoring_defaults["duration_penalty_per_min"],
             min_value=0.0,
             max_value=15.0,
             step=0.5,
+            key="bluesg_duration_penalty_per_min",
         )
     cap_col_a, cap_col_b, cap_col_c = st.columns(3)
     with cap_col_a:
         max_job_overage_penalty = st.number_input(
             "Max jobs overage penalty",
-            value=DEFAULT_MAX_JOB_OVERAGE_PENALTY,
+            value=scoring_defaults["max_job_overage_penalty"],
             min_value=0.0,
             max_value=300.0,
             step=10.0,
+            key="bluesg_max_job_overage_penalty",
         )
     with cap_col_b:
         duration_buffer_multiplier = st.number_input(
             "Duration buffer multiplier",
-            value=DEFAULT_DURATION_BUFFER_MULTIPLIER,
+            value=scoring_defaults["duration_buffer_multiplier"],
             min_value=1.0,
             max_value=2.0,
             step=0.1,
+            key="bluesg_duration_buffer_multiplier",
         )
     with cap_col_c:
         max_adjusted_duration_min = st.number_input(
             "Max adjusted minutes",
-            value=DEFAULT_MAX_ADJUSTED_DURATION_MIN,
+            value=scoring_defaults["max_adjusted_duration_min"],
             min_value=60.0,
             max_value=360.0,
             step=15.0,
+            key="bluesg_max_adjusted_duration_min",
         )
+    cluster_pressure_bonus_per_job = st.number_input(
+        "Cluster pressure bonus per remaining pickup",
+        value=scoring_defaults["cluster_pressure_bonus_per_job"],
+        min_value=0.0,
+        max_value=30.0,
+        step=1.0,
+        key="bluesg_cluster_pressure_bonus_per_job",
+    )
+
+st.subheader("3. Optimise Routes")
+optimise_by_label = st.radio(
+    "Optimise by",
+    ["Duration", "Distance"],
+    horizontal=True,
+    captions=["Lowest total minutes", "Lowest total kilometres"],
+)
+optimise_by = optimise_by_label.lower()
+
+if use_onemap and not onemap_token:
+    st.warning("OneMap is enabled but no token is entered. The app will use fallback estimates where needed.")
 
 if st.button("Optimise Routes", type="primary", disabled=not file_is_valid):
     riders, rider_errors = validate_riders(rider_df)
@@ -588,10 +665,12 @@ if st.button("Optimise Routes", type="primary", disabled=not file_is_valid):
         progress_bar = st.progress(0, text="Preparing optimisation...")
         status_text = st.empty()
         detail_text = st.empty()
-        metrics_slot = st.empty()
         started_at = time.monotonic()
+        last_progress_event: dict = {}
 
         def show_progress(event: dict) -> None:
+            last_progress_event.clear()
+            last_progress_event.update(event)
             elapsed = time.monotonic() - started_at
             progress_bar.progress(float(event.get("progress", 0)), text=str(event.get("status", "")))
             status_text.write(
@@ -610,11 +689,6 @@ if st.button("Optimise Routes", type="primary", disabled=not file_is_valid):
             if event.get("current_dropoff"):
                 detail_parts.append(f"Drop-off: {event['current_dropoff']}")
             detail_text.caption(" | ".join(detail_parts) if detail_parts else "Waiting for first lookup...")
-            with metrics_slot.container():
-                col_a, col_b, col_c = st.columns(3)
-                col_a.metric("Rider-job checks", f"{event.get('comparison_count', 0):,}")
-                col_b.metric("Estimated checks", f"{event.get('estimated_comparisons', estimated_checks):,}")
-                col_c.metric("Elapsed", f"{elapsed:,.1f}s")
 
         try:
             route_df, summary_df, lookup_warnings = optimise_vehicle_routes(
@@ -633,9 +707,14 @@ if st.button("Optimise Routes", type="primary", disabled=not file_is_valid):
                 max_job_overage_penalty=max_job_overage_penalty,
                 duration_buffer_multiplier=duration_buffer_multiplier,
                 max_adjusted_duration_min=max_adjusted_duration_min,
+                empty_travel_duration_multiplier=empty_travel_duration_multiplier,
+                empty_travel_wait_buffer_min=empty_travel_wait_buffer_min,
+                force_complete_assignment=force_complete_assignment,
+                cluster_pressure_bonus_per_job=cluster_pressure_bonus_per_job,
             )
         finally:
             progress_bar.progress(1.0, text="Finished optimisation.")
+        elapsed_total = time.monotonic() - started_at
         if route_df.empty:
             st.session_state.bluesg_latest_optimisation = None
             st.warning("No jobs could be assigned. Check rider roster and input data.")
@@ -649,6 +728,11 @@ if st.button("Optimise Routes", type="primary", disabled=not file_is_valid):
                 "validation_warnings": list(validation_warnings),
                 "lookup_warnings": list(lookup_warnings),
                 "token": onemap_token or None,
+                "diagnostics": {
+                    "rider_job_checks": int(last_progress_event.get("comparison_count", 0)),
+                    "estimated_checks": int(last_progress_event.get("estimated_comparisons", estimated_checks)),
+                    "elapsed_seconds": elapsed_total,
+                },
             }
 
 latest_optimisation = st.session_state.get("bluesg_latest_optimisation")
@@ -660,6 +744,27 @@ if latest_optimisation:
     result_validation_warnings = latest_optimisation["validation_warnings"]
     result_lookup_warnings = latest_optimisation["lookup_warnings"]
     result_token = latest_optimisation["token"]
+    result_diagnostics = latest_optimisation.get("diagnostics", {})
+
+    st.subheader("4. Review Results")
+    assigned_jobs = len(route_df)
+    total_jobs_uploaded = len(result_jobs_df)
+    unassigned_jobs = max(0, total_jobs_uploaded - assigned_jobs)
+    riders_used = (
+        int((summary_df["Total Jobs"].fillna(0).astype(int) > 0).sum())
+        if "Total Jobs" in summary_df.columns
+        else 0
+    )
+    total_duration = (
+        float(summary_df["Total Route Duration Min"].fillna(0).sum())
+        if "Total Route Duration Min" in summary_df.columns
+        else 0.0
+    )
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Jobs Assigned", f"{assigned_jobs}/{total_jobs_uploaded}")
+    metric_cols[1].metric("Riders Used", riders_used)
+    metric_cols[2].metric("Total Estimated Duration", f"{total_duration:.1f} min")
+    metric_cols[3].metric("Unassigned Jobs", unassigned_jobs)
 
     if len(route_df) < len(result_jobs_df):
         st.warning(
@@ -667,27 +772,92 @@ if latest_optimisation:
             "Some jobs were left unassigned because assigning them would break the adjusted 3-hour cap "
             "or no suitable rider was available."
         )
+        unassigned_jobs_df = build_unassigned_jobs_df(result_jobs_df, route_df)
+        if not unassigned_jobs_df.empty:
+            st.write("Unassigned jobs")
+            st.dataframe(unassigned_jobs_df, use_container_width=True, hide_index=True)
 
-    if result_lookup_warnings:
-        with st.expander("OneMap lookup fallbacks", expanded=False):
-            st.write("These lookups used fallback estimates instead of OneMap results:")
+    failed_validation = route_df["Route Validation Status"].ne("OK")
+    if failed_validation.any():
+        st.warning("Some rider route rows did not chain correctly. Open Data and route warnings for details.")
+
+    with st.expander("Data and route warnings", expanded=False):
+        if result_lookup_warnings:
+            st.write("OneMap lookups that used fallback estimates:")
             for warning in result_lookup_warnings[:100]:
                 st.warning(warning)
             if len(result_lookup_warnings) > 100:
                 st.info(f"Showing first 100 of {len(result_lookup_warnings)} lookup warning(s).")
+        else:
+            st.caption("No OneMap fallback warnings for the latest run.")
 
-    failed_validation = route_df["Route Validation Status"].ne("OK")
-    if failed_validation.any():
-        st.warning("Some rider route rows did not chain correctly. Check the validation status column.")
+        for warning in result_validation_warnings:
+            st.warning(warning)
+
+        if failed_validation.any():
+            st.write("Route validation rows to review:")
+            validation_cols = [
+                column
+                for column in ["Rider", "Sequence", "Start From", "Drop-off Address", "Route Validation Status"]
+                if column in route_df.columns
+            ]
+            st.dataframe(route_df.loc[failed_validation, validation_cols], use_container_width=True, hide_index=True)
+
+    with st.expander("Optimisation diagnostics", expanded=False):
+        diag_cols = st.columns(3)
+        diag_cols[0].metric("Rider-job checks", f"{int(result_diagnostics.get('rider_job_checks', 0)):,}")
+        diag_cols[1].metric("Estimated checks", f"{int(result_diagnostics.get('estimated_checks', 0)):,}")
+        diag_cols[2].metric("Elapsed time", f"{float(result_diagnostics.get('elapsed_seconds', 0.0)):.1f}s")
 
     show_route_map(route_df, result_jobs_df, result_rider_df, result_token)
 
-    st.subheader("Optimised Rider Routes")
-    st.dataframe(route_df, use_container_width=True, hide_index=True)
+    st.subheader("Dispatch View")
+    dispatch_columns = [
+        "Rider",
+        "Sequence",
+        "Car Plate",
+        "Pickup Address",
+        "Pickup Lot",
+        "Drop-off Address",
+        "Empty Travel To Pickup",
+        "Loaded Travel / Car Movement",
+        "Total Distance KM",
+        "Total Duration Min",
+    ]
+    dispatch_columns = [column for column in dispatch_columns if column in route_df.columns]
+    st.dataframe(route_df[dispatch_columns], use_container_width=True, hide_index=True)
+
+    with st.expander("Technical route details", expanded=False):
+        st.dataframe(route_df, use_container_width=True, hide_index=True)
 
     st.subheader("Summary")
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    summary_columns = [
+        "Rider",
+        "Total Jobs",
+        "Total Route Distance KM",
+        "Total Route Duration Min",
+        "Adjusted Route Duration Min",
+        "Within 3 Hours",
+        "Final Location",
+        "Workload Comment",
+    ]
+    summary_columns = [column for column in summary_columns if column in summary_df.columns]
+    st.dataframe(summary_df[summary_columns], use_container_width=True, hide_index=True)
 
+    detail_summary_columns = [
+        "Rider",
+        "Total Empty Distance KM",
+        "Total Empty Duration Min",
+        "Total Loaded Distance KM",
+        "Total Loaded Duration Min",
+        "Empty Travel %",
+        "Loaded Travel %",
+    ]
+    detail_summary_columns = [column for column in detail_summary_columns if column in summary_df.columns]
+    with st.expander("Detailed summary columns", expanded=False):
+        st.dataframe(summary_df[detail_summary_columns], use_container_width=True, hide_index=True)
+
+    st.subheader("5. Download")
     st.download_button(
         "Download Excel Output",
         data=export_routes_to_excel(

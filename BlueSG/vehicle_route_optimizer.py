@@ -26,6 +26,7 @@ ROSTER_FILE = Path(__file__).resolve().parent / "rider_roster.xlsx"
 ROUTE_COLUMNS = [
     "Rider",
     "Sequence",
+    "Uploaded Row",
     "Start From",
     "Empty Travel To Pickup",
     "Car Plate",
@@ -103,15 +104,19 @@ UNKNOWN_DISTANCE_KM = 18.0
 UNKNOWN_DURATION_MIN = 40.0
 SAME_UNKNOWN_DISTANCE_KM = 6.0
 SAME_UNKNOWN_DURATION_MIN = 18.0
-DEFAULT_EMPTY_WEIGHT = 6.0
-DEFAULT_LOADED_WEIGHT = 0.5
-DEFAULT_SOFT_WORKLOAD_MIN = 95.0
-DEFAULT_WORKLOAD_PENALTY_PER_MIN = 5.0
-DEFAULT_SOFT_ADJUSTED_DURATION_MIN = 135.0
-DEFAULT_DURATION_PENALTY_PER_MIN = 6.0
-DEFAULT_MAX_JOB_OVERAGE_PENALTY = 120.0
-DEFAULT_DURATION_BUFFER_MULTIPLIER = 1.3
+DEFAULT_EMPTY_WEIGHT = 4.5
+DEFAULT_LOADED_WEIGHT = 0.8
+DEFAULT_SOFT_WORKLOAD_MIN = 115.0
+DEFAULT_WORKLOAD_PENALTY_PER_MIN = 2.0
+DEFAULT_SOFT_ADJUSTED_DURATION_MIN = 165.0
+DEFAULT_DURATION_PENALTY_PER_MIN = 2.0
+DEFAULT_MAX_JOB_OVERAGE_PENALTY = 60.0
+DEFAULT_DURATION_BUFFER_MULTIPLIER = 1.2
 DEFAULT_MAX_ADJUSTED_DURATION_MIN = 180.0
+DEFAULT_EMPTY_TRAVEL_DURATION_MULTIPLIER = 1.5
+DEFAULT_EMPTY_TRAVEL_WAIT_BUFFER_MIN = 6.0
+DEFAULT_CLUSTER_PRESSURE_BONUS_PER_JOB = 8.0
+FORCE_COMPLETE_CAP_STAGES = [180.0, 195.0, 210.0]
 ONEMAP_SEARCH_URL = "https://www.onemap.gov.sg/api/common/elastic/search"
 ONEMAP_ROUTE_URL = "https://www.onemap.gov.sg/api/public/routingsvc/route"
 CACHE_DIR = Path(__file__).resolve().parent / "cache"
@@ -819,6 +824,14 @@ def validate_riders(rider_df: pd.DataFrame) -> tuple[list[RiderState], list[str]
 
 
 def _combined_source(empty_cost: TravelCost, loaded_cost: TravelCost) -> str:
+    if "public transport adjusted" in empty_cost.source.lower():
+        base_empty_source = empty_cost.source.replace(", public transport adjusted", "")
+        base_source = _combined_source(
+            TravelCost(empty_cost.distance_km, empty_cost.duration_min, base_empty_source, empty_cost.error),
+            loaded_cost,
+        )
+        return f"{base_source}, public transport adjusted"
+
     sources = {empty_cost.source, loaded_cost.source}
     if sources == {"OneMap"}:
         return "OneMap"
@@ -827,6 +840,41 @@ def _combined_source(empty_cost: TravelCost, loaded_cost: TravelCost) -> str:
     if "fallback estimate" in sources:
         return "fallback estimate"
     return ", ".join(sorted(sources))
+
+
+def adjust_empty_travel_for_public_transport(
+    empty_cost: TravelCost,
+    duration_multiplier: float = DEFAULT_EMPTY_TRAVEL_DURATION_MULTIPLIER,
+    wait_buffer_min: float = DEFAULT_EMPTY_TRAVEL_WAIT_BUFFER_MIN,
+) -> TravelCost:
+    if empty_cost.duration_min is None:
+        return empty_cost
+    if empty_cost.duration_min <= 0:
+        return empty_cost
+
+    adjusted_duration = round((empty_cost.duration_min * duration_multiplier) + wait_buffer_min, 1)
+    source = empty_cost.source
+    if "public transport adjusted" not in source.lower():
+        source = f"{source}, public transport adjusted"
+    return TravelCost(empty_cost.distance_km, adjusted_duration, source, empty_cost.error)
+
+
+def _job_uploaded_row(job: dict[str, Any]) -> int:
+    return int(job.get("_original_order", 0)) + 2
+
+
+def _route_status_for_adjusted_duration(adjusted_duration: float, base_cap: float) -> str:
+    if adjusted_duration <= base_cap:
+        return "OK"
+    if adjusted_duration <= max(FORCE_COMPLETE_CAP_STAGES):
+        return "Accepted under force-complete mode"
+    return "Fail"
+
+
+def _route_zone_for_job(job: dict[str, Any], key: str) -> str | None:
+    address = clean_text(job.get(key))
+    zone_key = "Pickup Zone" if key == "Pickup Address" else "Drop-off Zone"
+    return job.get(zone_key) or infer_zone(address)
 
 
 def optimise_vehicle_routes(
@@ -845,6 +893,10 @@ def optimise_vehicle_routes(
     max_job_overage_penalty: float = DEFAULT_MAX_JOB_OVERAGE_PENALTY,
     duration_buffer_multiplier: float = DEFAULT_DURATION_BUFFER_MULTIPLIER,
     max_adjusted_duration_min: float = DEFAULT_MAX_ADJUSTED_DURATION_MIN,
+    empty_travel_duration_multiplier: float = DEFAULT_EMPTY_TRAVEL_DURATION_MULTIPLIER,
+    empty_travel_wait_buffer_min: float = DEFAULT_EMPTY_TRAVEL_WAIT_BUFFER_MIN,
+    force_complete_assignment: bool = True,
+    cluster_pressure_bonus_per_job: float = DEFAULT_CLUSTER_PRESSURE_BONUS_PER_JOB,
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     token = token or get_onemap_token()
     remaining = jobs.sort_values("_original_order").to_dict("records")
@@ -856,6 +908,16 @@ def optimise_vehicle_routes(
     comparison_count = 0
     progress_base = 0.2 if use_onemap else 0
     progress_span = 0.78 if use_onemap else 0.98
+    rider_sequences: dict[str, list[dict[str, Any]]] = {rider.name: [] for rider in riders}
+    base_rider_state = {
+        rider.name: {
+            "start_location": rider.start_location,
+            "start_zone": rider.start_zone,
+            "max_jobs": rider.max_jobs,
+        }
+        for rider in riders
+    }
+    rejected_candidate_audit: list[dict[str, Any]] = []
 
     def report(status: str, **extra: Any) -> None:
         if progress_callback is None:
@@ -872,6 +934,147 @@ def optimise_vehicle_routes(
         }
         payload.update(extra)
         progress_callback(payload)
+
+    def evaluate_rider_sequence(
+        rider: RiderState,
+        sequence: list[dict[str, Any]],
+        cap: float,
+    ) -> dict[str, Any]:
+        current_location = base_rider_state[rider.name]["start_location"]
+        current_zone = base_rider_state[rider.name]["start_zone"]
+        empty_distance = 0.0
+        empty_duration = 0.0
+        loaded_distance = 0.0
+        loaded_duration = 0.0
+        rows: list[dict[str, Any]] = []
+        warnings: list[str] = []
+
+        for sequence_index, job in enumerate(sequence, start=1):
+            pickup_address = clean_text(job["Pickup Address"])
+            dropoff_address = clean_text(job["Drop-off Address"])
+            pickup_zone = _route_zone_for_job(job, "Pickup Address")
+            dropoff_zone = _route_zone_for_job(job, "Drop-off Address")
+
+            empty_cost = get_travel_cost(
+                current_location,
+                pickup_address,
+                current_zone,
+                pickup_zone,
+                use_onemap=use_onemap,
+                token=token,
+            )
+            empty_cost = adjust_empty_travel_for_public_transport(
+                empty_cost,
+                duration_multiplier=empty_travel_duration_multiplier,
+                wait_buffer_min=empty_travel_wait_buffer_min,
+            )
+            loaded_cost = get_travel_cost(
+                pickup_address,
+                dropoff_address,
+                pickup_zone,
+                dropoff_zone,
+                use_onemap=use_onemap,
+                token=token,
+            )
+            route_zone_priority, same_zone_pickup, route_stays_current_zone = calculate_route_zone_priority(
+                current_zone,
+                pickup_zone,
+                dropoff_zone,
+            )
+            score_data = calculate_assignment_score(
+                empty_distance_km=empty_cost.distance_km,
+                empty_duration_min=empty_cost.duration_min,
+                loaded_distance_km=loaded_cost.distance_km,
+                loaded_duration_min=loaded_cost.duration_min,
+                rider_current_zone=current_zone,
+                pickup_zone=pickup_zone,
+                dropoff_zone=dropoff_zone,
+                rider_total_duration_min=empty_duration + loaded_duration,
+                rider_assigned_jobs=sequence_index - 1,
+                rider_max_jobs=base_rider_state[rider.name]["max_jobs"],
+                optimise_by=optimise_by,
+                empty_weight=empty_weight,
+                loaded_weight=loaded_weight,
+                soft_workload_min=soft_workload_min,
+                workload_penalty_per_min=workload_penalty_per_min,
+                soft_adjusted_duration_min=soft_adjusted_duration_min,
+                duration_buffer_multiplier=duration_buffer_multiplier,
+                duration_penalty_per_min=duration_penalty_per_min,
+                max_jobs_overage_penalty=max_job_overage_penalty,
+                max_adjusted_duration_min=cap,
+            )
+            if score_data is None:
+                projected_raw = empty_duration + loaded_duration + (empty_cost.duration_min or 0) + (loaded_cost.duration_min or 0)
+                return {
+                    "valid": False,
+                    "rows": rows,
+                    "raw_duration": projected_raw,
+                    "adjusted_duration": projected_raw * duration_buffer_multiplier,
+                    "warnings": warnings,
+                }
+
+            if empty_cost.error:
+                warnings.append(f"{current_location} -> {pickup_address}: {empty_cost.error}")
+            if loaded_cost.error:
+                warnings.append(f"{pickup_address} -> {dropoff_address}: {loaded_cost.error}")
+
+            cost_source = _combined_source(empty_cost, loaded_cost)
+            rows.append(
+                {
+                    "Rider": rider.name,
+                    "Sequence": sequence_index,
+                    "Uploaded Row": _job_uploaded_row(job),
+                    "Start From": current_location,
+                    "Empty Travel To Pickup": f"{current_location} -> {pickup_address}",
+                    "Car Plate": clean_text(job.get("Car Plate")),
+                    "Pickup Address": pickup_address,
+                    "Pickup Lot": clean_text(job.get("Pickup Lot")),
+                    "Drop-off Address": dropoff_address,
+                    "Loaded Travel / Car Movement": f"{pickup_address} -> {dropoff_address}",
+                    "Empty Distance KM": empty_cost.distance_km,
+                    "Empty Duration Min": empty_cost.duration_min,
+                    "Loaded Distance KM": loaded_cost.distance_km,
+                    "Loaded Duration Min": loaded_cost.duration_min,
+                    "Total Distance KM": round((empty_cost.distance_km or 0) + (loaded_cost.distance_km or 0), 2),
+                    "Total Duration Min": round((empty_cost.duration_min or 0) + (loaded_cost.duration_min or 0), 1),
+                    "Assignment Score": score_data["assignment_score"],
+                    "Zone Adjustment": score_data["zone_adjustment"],
+                    "Same Zone Pickup": "Yes" if same_zone_pickup else "No",
+                    "Same Zone Route": "Yes" if route_stays_current_zone else "No",
+                    "Route Zone Priority": route_zone_priority,
+                    "Empty Weight": empty_weight,
+                    "Loaded Weight": loaded_weight,
+                    "Workload Penalty": score_data["workload_penalty"],
+                    "Duration Penalty": score_data["duration_penalty"],
+                    "Max Jobs Penalty": score_data["max_jobs_penalty"],
+                    "Projected Rider Duration Min": round(float(score_data["projected_duration_min"]), 1),
+                    "Projected Adjusted Duration Min": round(float(score_data["projected_adjusted_duration_min"]), 1),
+                    "Cost Source": cost_source,
+                    "Route Validation Status": "",
+                }
+            )
+
+            empty_distance += empty_cost.distance_km or 0
+            empty_duration += empty_cost.duration_min or 0
+            loaded_distance += loaded_cost.distance_km or 0
+            loaded_duration += loaded_cost.duration_min or 0
+            current_location = dropoff_address
+            current_zone = dropoff_zone
+
+        raw_duration = empty_duration + loaded_duration
+        return {
+            "valid": raw_duration * duration_buffer_multiplier <= cap,
+            "rows": rows,
+            "empty_distance": empty_distance,
+            "empty_duration": empty_duration,
+            "loaded_distance": loaded_distance,
+            "loaded_duration": loaded_duration,
+            "raw_duration": raw_duration,
+            "adjusted_duration": raw_duration * duration_buffer_multiplier,
+            "final_location": current_location,
+            "final_zone": current_zone,
+            "warnings": warnings,
+        }
 
     if use_onemap:
         unique_addresses = sorted(
@@ -902,6 +1105,11 @@ def optimise_vehicle_routes(
     # pickup-to-drop-off jobs against every rider's real current location.
     while remaining and riders:
         report("Comparing rider-job combinations", phase="Comparing")
+        remaining_pickup_zone_counts: dict[str, int] = {}
+        for remaining_job in remaining:
+            remaining_zone = _route_zone_for_job(remaining_job, "Pickup Address") or "Unknown"
+            remaining_pickup_zone_counts[remaining_zone] = remaining_pickup_zone_counts.get(remaining_zone, 0) + 1
+
         best_choice: tuple[
             tuple[float, float, float, int, float, int, int, int],
             int,
@@ -930,6 +1138,11 @@ def optimise_vehicle_routes(
                     pickup_zone,
                     use_onemap=use_onemap,
                     token=token,
+                )
+                empty_cost = adjust_empty_travel_for_public_transport(
+                    empty_cost,
+                    duration_multiplier=empty_travel_duration_multiplier,
+                    wait_buffer_min=empty_travel_wait_buffer_min,
                 )
                 loaded_cost = get_travel_cost(
                     pickup_address,
@@ -972,8 +1185,10 @@ def optimise_vehicle_routes(
                 if score_data is None:
                     continue
 
+                cluster_pressure_bonus = -cluster_pressure_bonus_per_job * remaining_pickup_zone_counts.get(pickup_zone or "Unknown", 0)
+                greedy_assignment_score = float(score_data["assignment_score"]) + cluster_pressure_bonus
                 candidate_rank = (
-                    float(score_data["assignment_score"]),
+                    greedy_assignment_score,
                     empty_cost.distance_km if empty_cost.distance_km is not None else math.inf,
                     empty_cost.duration_min if empty_cost.duration_min is not None else math.inf,
                     route_zone_priority,
@@ -990,7 +1205,7 @@ def optimise_vehicle_routes(
                         job,
                         empty_cost,
                         loaded_cost,
-                        score_data,
+                        {**score_data, "assignment_score": round(greedy_assignment_score, 3)},
                         same_zone_pickup,
                         route_stays_current_zone,
                         route_zone_priority,
@@ -1039,6 +1254,7 @@ def optimise_vehicle_routes(
             {
                 "Rider": rider.name,
                 "Sequence": rider.assigned_count + 1,
+                "Uploaded Row": int(job.get("_original_order", len(route_rows))) + 2,
                 "Start From": rider.current_location,
                 "Empty Travel To Pickup": f"{rider.current_location} -> {pickup_address}",
                 "Car Plate": clean_text(job.get("Car Plate")),
@@ -1076,9 +1292,162 @@ def optimise_vehicle_routes(
         rider.loaded_duration_min += loaded_cost.duration_min or 0
         rider.current_location = dropoff_address
         rider.current_zone = job.get("Drop-off Zone") or infer_zone(dropoff_address)
+        rider_sequences[rider.name].append(job)
         remaining.pop(job_index)
 
+    cap_stages = [max_adjusted_duration_min]
+    if force_complete_assignment:
+        cap_stages = []
+        for cap in [max_adjusted_duration_min] + FORCE_COMPLETE_CAP_STAGES:
+            if cap not in cap_stages:
+                cap_stages.append(float(cap))
+
+    cap_used = max_adjusted_duration_min
+    if remaining:
+        for cap in cap_stages:
+            cap_used = cap
+            made_assignment = True
+            while remaining and made_assignment:
+                made_assignment = False
+                best_insertion: tuple[float, float, int, RiderState, int, int, dict[str, Any], dict[str, Any]] | None = None
+
+                current_evaluations = {
+                    rider.name: evaluate_rider_sequence(rider, rider_sequences[rider.name], cap)
+                    for rider in riders
+                }
+                for job_index, job in enumerate(remaining):
+                    for rider in riders:
+                        current_sequence = rider_sequences[rider.name]
+                        current_duration = float(current_evaluations[rider.name].get("raw_duration", 0) or 0)
+                        for insert_at in range(len(current_sequence) + 1):
+                            candidate_sequence = current_sequence[:insert_at] + [job] + current_sequence[insert_at:]
+                            evaluation = evaluate_rider_sequence(rider, candidate_sequence, cap)
+                            added_duration = float(evaluation.get("raw_duration", math.inf)) - current_duration
+                            projected_adjusted = float(evaluation.get("adjusted_duration", math.inf))
+                            if not evaluation.get("valid"):
+                                continue
+                            candidate_rank = (
+                                added_duration,
+                                projected_adjusted,
+                                int(job.get("_original_order", job_index)),
+                            )
+                            if best_insertion is None or candidate_rank < best_insertion[:3]:
+                                best_insertion = (
+                                    added_duration,
+                                    projected_adjusted,
+                                    int(job.get("_original_order", job_index)),
+                                    rider,
+                                    insert_at,
+                                    job_index,
+                                    job,
+                                    evaluation,
+                                )
+
+                if best_insertion is not None:
+                    _, _, _, rider, insert_at, job_index, job, _ = best_insertion
+                    rider_sequences[rider.name].insert(insert_at, job)
+                    remaining.pop(job_index)
+                    made_assignment = True
+
+            if not remaining:
+                break
+
+    final_evaluations = {
+        rider.name: evaluate_rider_sequence(rider, rider_sequences[rider.name], cap_used)
+        for rider in riders
+    }
+    route_rows = []
+    lookup_warnings.extend(
+        warning
+        for evaluation in final_evaluations.values()
+        for warning in evaluation.get("warnings", [])
+    )
+    for rider in riders:
+        evaluation = final_evaluations[rider.name]
+        route_rows.extend(evaluation.get("rows", []))
+        rider.assigned_count = len(rider_sequences[rider.name])
+        rider.empty_distance_km = float(evaluation.get("empty_distance", 0) or 0)
+        rider.empty_duration_min = float(evaluation.get("empty_duration", 0) or 0)
+        rider.loaded_distance_km = float(evaluation.get("loaded_distance", 0) or 0)
+        rider.loaded_duration_min = float(evaluation.get("loaded_duration", 0) or 0)
+        rider.current_location = clean_text(evaluation.get("final_location", base_rider_state[rider.name]["start_location"]))
+        rider.current_zone = evaluation.get("final_zone") or base_rider_state[rider.name]["start_zone"]
+
+    unassigned_details: list[dict[str, Any]] = []
+    for job in remaining:
+        candidate_rows = []
+        cap_for_audit = cap_used
+        for rider in riders:
+            current_sequence = rider_sequences[rider.name]
+            current_evaluation = evaluate_rider_sequence(rider, current_sequence, cap_for_audit)
+            current_raw_duration = float(current_evaluation.get("raw_duration", 0) or 0)
+            current_location = (
+                clean_text(current_sequence[-1]["Drop-off Address"])
+                if current_sequence
+                else base_rider_state[rider.name]["start_location"]
+            )
+            for insert_at in range(len(current_sequence) + 1):
+                candidate_sequence = current_sequence[:insert_at] + [job] + current_sequence[insert_at:]
+                evaluation = evaluate_rider_sequence(rider, candidate_sequence, cap_for_audit)
+                inserted_rows = [
+                    row for row in evaluation.get("rows", [])
+                    if int(row.get("Uploaded Row", -1)) == _job_uploaded_row(job)
+                ]
+                inserted_row = inserted_rows[0] if inserted_rows else {}
+                candidate_rows.append(
+                    {
+                        "Car Plate": clean_text(job.get("Car Plate")),
+                        "Pickup Address": clean_text(job.get("Pickup Address")),
+                        "Drop-off Address": clean_text(job.get("Drop-off Address")),
+                        "Candidate Rider": rider.name,
+                        "Candidate Start/Current Location": current_location,
+                        "Candidate Empty Duration Min": inserted_row.get("Empty Duration Min", ""),
+                        "Candidate Loaded Duration Min": inserted_row.get("Loaded Duration Min", ""),
+                        "Candidate Added Duration Min": round(
+                            float(evaluation.get("raw_duration", 0) or 0) - current_raw_duration,
+                            1,
+                        ),
+                        "Projected Raw Duration Min": round(float(evaluation.get("raw_duration", 0) or 0), 1),
+                        "Projected Adjusted Duration Min": round(float(evaluation.get("adjusted_duration", 0) or 0), 1),
+                        "Cap Used": cap_for_audit,
+                        "Reason Rejected": (
+                            "Projected adjusted duration exceeds cap"
+                            if float(evaluation.get("adjusted_duration", math.inf)) > cap_for_audit
+                            else "Not selected by rescue insertion ranking"
+                        ),
+                    }
+                )
+
+        candidate_rows = sorted(
+            candidate_rows,
+            key=lambda row: float(row["Projected Adjusted Duration Min"] or math.inf),
+        )
+        rejected_candidate_audit.extend(candidate_rows[:3])
+        best = candidate_rows[0] if candidate_rows else {}
+        best_adjusted = best.get("Projected Adjusted Duration Min", "")
+        best_rider = best.get("Candidate Rider", "")
+        best_location = best.get("Candidate Start/Current Location", "")
+        unassigned_details.append(
+            {
+                "Uploaded Row": _job_uploaded_row(job),
+                "Best Candidate Rider": best_rider,
+                "Best Candidate Final Location": best_location,
+                "Best Candidate Projected Raw Duration": best.get("Projected Raw Duration Min", ""),
+                "Best Candidate Projected Adjusted Duration": best_adjusted,
+                "Current Cap": cap_for_audit,
+                "Reason": (
+                    f"Could not assign under current cap. Best candidate was {best_rider}, "
+                    f"projected adjusted duration {best_adjusted} min, cap {cap_for_audit} min."
+                    if best
+                    else "Could not assign under current cap. No rider candidate was available."
+                ),
+            }
+        )
+
     route_df = format_route_output(pd.DataFrame(route_rows, columns=ROUTE_COLUMNS), riders)
+    route_df.attrs["unassigned_details"] = unassigned_details
+    route_df.attrs["rejected_candidate_audit"] = rejected_candidate_audit
+    route_df.attrs["force_complete_cap_used"] = cap_used
     summary_df = pd.DataFrame(
         [
             {
@@ -1094,11 +1463,9 @@ def optimise_vehicle_routes(
                     (rider.empty_duration_min + rider.loaded_duration_min) * duration_buffer_multiplier,
                     1,
                 ),
-                "Within 3 Hours": (
-                    "OK"
-                    if (rider.empty_duration_min + rider.loaded_duration_min) * duration_buffer_multiplier
-                    <= max_adjusted_duration_min
-                    else "Fail"
+                "Within 3 Hours": _route_status_for_adjusted_duration(
+                    (rider.empty_duration_min + rider.loaded_duration_min) * duration_buffer_multiplier,
+                    DEFAULT_MAX_ADJUSTED_DURATION_MIN,
                 ),
                 "Final Location": rider.current_location,
             }
@@ -1395,6 +1762,67 @@ def _data_quality_rows(
     return rows
 
 
+def build_unassigned_jobs_df(jobs_df: pd.DataFrame | None, route_df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "Uploaded Row",
+        "Car Plate",
+        "Pickup Address",
+        "Pickup Lot",
+        "Drop-off Address",
+        "Pickup Zone",
+        "Drop-off Zone",
+        "Best Candidate Rider",
+        "Best Candidate Final Location",
+        "Best Candidate Projected Raw Duration",
+        "Best Candidate Projected Adjusted Duration",
+        "Current Cap",
+        "Reason",
+    ]
+    if jobs_df is None or jobs_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    jobs = jobs_df.copy()
+    if "_original_order" not in jobs.columns:
+        jobs["_original_order"] = range(len(jobs))
+    jobs["Uploaded Row"] = jobs["_original_order"].astype(int) + 2
+
+    assigned_rows: set[int] = set()
+    if route_df is not None and not route_df.empty and "Uploaded Row" in route_df.columns:
+        assigned_rows = set(route_df["Uploaded Row"].dropna().astype(int).tolist())
+
+    unassigned = jobs[~jobs["Uploaded Row"].isin(assigned_rows)].copy()
+    if unassigned.empty:
+        return pd.DataFrame(columns=columns)
+
+    details = {}
+    if route_df is not None:
+        details = {
+            int(detail.get("Uploaded Row")): detail
+            for detail in route_df.attrs.get("unassigned_details", [])
+            if detail.get("Uploaded Row") is not None
+        }
+
+    for detail_column in [
+        "Best Candidate Rider",
+        "Best Candidate Final Location",
+        "Best Candidate Projected Raw Duration",
+        "Best Candidate Projected Adjusted Duration",
+        "Current Cap",
+        "Reason",
+    ]:
+        unassigned[detail_column] = unassigned["Uploaded Row"].apply(
+            lambda row_number: details.get(int(row_number), {}).get(detail_column, "")
+        )
+    unassigned["Reason"] = unassigned["Reason"].replace(
+        "",
+        "Could not assign under current cap. No candidate audit was available.",
+    )
+    for column in columns:
+        if column not in unassigned.columns:
+            unassigned[column] = ""
+    return unassigned.loc[:, columns].reset_index(drop=True)
+
+
 def _write_how_to_read_sheet(writer: pd.ExcelWriter) -> None:
     wb = writer.book
     ws = wb.create_sheet("How To Read This", 0)
@@ -1646,6 +2074,68 @@ def _write_manager_dispatch_summary_sheet(
     _autosize_columns(ws, 45)
 
 
+def _write_unassigned_jobs_sheet(
+    writer: pd.ExcelWriter,
+    jobs_df: pd.DataFrame | None,
+    route_df: pd.DataFrame,
+) -> None:
+    ws = writer.book.create_sheet("Unassigned Jobs")
+    _write_title(ws, "Unassigned Jobs", 1)
+    ws.cell(
+        row=2,
+        column=1,
+        value="Uploaded jobs that were not assigned to any rider. Use the Uploaded Row number to find the job in the original file.",
+    )
+    ws.cell(row=2, column=1).alignment = Alignment(wrap_text=True, vertical="top")
+
+    unassigned_df = build_unassigned_jobs_df(jobs_df, route_df)
+    if unassigned_df.empty:
+        ws.cell(row=4, column=1, value="All uploaded valid jobs were assigned.")
+        _autosize_columns(ws, 45)
+        return
+
+    header_row = 4
+    for col, column_name in enumerate(unassigned_df.columns, start=1):
+        ws.cell(row=header_row, column=col, value=column_name)
+    _style_header_row(ws, header_row, len(unassigned_df.columns))
+
+    for row_idx, row in enumerate(unassigned_df.itertuples(index=False), start=header_row + 1):
+        for col_idx, value in enumerate(row, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+    ws.freeze_panes = "A5"
+    _autosize_columns(ws, 55)
+
+
+def _write_rejected_candidate_audit_sheet(writer: pd.ExcelWriter, route_df: pd.DataFrame) -> None:
+    ws = writer.book.create_sheet("Rejected Candidate Audit")
+    _write_title(ws, "Rejected Candidate Audit", 1)
+    ws.cell(
+        row=2,
+        column=1,
+        value="Top rejected rider options for jobs that remained unassigned after normal and rescue assignment passes.",
+    )
+    ws.cell(row=2, column=1).alignment = Alignment(wrap_text=True, vertical="top")
+
+    audit_df = pd.DataFrame(route_df.attrs.get("rejected_candidate_audit", []))
+    if audit_df.empty:
+        ws.cell(row=4, column=1, value="No rejected candidate audit rows for this run.")
+        _autosize_columns(ws, 45)
+        return
+
+    header_row = 4
+    for col, column_name in enumerate(audit_df.columns, start=1):
+        ws.cell(row=header_row, column=col, value=column_name)
+    _style_header_row(ws, header_row, len(audit_df.columns))
+    for row_idx, row in enumerate(audit_df.itertuples(index=False), start=header_row + 1):
+        for col_idx, value in enumerate(row, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+    ws.freeze_panes = "A5"
+    _autosize_columns(ws, 55)
+
+
 def export_routes_to_excel(
     route_df: pd.DataFrame,
     summary_df: pd.DataFrame,
@@ -1689,6 +2179,8 @@ def export_routes_to_excel(
         _style_summary_sheet(summary_ws, rider_header_row)
         _autosize_columns(summary_ws, 45)
 
+        _write_unassigned_jobs_sheet(writer, jobs_df, route_df)
+        _write_rejected_candidate_audit_sheet(writer, route_df)
         _write_rider_instructions_sheet(writer, route_df, summary_df)
         _write_manager_dispatch_summary_sheet(writer, route_df, summary_df)
 
