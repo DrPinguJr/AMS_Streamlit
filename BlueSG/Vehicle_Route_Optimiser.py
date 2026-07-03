@@ -1,4 +1,5 @@
 import os
+import json
 import time
 
 import pandas as pd
@@ -22,6 +23,7 @@ from BlueSG.vehicle_route_optimizer import (
     ROSTER_FILE,
     clean_text,
     WEEKDAY_SHEETS,
+    dedupe_rider_roster,
     ensure_rider_roster_workbook,
     export_routes_to_excel,
     build_unassigned_jobs_df,
@@ -29,11 +31,17 @@ from BlueSG.vehicle_route_optimizer import (
     get_cached_geocode,
     load_and_validate_jobs,
     load_rider_roster,
+    optimisation_integrity_report,
     optimise_vehicle_routes,
     read_rider_roster_file,
     save_rider_roster,
     validate_riders,
 )
+
+try:
+    st.set_page_config(page_title="Vehicle Route Optimiser", layout="wide")
+except st.errors.StreamlitAPIException:
+    pass
 
 
 @st.cache_data(show_spinner=False)
@@ -67,6 +75,20 @@ def rider_colour(index: int) -> list[int]:
         [77, 124, 15],
     ]
     return colours[index % len(colours)]
+
+
+def parse_route_path(value: object) -> list[list[float]]:
+    if isinstance(value, list):
+        return value
+    if value is None or pd.isna(value) or value == "":
+        return []
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, json.JSONDecodeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return parsed
 
 
 def build_route_map_data(
@@ -140,6 +162,8 @@ def build_route_map_data(
                 "To": clean_text(row["Pickup Address"]),
                 "Distance KM": row["Empty Distance KM"],
                 "Duration Min": row["Empty Duration Min"],
+                "Instructions": clean_text(row.get("Empty PT Instructions")),
+                "Route Path": parse_route_path(row.get("Empty Route Path")),
                 "color": public_colour,
             },
             {
@@ -148,6 +172,8 @@ def build_route_map_data(
                 "To": clean_text(row["Drop-off Address"]),
                 "Distance KM": row["Loaded Distance KM"],
                 "Duration Min": row["Loaded Duration Min"],
+                "Instructions": clean_text(row.get("Loaded Drive Instructions")),
+                "Route Path": parse_route_path(row.get("Loaded Route Path")),
                 "color": car_colour,
             },
         ]
@@ -161,6 +187,7 @@ def build_route_map_data(
                 or end.get("lon") is None
             ):
                 continue
+            path = leg["Route Path"] or [[start["lon"], start["lat"]], [end["lon"], end["lat"]]]
             leg_rows.append(
                 {
                     "Rider": rider,
@@ -172,7 +199,7 @@ def build_route_map_data(
                     "Distance KM": leg["Distance KM"],
                     "Duration Min": leg["Duration Min"],
                     "Cost Source": clean_text(row["Cost Source"]),
-                    "path": [[start["lon"], start["lat"]], [end["lon"], end["lat"]]],
+                    "path": path,
                     "color": leg["color"],
                     "label_position": [
                         (float(start["lon"]) + float(end["lon"])) / 2,
@@ -183,6 +210,7 @@ def build_route_map_data(
                         f"{rider}<br/>Step {int(row['Sequence'])}: {leg['Mode']}<br/>"
                         f"{leg['From']} -> {leg['To']}<br/>"
                         f"{leg['Distance KM']} km, {leg['Duration Min']} min<br/>"
+                        f"{leg['Instructions']}<br/>"
                         f"{clean_text(row['Car Plate'])}"
                     ),
                 }
@@ -647,7 +675,10 @@ if use_onemap and not onemap_token:
     st.warning("OneMap is enabled but no token is entered. The app will use fallback estimates where needed.")
 
 if st.button("Optimise Routes", type="primary", disabled=not file_is_valid):
-    riders, rider_errors = validate_riders(rider_df)
+    rider_df_for_optimise, duplicate_rider_rows_removed = dedupe_rider_roster(rider_df)
+    if duplicate_rider_rows_removed:
+        st.warning(f"Duplicate rider rows removed before optimisation: {duplicate_rider_rows_removed}")
+    riders, rider_errors = validate_riders(rider_df_for_optimise)
     if rider_errors:
         for error in rider_errors:
             st.error(error)
@@ -658,13 +689,22 @@ if st.button("Optimise Routes", type="primary", disabled=not file_is_valid):
         if use_onemap:
             st.info(
                 f"OneMap mode may take a while: this run can compare up to about "
-                f"{estimated_checks:,} rider-job combinations, and each comparison has an empty leg "
-                "plus a loaded leg. Cached addresses and routes are reused."
+                f"{estimated_checks:,} rider-job combinations. Cached addresses and routes are reused, "
+                "and OneMap PT is only called for distinct empty-leg pairs where needed."
             )
 
-        progress_bar = st.progress(0, text="Preparing optimisation...")
-        status_text = st.empty()
-        detail_text = st.empty()
+        progress_panel = st.container(border=True)
+        with progress_panel:
+            st.markdown("**Optimisation in progress**")
+            metric_cols = st.columns(5)
+            phase_metric = metric_cols[0].empty()
+            assigned_metric = metric_cols[1].empty()
+            remaining_metric = metric_cols[2].empty()
+            elapsed_metric = metric_cols[3].empty()
+            checks_metric = metric_cols[4].empty()
+            progress_bar = st.progress(0, text="Preparing optimisation...")
+            activity_text = st.empty()
+            detail_text = st.empty()
         started_at = time.monotonic()
         last_progress_event: dict = {}
 
@@ -672,23 +712,41 @@ if st.button("Optimise Routes", type="primary", disabled=not file_is_valid):
             last_progress_event.clear()
             last_progress_event.update(event)
             elapsed = time.monotonic() - started_at
-            progress_bar.progress(float(event.get("progress", 0)), text=str(event.get("status", "")))
-            status_text.write(
-                f"Phase: {event.get('phase', 'Working')} | "
-                f"Assigned {event.get('assigned_jobs', 0)} of {event.get('total_jobs', 0)} jobs | "
-                f"Remaining {event.get('remaining_jobs', 0)} | "
-                f"Elapsed {elapsed:,.1f}s"
-            )
+            progress_value = max(0.0, min(1.0, float(event.get("progress", 0))))
+            assigned_jobs = int(event.get("assigned_jobs", 0) or 0)
+            total_jobs = int(event.get("total_jobs", 0) or 0)
+            remaining_jobs = int(event.get("remaining_jobs", 0) or 0)
+            comparison_count = int(event.get("comparison_count", 0) or 0)
+            estimated_comparisons = int(event.get("estimated_comparisons", 0) or 0)
+            phase = str(event.get("phase", "Working"))
+            status = str(event.get("status", "Optimising routes..."))
+
+            phase_metric.metric("Phase", phase)
+            assigned_metric.metric("Assigned", f"{assigned_jobs}/{total_jobs}")
+            remaining_metric.metric("Remaining", remaining_jobs)
+            elapsed_metric.metric("Elapsed", f"{elapsed:,.1f}s")
+            checks_metric.metric("Checks", f"{comparison_count:,}/{estimated_comparisons:,}")
+            progress_bar.progress(progress_value, text=f"{status} ({progress_value * 100:.0f}%)")
+            activity_text.info(status)
+
             detail_parts = []
             if event.get("current_address"):
-                detail_parts.append(f"Address: {event['current_address']}")
+                detail_parts.append(("Address", event["current_address"]))
             if event.get("current_rider"):
-                detail_parts.append(f"Rider: {event['current_rider']}")
+                detail_parts.append(("Rider", event["current_rider"]))
             if event.get("current_pickup"):
-                detail_parts.append(f"Pickup: {event['current_pickup']}")
+                detail_parts.append(("Pickup", event["current_pickup"]))
             if event.get("current_dropoff"):
-                detail_parts.append(f"Drop-off: {event['current_dropoff']}")
-            detail_text.caption(" | ".join(detail_parts) if detail_parts else "Waiting for first lookup...")
+                detail_parts.append(("Drop-off", event["current_dropoff"]))
+
+            if detail_parts:
+                detail_text.dataframe(
+                    pd.DataFrame(detail_parts, columns=["Current item", "Value"]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                detail_text.caption("Warming up caches and preparing route checks...")
 
         try:
             route_df, summary_df, lookup_warnings = optimise_vehicle_routes(
@@ -712,8 +770,18 @@ if st.button("Optimise Routes", type="primary", disabled=not file_is_valid):
                 force_complete_assignment=force_complete_assignment,
                 cluster_pressure_bonus_per_job=cluster_pressure_bonus_per_job,
             )
+            integrity_report = optimisation_integrity_report(route_df, jobs_df)
+            if not integrity_report["is_valid"]:
+                st.error(integrity_report["message"])
+                if integrity_report["duplicate_details"]:
+                    st.dataframe(pd.DataFrame(integrity_report["duplicate_details"]), use_container_width=True, hide_index=True)
+                st.stop()
+        except ValueError as exc:
+            st.error(str(exc))
+            st.stop()
         finally:
             progress_bar.progress(1.0, text="Finished optimisation.")
+            activity_text.success("Finished optimisation.")
         elapsed_total = time.monotonic() - started_at
         if route_df.empty:
             st.session_state.bluesg_latest_optimisation = None
@@ -724,10 +792,12 @@ if st.button("Optimise Routes", type="primary", disabled=not file_is_valid):
                 "route_df": route_df.copy(),
                 "summary_df": summary_df.copy(),
                 "jobs_df": jobs_df.copy(),
-                "rider_df": rider_df.copy(),
+                "rider_df": rider_df_for_optimise.copy(),
                 "validation_warnings": list(validation_warnings),
                 "lookup_warnings": list(lookup_warnings),
                 "token": onemap_token or None,
+                "integrity_report": integrity_report,
+                "duplicate_rider_rows_removed": duplicate_rider_rows_removed,
                 "diagnostics": {
                     "rider_job_checks": int(last_progress_event.get("comparison_count", 0)),
                     "estimated_checks": int(last_progress_event.get("estimated_comparisons", estimated_checks)),
@@ -745,11 +815,21 @@ if latest_optimisation:
     result_lookup_warnings = latest_optimisation["lookup_warnings"]
     result_token = latest_optimisation["token"]
     result_diagnostics = latest_optimisation.get("diagnostics", {})
+    result_integrity = latest_optimisation.get("integrity_report") or optimisation_integrity_report(route_df, result_jobs_df)
+    duplicate_rider_rows_removed = int(latest_optimisation.get("duplicate_rider_rows_removed", 0))
+    unassigned_jobs_df = result_integrity["unassigned_df"]
+
+    if not result_integrity["is_valid"]:
+        st.error(result_integrity["message"])
+        if result_integrity["duplicate_details"]:
+            st.dataframe(pd.DataFrame(result_integrity["duplicate_details"]), use_container_width=True, hide_index=True)
+        st.stop()
 
     st.subheader("4. Review Results")
-    assigned_jobs = len(route_df)
-    total_jobs_uploaded = len(result_jobs_df)
-    unassigned_jobs = max(0, total_jobs_uploaded - assigned_jobs)
+    assigned_jobs = int(result_integrity["assigned_unique_jobs"])
+    assigned_route_rows = int(result_integrity["assigned_route_rows"])
+    total_jobs_uploaded = int(result_integrity["total_valid_jobs"])
+    unassigned_jobs = int(result_integrity["unassigned_jobs"])
     riders_used = (
         int((summary_df["Total Jobs"].fillna(0).astype(int) > 0).sum())
         if "Total Jobs" in summary_df.columns
@@ -766,13 +846,26 @@ if latest_optimisation:
     metric_cols[2].metric("Total Estimated Duration", f"{total_duration:.1f} min")
     metric_cols[3].metric("Unassigned Jobs", unassigned_jobs)
 
-    if len(route_df) < len(result_jobs_df):
+    with st.expander("Optimisation Integrity Checks", expanded=False):
+        integrity_rows = [
+            ["Total valid jobs", total_jobs_uploaded],
+            ["Unique assigned jobs", assigned_jobs],
+            ["Assigned route rows", assigned_route_rows],
+            ["Unassigned jobs", unassigned_jobs],
+            ["Duplicate assigned Uploaded Rows", ", ".join(map(str, result_integrity["duplicate_uploaded_rows"])) or "None"],
+            ["Jobs in both assigned and unassigned", ", ".join(map(str, result_integrity["overlap_uploaded_rows"])) or "None"],
+            ["Duplicate rider rows removed", duplicate_rider_rows_removed],
+        ]
+        st.dataframe(pd.DataFrame(integrity_rows, columns=["Check", "Value"]), use_container_width=True, hide_index=True)
+        if result_integrity["duplicate_details"]:
+            st.write("Duplicate assignment details")
+            st.dataframe(pd.DataFrame(result_integrity["duplicate_details"]), use_container_width=True, hide_index=True)
+
+    if unassigned_jobs:
         st.warning(
-            f"Assigned {len(route_df)} of {len(result_jobs_df)} job(s). "
-            "Some jobs were left unassigned because assigning them would break the adjusted 3-hour cap "
-            "or no suitable rider was available."
+            f"Assigned {assigned_jobs} of {total_jobs_uploaded} job(s). "
+            "Some jobs were left unassigned because no rider route could fit them inside the 14:00-17:00 job window."
         )
-        unassigned_jobs_df = build_unassigned_jobs_df(result_jobs_df, route_df)
         if not unassigned_jobs_df.empty:
             st.write("Unassigned jobs")
             st.dataframe(unassigned_jobs_df, use_container_width=True, hide_index=True)
