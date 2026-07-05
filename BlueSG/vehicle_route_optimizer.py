@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import re
@@ -20,7 +21,14 @@ from openpyxl.utils import get_column_letter
 
 REQUIRED_JOB_HEADERS = ["Car Plate", "Pickup Address", "Pickup Lot", "Drop-off Address"]
 OPTIONAL_JOB_HEADERS = ["Date", "Fuel %", "Pickup Time", "Notes"]
-RIDER_COLUMNS = ["Rider Name", "Start Location", "Start Zone", "Max Jobs"]
+RIDER_COLUMNS = ["Rider Name", "Start Location", "Start Zone", "Max Jobs", "Rider Load"]
+RIDER_LOAD_LEVELS = ["Low", "Normal", "High", "Very High"]
+RIDER_LOAD_SCORE_ADJUSTMENTS = {
+    "Low": 35.0,
+    "Normal": 0.0,
+    "High": -25.0,
+    "Very High": -45.0,
+}
 WEEKDAY_SHEETS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 ROSTER_FILE = Path(__file__).resolve().parent / "rider_roster.xlsx"
 
@@ -157,6 +165,7 @@ class RiderState:
     start_location: str
     start_zone: str | None = None
     max_jobs: int | None = None
+    load_level: str = "Normal"
     current_location: str = ""
     current_zone: str | None = None
     assigned_count: int = 0
@@ -174,6 +183,7 @@ class RiderState:
             start_location=start_location,
             start_zone=start_zone,
             max_jobs=parse_optional_int(row.get("Max Jobs")),
+            load_level=normalise_rider_load_level(row.get("Rider Load")),
             current_location=start_location,
             current_zone=start_zone,
         )
@@ -269,6 +279,14 @@ def parse_optional_int(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
+
+
+def normalise_rider_load_level(value: Any) -> str:
+    text = clean_text(value)
+    for level in RIDER_LOAD_LEVELS:
+        if text.casefold() == level.casefold():
+            return level
+    return "Normal"
 
 
 def _read_csv_cache(path: Path, columns: list[str]) -> pd.DataFrame:
@@ -407,11 +425,119 @@ def clean_address_for_geocoding(address: Any) -> str:
     return text.strip(" ,")
 
 
+def _normalise_header(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", clean_text(value).lower())
+
+
+JOB_HEADER_ALIASES = {
+    "Date": {"date"},
+    "Car Plate": {"carplate", "carplates", "carno", "carnumber", "vehicleplate", "vehicle"},
+    "Fuel %": {"fuel", "fuelpercent", "fuelpercentage"},
+    "Pickup Address": {"pickupaddress", "pickuplocation", "pickuplocationaddress", "startlocation"},
+    "Pickup Lot": {"pickuplot", "lot", "lots", "lotnumber", "lotsnumber", "pickuplotsnumber"},
+    "Drop-off Address": {"dropoffaddress", "dropofflocation", "endlocation", "destination"},
+    "Pickup Time": {"pickuptime", "starttime"},
+    "Notes": {"notes", "note", "remarks", "remark"},
+}
+
+
+def _canonical_job_header(value: Any) -> str | None:
+    normalised = _normalise_header(value)
+    for canonical, aliases in JOB_HEADER_ALIASES.items():
+        if normalised in aliases:
+            return canonical
+    return None
+
+
+def _find_job_header_row(raw: pd.DataFrame) -> int:
+    best_row = 0
+    best_score = -1
+    search_rows = min(20, len(raw))
+    for row_index in range(search_rows):
+        found = {
+            canonical
+            for value in raw.iloc[row_index].tolist()
+            if (canonical := _canonical_job_header(value)) is not None
+        }
+        score = sum(header in found for header in REQUIRED_JOB_HEADERS)
+        if score > best_score:
+            best_row = row_index
+            best_score = score
+        if score == len(REQUIRED_JOB_HEADERS):
+            return row_index
+    return best_row
+
+
+def _coerce_job_date(value: Any, swap_month_day: bool = False) -> Any:
+    if pd.isna(value):
+        return value
+
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return value
+
+    timestamp = pd.Timestamp(parsed)
+    # Some supplier sheets are typed as m/d but used operationally as d/m.
+    # Example: displayed/input "04/07" should mean 4 July, not 7 April.
+    if swap_month_day and timestamp.day <= 12:
+        timestamp = pd.Timestamp(year=timestamp.year, month=timestamp.day, day=timestamp.month)
+    return timestamp.normalize()
+
+
 def load_jobs_from_excel(uploaded_file: Any) -> pd.DataFrame:
     try:
-        jobs = pd.read_excel(uploaded_file)
+        if hasattr(uploaded_file, "seek"):
+            uploaded_file.seek(0)
+        raw = pd.read_excel(uploaded_file, header=None)
     except Exception as exc:
         raise ValueError(f"Unable to read the Excel file: {exc}") from exc
+
+    if raw.empty:
+        return pd.DataFrame()
+
+    header_row = _find_job_header_row(raw)
+    headers = raw.iloc[header_row].tolist()
+    data = raw.iloc[header_row + 1 :].copy()
+    uses_supplier_day_month_dates = any(
+        _normalise_header(header) in {"carplate", "pickuplocation", "endlocation"}
+        for header in headers
+    )
+
+    output = pd.DataFrame(index=data.index)
+    seen_lots_number = 0
+    for column_index, header in enumerate(headers):
+        canonical = _canonical_job_header(header)
+        normalised = _normalise_header(header)
+        if normalised in {"lotnumber", "lotsnumber"}:
+            seen_lots_number += 1
+            canonical = "Pickup Lot" if seen_lots_number == 1 else None
+        if canonical is None or canonical in output.columns:
+            continue
+        output[canonical] = data.iloc[:, column_index]
+
+    extra_notes = []
+    for column_name in ["Driver", "Contact"]:
+        matching_indexes = [
+            index for index, header in enumerate(headers) if _normalise_header(header) == _normalise_header(column_name)
+        ]
+        if matching_indexes:
+            extra_notes.append(data.iloc[:, matching_indexes[0]].apply(clean_text))
+    if extra_notes:
+        combined = extra_notes[0]
+        for note_series in extra_notes[1:]:
+            combined = combined.str.cat(note_series, sep=" ", na_rep="").str.strip()
+        if "Notes" in output.columns:
+            output["Notes"] = output["Notes"].apply(clean_text).str.cat(combined, sep=" ", na_rep="").str.strip()
+        else:
+            output["Notes"] = combined
+
+    if "Date" in output.columns:
+        output["Date"] = output["Date"].apply(
+            lambda value: _coerce_job_date(value, swap_month_day=uses_supplier_day_month_dates)
+        )
+
+    output["_uploaded_row"] = data.index.astype(int) + 1
+    jobs = output.dropna(how="all").reset_index(drop=True)
     jobs.columns = [clean_text(column) for column in jobs.columns]
     return jobs
 
@@ -424,8 +550,13 @@ def validate_jobs(jobs: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[str
         return pd.DataFrame(), missing_headers, warnings
 
     keep_columns = REQUIRED_JOB_HEADERS + [header for header in OPTIONAL_JOB_HEADERS if header in jobs.columns]
+    if "_uploaded_row" in jobs.columns:
+        keep_columns.append("_uploaded_row")
     jobs = jobs.loc[:, keep_columns].copy()
-    jobs["_original_order"] = range(len(jobs))
+    if "_uploaded_row" in jobs.columns:
+        jobs["_original_order"] = pd.to_numeric(jobs["_uploaded_row"], errors="coerce").fillna(2).astype(int) - 2
+    else:
+        jobs["_original_order"] = range(len(jobs))
 
     before_drop = len(jobs)
     jobs = jobs[
@@ -1015,6 +1146,7 @@ def calculate_assignment_score(
     rider_total_duration_min: float,
     rider_assigned_jobs: int,
     rider_max_jobs: int | None,
+    rider_load_level: str = "Normal",
     optimise_by: str = "duration",
     empty_weight: float = DEFAULT_EMPTY_WEIGHT,
     loaded_weight: float = DEFAULT_LOADED_WEIGHT,
@@ -1056,12 +1188,15 @@ def calculate_assignment_score(
     projected_jobs = rider_assigned_jobs + 1
     max_jobs_overage = max(0, projected_jobs - rider_max_jobs) if rider_max_jobs is not None else 0
     max_jobs_penalty = (max_jobs_overage**2) * max_jobs_overage_penalty
+    load_level = normalise_rider_load_level(rider_load_level)
+    rider_load_adjustment = RIDER_LOAD_SCORE_ADJUSTMENTS.get(load_level, 0.0) * projected_jobs
     assignment_score = (
         movement_score
         + zone_adjustment
         + workload_penalty
         + duration_penalty
         + max_jobs_penalty
+        + rider_load_adjustment
     )
 
     return {
@@ -1070,6 +1205,7 @@ def calculate_assignment_score(
         "workload_penalty": round(float(workload_penalty), 3),
         "duration_penalty": round(float(duration_penalty), 3),
         "max_jobs_penalty": round(float(max_jobs_penalty), 3),
+        "rider_load_adjustment": round(float(rider_load_adjustment), 3),
         "projected_duration_min": round(float(projected_duration), 3),
         "projected_adjusted_duration_min": round(float(projected_adjusted_duration), 3),
         "max_jobs_overage": int(max_jobs_overage),
@@ -1078,14 +1214,22 @@ def calculate_assignment_score(
 
 def default_rider_table(count: int = 4) -> pd.DataFrame:
     defaults = [
-        {"Rider Name": "Rider A", "Start Location": "Sengkang", "Start Zone": "North-East", "Max Jobs": 5},
-        {"Rider Name": "Rider B", "Start Location": "Punggol", "Start Zone": "North-East", "Max Jobs": 5},
-        {"Rider Name": "Rider C", "Start Location": "Yishun", "Start Zone": "North", "Max Jobs": 5},
-        {"Rider Name": "Rider D", "Start Location": "Tampines", "Start Zone": "East", "Max Jobs": 5},
+        {"Rider Name": "Rider A", "Start Location": "Sengkang", "Start Zone": "North-East", "Max Jobs": 5, "Rider Load": "Normal"},
+        {"Rider Name": "Rider B", "Start Location": "Punggol", "Start Zone": "North-East", "Max Jobs": 5, "Rider Load": "Normal"},
+        {"Rider Name": "Rider C", "Start Location": "Yishun", "Start Zone": "North", "Max Jobs": 5, "Rider Load": "Normal"},
+        {"Rider Name": "Rider D", "Start Location": "Tampines", "Start Zone": "East", "Max Jobs": 5, "Rider Load": "Normal"},
     ]
     while len(defaults) < count:
         rider_number = len(defaults) + 1
-        defaults.append({"Rider Name": f"Rider {rider_number}", "Start Location": "", "Start Zone": "", "Max Jobs": None})
+        defaults.append(
+            {
+                "Rider Name": f"Rider {rider_number}",
+                "Start Location": "",
+                "Start Zone": "",
+                "Max Jobs": None,
+                "Rider Load": "Normal",
+            }
+        )
     return pd.DataFrame(defaults[:count])
 
 
@@ -1099,6 +1243,7 @@ def _normalise_rider_roster(rider_df: pd.DataFrame) -> pd.DataFrame:
     rider_df["Start Location"] = rider_df["Start Location"].apply(clean_text)
     rider_df["Start Zone"] = rider_df["Start Zone"].apply(clean_text)
     rider_df["Max Jobs"] = rider_df["Max Jobs"].apply(parse_optional_int)
+    rider_df["Rider Load"] = rider_df["Rider Load"].apply(normalise_rider_load_level)
     return rider_df
 
 
@@ -1361,6 +1506,32 @@ def _route_zone_for_job(job: dict[str, Any], key: str) -> str | None:
     return job.get(zone_key) or infer_zone(address)
 
 
+def _route_variant_score_adjustment(
+    route_variant_index: int,
+    rider: RiderState,
+    job: dict[str, Any],
+    assignment_round: int,
+) -> float:
+    if route_variant_index <= 0:
+        return 0.0
+
+    key = "|".join(
+        [
+            str(route_variant_index),
+            str(assignment_round),
+            rider.name,
+            rider.start_location,
+            str(_job_id(job)),
+            clean_text(job.get("Pickup Address")),
+            clean_text(job.get("Drop-off Address")),
+        ]
+    )
+    digest = hashlib.sha256(key.encode("utf-8")).digest()
+    bucket = int.from_bytes(digest[:2], "big") / 65535
+    centred = (bucket * 2) - 1
+    return centred * 30.0
+
+
 def optimise_vehicle_routes(
     jobs: pd.DataFrame,
     riders: list[RiderState],
@@ -1381,6 +1552,7 @@ def optimise_vehicle_routes(
     empty_travel_wait_buffer_min: float = DEFAULT_EMPTY_TRAVEL_WAIT_BUFFER_MIN,
     force_complete_assignment: bool = True,
     cluster_pressure_bonus_per_job: float = DEFAULT_CLUSTER_PRESSURE_BONUS_PER_JOB,
+    route_variant_index: int = 0,
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     token = token or get_onemap_token()
     remaining = jobs.sort_values("_original_order").to_dict("records")
@@ -1404,6 +1576,7 @@ def optimise_vehicle_routes(
             "start_location": rider.start_location,
             "start_zone": rider.start_zone,
             "max_jobs": rider.max_jobs,
+            "load_level": rider.load_level,
         }
         for rider in riders
     }
@@ -1508,6 +1681,7 @@ def optimise_vehicle_routes(
                 rider_total_duration_min=in_window_duration,
                 rider_assigned_jobs=sequence_index - 1,
                 rider_max_jobs=base_rider_state[key]["max_jobs"],
+                rider_load_level=base_rider_state[key]["load_level"],
                 optimise_by=optimise_by,
                 empty_weight=empty_weight,
                 loaded_weight=loaded_weight,
@@ -1657,7 +1831,9 @@ def optimise_vehicle_routes(
 
     # Semi-optimised greedy assignment: every round compares all remaining fixed
     # pickup-to-drop-off jobs against every rider's real current location.
+    assignment_round = 0
     while remaining and riders:
+        assignment_round += 1
         report("Comparing rider-job combinations", phase="Comparing")
         remaining_pickup_zone_counts: dict[str, int] = {}
         for remaining_job in remaining:
@@ -1690,7 +1866,17 @@ def optimise_vehicle_routes(
                 rider_minimum_target = _rider_minimum_job_target(rider, minimum_job_target)
                 minimum_priority = _minimum_job_priority(rider.assigned_count, rider_minimum_target)
                 cluster_pressure_bonus = -cluster_pressure_bonus_per_job * remaining_pickup_zone_counts.get(pickup_zone or "Unknown", 0)
-                greedy_assignment_score = float(inserted_row.get("Assignment Score", 0) or 0) + cluster_pressure_bonus
+                route_variant_adjustment = _route_variant_score_adjustment(
+                    route_variant_index,
+                    rider,
+                    job,
+                    assignment_round,
+                )
+                greedy_assignment_score = (
+                    float(inserted_row.get("Assignment Score", 0) or 0)
+                    + cluster_pressure_bonus
+                    + route_variant_adjustment
+                )
                 cluster_jump_penalty = 0 if rider.current_zone == pickup_zone or rider.assigned_count == 0 else 25
                 candidate_rank = (
                     minimum_priority,

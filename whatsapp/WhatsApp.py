@@ -58,7 +58,7 @@ def render_recent_messages(chat_name: str) -> None:
         "has_image",
         "image_path",
     ]
-    st.dataframe(dataframe[visible_columns], use_container_width=True, hide_index=True)
+    st.dataframe(dataframe[visible_columns], width="stretch", hide_index=True)
 
 
 def render_streamlit_page() -> None:

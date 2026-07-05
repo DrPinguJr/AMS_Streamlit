@@ -57,7 +57,7 @@ def render_streamlit_page() -> None:
                         f"Added {save_summary.new_count} new and updated {save_summary.updated_count}. "
                         f"Saved {save_summary.new_output_path.name}."
                     )
-                st.dataframe(dataframe, use_container_width=True)
+                st.dataframe(dataframe, width="stretch")
                 if save_summary.new_output_path is not None:
                     st.download_button(
                         "Download New Excel",

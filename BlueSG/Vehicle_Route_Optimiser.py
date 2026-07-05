@@ -20,6 +20,8 @@ from BlueSG.vehicle_route_optimizer import (
     DEFAULT_SOFT_WORKLOAD_MIN,
     DEFAULT_WORKLOAD_PENALTY_PER_MIN,
     REQUIRED_JOB_HEADERS,
+    RIDER_COLUMNS,
+    RIDER_LOAD_LEVELS,
     ROSTER_FILE,
     clean_text,
     WEEKDAY_SHEETS,
@@ -89,6 +91,24 @@ def parse_route_path(value: object) -> list[list[float]]:
     if not isinstance(parsed, list):
         return []
     return parsed
+
+
+def add_session_rider_load_column(rider_df: pd.DataFrame) -> pd.DataFrame:
+    rider_df = rider_df.copy() if rider_df is not None else pd.DataFrame()
+    if "Rider Load" not in rider_df.columns:
+        rider_df["Rider Load"] = "Normal"
+    rider_df["Rider Load"] = rider_df["Rider Load"].apply(
+        lambda value: value if value in RIDER_LOAD_LEVELS else "Normal"
+    )
+    return rider_df
+
+
+def persistent_roster_columns(rider_df: pd.DataFrame) -> pd.DataFrame:
+    rider_df = rider_df.copy() if rider_df is not None else pd.DataFrame()
+    for column in RIDER_COLUMNS:
+        if column not in rider_df.columns:
+            rider_df[column] = None
+    return rider_df.loc[:, RIDER_COLUMNS].copy()
 
 
 def build_route_map_data(
@@ -258,7 +278,7 @@ def show_route_map(route_df: pd.DataFrame, jobs_df: pd.DataFrame, rider_df: pd.D
                 f"{rider_name}",
                 key=f"map_rider_{rider_name}",
                 type=button_type,
-                use_container_width=True,
+                width="stretch",
             ):
                 selected_rider = rider_name
                 st.session_state[selected_key] = rider_name
@@ -267,7 +287,7 @@ def show_route_map(route_df: pd.DataFrame, jobs_df: pd.DataFrame, rider_df: pd.D
                 st.caption(f"{round(total_distance, 2)} km")
                 st.caption(f"{round(total_duration, 1)} min")
 
-        if selected_rider and st.button("Clear route", key="map_clear_rider", use_container_width=True):
+        if selected_rider and st.button("Clear route", key="map_clear_rider", width="stretch"):
             selected_rider = ""
             st.session_state[selected_key] = ""
 
@@ -340,7 +360,7 @@ def show_route_map(route_df: pd.DataFrame, jobs_df: pd.DataFrame, rider_df: pd.D
                 st.warning("This rider has no drawable route legs. Check whether the route addresses were geocoded.")
         else:
             st.caption("Select a rider on the right to show their route.")
-        st.pydeck_chart(deck, use_container_width=True)
+        st.pydeck_chart(deck, width="stretch")
 
         legend_cols = st.columns(4)
         legend_cols[0].caption("Red: public transport to pickup")
@@ -433,10 +453,40 @@ with upload_col:
             else:
                 file_is_valid = True
                 skipped_rows = int(jobs_df.attrs.get("blank_address_rows_dropped", 0))
+                if "Date" in jobs_df.columns:
+                    parsed_dates = pd.to_datetime(jobs_df["Date"], errors="coerce").dt.date
+                    available_dates = sorted(parsed_dates.dropna().unique())
+                    if available_dates:
+                        today = pd.Timestamp.now(tz="Asia/Singapore").date()
+                        default_date_index = (
+                            available_dates.index(today)
+                            if today in available_dates
+                            else len(available_dates) - 1
+                        )
+                        selected_job_date = st.selectbox(
+                            "Job date",
+                            available_dates,
+                            index=default_date_index,
+                            format_func=lambda value: value.strftime("%d/%m/%Y"),
+                            help="Only jobs for the selected date are sent into the optimiser.",
+                        )
+                        all_date_jobs_count = len(jobs_df)
+                        jobs_df = jobs_df.loc[parsed_dates == selected_job_date].copy()
+                        jobs_df.attrs.update(
+                            {
+                                "uploaded_count": all_date_jobs_count,
+                                "blank_address_rows_dropped": skipped_rows,
+                            }
+                        )
+                        st.caption(
+                            f"Showing {len(jobs_df)} of {all_date_jobs_count} valid job(s) "
+                            f"for {selected_job_date.strftime('%d/%m/%Y')}."
+                        )
                 status_cols = st.columns(2)
                 status_cols[0].metric("Valid Jobs", len(jobs_df))
                 status_cols[1].metric("Skipped Rows", skipped_rows)
                 preview_columns = [
+                    "Date",
                     "Car Plate",
                     "Pickup Address",
                     "Pickup Lot",
@@ -444,10 +494,11 @@ with upload_col:
                     "Pickup Zone",
                     "Drop-off Zone",
                 ]
+                preview_columns = [column for column in preview_columns if column in jobs_df.columns]
                 with st.expander("Preview uploaded jobs", expanded=True):
                     st.dataframe(
                         jobs_df[preview_columns],
-                        use_container_width=True,
+                        width="stretch",
                         hide_index=True,
                         height=220,
                     )
@@ -473,15 +524,17 @@ with riders_col:
 
     if st.session_state.get("bluesg_roster_day") != selected_roster_day:
         st.session_state.bluesg_roster_day = selected_roster_day
-        st.session_state.bluesg_riders = load_rider_roster(selected_roster_day)
+        st.session_state.bluesg_riders = add_session_rider_load_column(load_rider_roster(selected_roster_day))
 
     if "bluesg_riders" not in st.session_state:
-        st.session_state.bluesg_riders = load_rider_roster(selected_roster_day)
+        st.session_state.bluesg_riders = add_session_rider_load_column(load_rider_roster(selected_roster_day))
+    else:
+        st.session_state.bluesg_riders = add_session_rider_load_column(st.session_state.bluesg_riders)
 
     rider_df = st.data_editor(
         st.session_state.bluesg_riders,
         num_rows="dynamic",
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         height=330,
         column_config={
@@ -496,15 +549,20 @@ with riders_col:
                 step=1,
                 help="Soft preference only. A rider can exceed it if they are still the best nearby match.",
             ),
+            "Rider Load": st.column_config.SelectboxColumn(
+                options=RIDER_LOAD_LEVELS,
+                help="Session-only priority. Low gets fewer jobs; High and Very High are preferred for more jobs.",
+            ),
         },
     )
+    rider_df = add_session_rider_load_column(rider_df)
     st.session_state.bluesg_riders = rider_df
 
     roster_action_cols = st.columns([1, 1, 1])
     with roster_action_cols[0]:
-        if st.button("Save Roster", type="secondary", use_container_width=True):
+        if st.button("Save Roster", type="secondary", width="stretch"):
             try:
-                saved_path = save_rider_roster(selected_roster_day, rider_df)
+                saved_path = save_rider_roster(selected_roster_day, persistent_roster_columns(rider_df))
             except PermissionError:
                 st.error("Could not save roster. Close the Excel workbook if it is open, then try again.")
             except Exception as exc:
@@ -512,15 +570,15 @@ with riders_col:
             else:
                 st.success(f"Saved {selected_roster_day} roster to {saved_path}")
     with roster_action_cols[1]:
-        if st.button("Reload From Excel", use_container_width=True):
+        if st.button("Reload From Excel", width="stretch"):
             try:
-                st.session_state.bluesg_riders = load_rider_roster(selected_roster_day)
+                st.session_state.bluesg_riders = add_session_rider_load_column(load_rider_roster(selected_roster_day))
             except Exception as exc:
                 st.error(f"Could not reload roster: {exc}")
             else:
                 st.rerun()
     with roster_action_cols[2]:
-        if st.button("Open Excel File", use_container_width=True):
+        if st.button("Open Excel File", width="stretch"):
             try:
                 os.startfile(ROSTER_FILE)
             except Exception as exc:
@@ -562,16 +620,35 @@ with action_col:
 
         ready_text = "Ready to optimise" if file_is_valid else "Upload a valid job file first"
         st.caption(ready_text)
-        optimise_clicked = st.button(
-            "Optimise Routes",
-            type="primary",
-            disabled=not file_is_valid,
-            use_container_width=True,
-        )
+        optimise_cols = st.columns(2)
+        with optimise_cols[0]:
+            optimise_clicked = st.button(
+                "Optimise Routes",
+                type="primary",
+                disabled=not file_is_valid,
+                width="stretch",
+            )
+        with optimise_cols[1]:
+            optimise_new_route_clicked = st.button(
+                "Optimise New Route",
+                disabled=not file_is_valid,
+                width="stretch",
+                help="Generate an alternate valid route plan by nudging assignment choices.",
+            )
+
+        if optimise_clicked:
+            st.session_state.bluesg_route_variant_index = 0
+        elif optimise_new_route_clicked:
+            st.session_state.bluesg_route_variant_index = int(
+                st.session_state.get("bluesg_route_variant_index", 0)
+            ) + 1
+        route_variant_index = int(st.session_state.get("bluesg_route_variant_index", 0))
+        if route_variant_index > 0:
+            st.caption(f"Alternate route variant #{route_variant_index}")
 
     with st.expander("Advanced Settings", expanded=False):
         st.write("Fallback travel cost table")
-        st.dataframe(cached_cost_explanation(), use_container_width=True, hide_index=True, height=180)
+        st.dataframe(cached_cost_explanation(), width="stretch", hide_index=True, height=180)
 
         st.markdown("**Public Transport Empty Leg**")
         pt_col_a, pt_col_b = st.columns(2)
@@ -600,7 +677,7 @@ with action_col:
             value=True,
             help="If enabled, the optimiser retries unassigned jobs in different route positions, but never exceeds the max adjusted minutes cap.",
         )
-        if st.button("Reset to Recommended Defaults", use_container_width=True):
+        if st.button("Reset to Recommended Defaults", width="stretch"):
             for key, value in scoring_defaults.items():
                 st.session_state[f"bluesg_{key}"] = value
 
@@ -697,7 +774,7 @@ with action_col:
             key="bluesg_cluster_pressure_bonus_per_job",
         )
 
-if optimise_clicked:
+if optimise_clicked or optimise_new_route_clicked:
     rider_df_for_optimise, duplicate_rider_rows_removed = dedupe_rider_roster(rider_df)
     if duplicate_rider_rows_removed:
         st.warning(f"Duplicate rider rows removed before optimisation: {duplicate_rider_rows_removed}")
@@ -765,7 +842,7 @@ if optimise_clicked:
             if detail_parts:
                 detail_text.dataframe(
                     pd.DataFrame(detail_parts, columns=["Current item", "Value"]),
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                 )
             else:
@@ -792,12 +869,13 @@ if optimise_clicked:
                 empty_travel_wait_buffer_min=empty_travel_wait_buffer_min,
                 force_complete_assignment=force_complete_assignment,
                 cluster_pressure_bonus_per_job=cluster_pressure_bonus_per_job,
+                route_variant_index=route_variant_index,
             )
             integrity_report = optimisation_integrity_report(route_df, jobs_df)
             if not integrity_report["is_valid"]:
                 st.error(integrity_report["message"])
                 if integrity_report["duplicate_details"]:
-                    st.dataframe(pd.DataFrame(integrity_report["duplicate_details"]), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(integrity_report["duplicate_details"]), width="stretch", hide_index=True)
                 st.stop()
         except ValueError as exc:
             st.error(str(exc))
@@ -821,6 +899,7 @@ if optimise_clicked:
                 "token": onemap_token or None,
                 "integrity_report": integrity_report,
                 "duplicate_rider_rows_removed": duplicate_rider_rows_removed,
+                "route_variant_index": route_variant_index,
                 "diagnostics": {
                     "rider_job_checks": int(last_progress_event.get("comparison_count", 0)),
                     "estimated_checks": int(last_progress_event.get("estimated_comparisons", estimated_checks)),
@@ -840,12 +919,13 @@ if latest_optimisation:
     result_diagnostics = latest_optimisation.get("diagnostics", {})
     result_integrity = latest_optimisation.get("integrity_report") or optimisation_integrity_report(route_df, result_jobs_df)
     duplicate_rider_rows_removed = int(latest_optimisation.get("duplicate_rider_rows_removed", 0))
+    result_route_variant_index = int(latest_optimisation.get("route_variant_index", 0))
     unassigned_jobs_df = result_integrity["unassigned_df"]
 
     if not result_integrity["is_valid"]:
         st.error(result_integrity["message"])
         if result_integrity["duplicate_details"]:
-            st.dataframe(pd.DataFrame(result_integrity["duplicate_details"]), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(result_integrity["duplicate_details"]), width="stretch", hide_index=True)
         st.stop()
 
     with review_col:
@@ -879,11 +959,12 @@ if latest_optimisation:
                 ["Duplicate assigned Uploaded Rows", ", ".join(map(str, result_integrity["duplicate_uploaded_rows"])) or "None"],
                 ["Jobs in both assigned and unassigned", ", ".join(map(str, result_integrity["overlap_uploaded_rows"])) or "None"],
                 ["Duplicate rider rows removed", duplicate_rider_rows_removed],
+                ["Route variant", f"Alternate #{result_route_variant_index}" if result_route_variant_index else "Default"],
             ]
-            st.dataframe(pd.DataFrame(integrity_rows, columns=["Check", "Value"]), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(integrity_rows, columns=["Check", "Value"]), width="stretch", hide_index=True)
             if result_integrity["duplicate_details"]:
                 st.write("Duplicate assignment details")
-                st.dataframe(pd.DataFrame(result_integrity["duplicate_details"]), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(result_integrity["duplicate_details"]), width="stretch", hide_index=True)
 
         if unassigned_jobs:
             st.warning(
@@ -892,7 +973,7 @@ if latest_optimisation:
             )
             if not unassigned_jobs_df.empty:
                 st.write("Unassigned jobs")
-                st.dataframe(unassigned_jobs_df, use_container_width=True, hide_index=True, height=160)
+                st.dataframe(unassigned_jobs_df, width="stretch", hide_index=True, height=160)
 
         failed_validation = route_df["Route Validation Status"].ne("OK")
         if failed_validation.any():
@@ -918,7 +999,7 @@ if latest_optimisation:
                     for column in ["Rider", "Sequence", "Start From", "Drop-off Address", "Route Validation Status"]
                     if column in route_df.columns
                 ]
-                st.dataframe(route_df.loc[failed_validation, validation_cols], use_container_width=True, hide_index=True)
+                st.dataframe(route_df.loc[failed_validation, validation_cols], width="stretch", hide_index=True)
 
         with st.expander("Optimisation diagnostics", expanded=False):
             diag_cols = st.columns(3)
@@ -942,10 +1023,10 @@ if latest_optimisation:
         "Total Duration Min",
     ]
     dispatch_columns = [column for column in dispatch_columns if column in route_df.columns]
-    st.dataframe(route_df[dispatch_columns], use_container_width=True, hide_index=True)
+    st.dataframe(route_df[dispatch_columns], width="stretch", hide_index=True)
 
     with st.expander("Technical route details", expanded=False):
-        st.dataframe(route_df, use_container_width=True, hide_index=True)
+        st.dataframe(route_df, width="stretch", hide_index=True)
 
     st.subheader("Summary")
     summary_columns = [
@@ -959,7 +1040,7 @@ if latest_optimisation:
         "Workload Comment",
     ]
     summary_columns = [column for column in summary_columns if column in summary_df.columns]
-    st.dataframe(summary_df[summary_columns], use_container_width=True, hide_index=True)
+    st.dataframe(summary_df[summary_columns], width="stretch", hide_index=True)
 
     detail_summary_columns = [
         "Rider",
@@ -972,7 +1053,7 @@ if latest_optimisation:
     ]
     detail_summary_columns = [column for column in detail_summary_columns if column in summary_df.columns]
     with st.expander("Detailed summary columns", expanded=False):
-        st.dataframe(summary_df[detail_summary_columns], use_container_width=True, hide_index=True)
+        st.dataframe(summary_df[detail_summary_columns], width="stretch", hide_index=True)
 
     st.subheader("5. Download")
     st.download_button(

@@ -186,7 +186,7 @@ def render_uploaded_flow(starting_name: str) -> None:
         {"Original": uploaded_file.name, "Word output": output_name(uploaded_file.name, starting_name)}
         for uploaded_file in uploaded_files
     ]
-    st.dataframe(preview_rows, use_container_width=True, hide_index=True)
+    st.dataframe(preview_rows, width="stretch", hide_index=True)
 
     if not st.button("Convert uploaded PDFs", type="primary"):
         return
@@ -218,7 +218,7 @@ def render_folder_flow(starting_name: str) -> None:
         {"Original": path.name, "Word output": output_name(path.name, starting_name)}
         for path in selected_paths
     ]
-    st.dataframe(preview_rows, use_container_width=True, hide_index=True)
+    st.dataframe(preview_rows, width="stretch", hide_index=True)
 
     if st.button("Convert selected folder PDFs", type="primary", disabled=not selected_paths):
         with st.spinner("Converting PDFs to Word..."):

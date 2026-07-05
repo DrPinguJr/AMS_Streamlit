@@ -418,7 +418,7 @@ def extract_docx_text_fallback(path: Path) -> str:
 
 def preview_image(path: Path) -> None:
     try:
-        st.image(str(path), use_container_width=True)
+        st.image(str(path), width="stretch")
     except Exception as exc:
         st.warning(f"Image preview failed: {exc}")
 
@@ -434,7 +434,7 @@ def preview_text_file(path: Path) -> None:
 def preview_spreadsheet(path: Path) -> None:
     try:
         df = pd.read_excel(path, nrows=100)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, width="stretch", hide_index=True)
     except Exception as exc:
         st.info(f"Spreadsheet preview is not available for this file. Use Open or Download. Details: {exc}")
 
@@ -715,7 +715,7 @@ def render_role_management() -> None:
     display_roles = roles_df.copy()
     edited_roles = st.data_editor(
         display_roles,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         column_config={
             "Active": st.column_config.SelectboxColumn("Active", options=["Yes", "No"]),
@@ -1118,7 +1118,7 @@ def render_diagnostics() -> None:
         if log_df.empty:
             st.info("No activity logged yet.")
         else:
-            st.dataframe(log_df.tail(50).iloc[::-1], use_container_width=True, hide_index=True)
+            st.dataframe(log_df.tail(50).iloc[::-1], width="stretch", hide_index=True)
 
 
 def main() -> None:

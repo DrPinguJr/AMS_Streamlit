@@ -53,7 +53,7 @@ def render_sesami_tab() -> None:
                 cached_sesami_data.clear()
                 dataframe = pd.DataFrame([row.as_dict() for row in rows])
                 st.success(f"Extracted {len(dataframe)} Sesami rows and saved {saved_path.name}.")
-                st.dataframe(dataframe, use_container_width=True)
+                st.dataframe(dataframe, width="stretch")
                 st.download_button(
                     "Download Excel",
                     saved_path.read_bytes(),
@@ -67,7 +67,7 @@ def render_sesami_tab() -> None:
     if latest_dataframe.empty:
         st.info("No saved Sesami Excel file found yet.")
     else:
-        st.dataframe(latest_dataframe, use_container_width=True)
+        st.dataframe(latest_dataframe, width="stretch")
 
 
 def running_inside_streamlit() -> bool:
