@@ -15,6 +15,10 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import pandas as pd
+try:
+    import streamlit as st
+except ImportError:  # pragma: no cover - Streamlit is present in the app, but keep helpers importable.
+    st = None
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
@@ -146,6 +150,7 @@ SHORT_WALK_DISTANCE_KM = 1.0
 SHORT_WALK_DURATION_MIN = 15.0
 ONEMAP_SEARCH_URL = "https://www.onemap.gov.sg/api/common/elastic/search"
 ONEMAP_ROUTE_URL = "https://www.onemap.gov.sg/api/public/routingsvc/route"
+ONEMAP_AUTH_URL = "https://www.onemap.gov.sg/api/auth/post/getToken"
 CACHE_DIR = Path(__file__).resolve().parent / "cache"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ENV_FILE = PROJECT_ROOT / ".env"
@@ -157,6 +162,8 @@ ROUTE_MEMORY_CACHE: dict[str, TravelCost] = {}
 GEOCODE_DISK_CACHE_LOADED = False
 ROUTE_DISK_CACHE_LOADED = False
 SINGAPORE_TZ = timezone(timedelta(hours=8))
+ONEMAP_MEMORY_TOKEN: str = ""
+ONEMAP_MEMORY_TOKEN_EXPIRY: datetime | None = None
 
 
 @dataclass
@@ -381,6 +388,158 @@ def get_onemap_token() -> str:
     return load_env_value("ONEMAP_TOKEN")
 
 
+def _get_streamlit_session_value(key: str, default: Any = None) -> Any:
+    if not _streamlit_context_available():
+        return default
+    try:
+        return st.session_state.get(key, default)
+    except Exception:
+        return default
+
+
+def _set_streamlit_session_value(key: str, value: Any) -> None:
+    if not _streamlit_context_available():
+        return
+    try:
+        st.session_state[key] = value
+    except Exception:
+        return
+
+
+def _streamlit_context_available() -> bool:
+    if st is None:
+        return False
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+        return get_script_run_ctx() is not None
+    except Exception:
+        return False
+
+
+def _get_onemap_secret(name: str) -> str:
+    if _streamlit_context_available():
+        try:
+            value = st.secrets.get(name, "")
+        except Exception:
+            value = ""
+        if value:
+            return clean_text(value)
+    return load_env_value(name)
+
+
+def _parse_onemap_token_expiry(payload: dict[str, Any]) -> datetime | None:
+    expires_in = payload.get("expires_in") or payload.get("expiresIn")
+    if expires_in is not None:
+        try:
+            return datetime.now(timezone.utc) + timedelta(seconds=float(expires_in))
+        except (TypeError, ValueError):
+            pass
+
+    expiry_value = (
+        payload.get("expiry_timestamp")
+        or payload.get("expiryTimestamp")
+        or payload.get("expires_at")
+        or payload.get("expiresAt")
+        or payload.get("expiry")
+    )
+    if expiry_value is None:
+        return None
+    try:
+        if isinstance(expiry_value, (int, float)):
+            timestamp = float(expiry_value)
+            if timestamp > 10_000_000_000:
+                timestamp /= 1000
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        expiry_text = clean_text(expiry_value)
+        if expiry_text.isdigit():
+            timestamp = float(expiry_text)
+            if timestamp > 10_000_000_000:
+                timestamp /= 1000
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        parsed = pd.to_datetime(expiry_text, errors="coerce", utc=True)
+        if pd.isna(parsed):
+            return None
+        return parsed.to_pydatetime()
+    except (OSError, OverflowError, TypeError, ValueError):
+        return None
+
+
+def _cached_onemap_token_is_valid(expiry: datetime | None) -> bool:
+    if expiry is None:
+        return True
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    return expiry > datetime.now(timezone.utc) + timedelta(hours=1)
+
+
+def _store_active_onemap_token(token: str, expiry: datetime | None = None) -> None:
+    global ONEMAP_MEMORY_TOKEN, ONEMAP_MEMORY_TOKEN_EXPIRY
+    ONEMAP_MEMORY_TOKEN = token
+    ONEMAP_MEMORY_TOKEN_EXPIRY = expiry
+    _set_streamlit_session_value("onemap_token", token)
+    _set_streamlit_session_value("onemap_token_expiry", expiry)
+
+
+def request_new_onemap_token() -> tuple[str, datetime | None]:
+    email = _get_onemap_secret("ONEMAP_EMAIL")
+    password = _get_onemap_secret("ONEMAP_PASSWORD")
+    if not email or not password:
+        raise RuntimeError("OneMap token refresh failed: ONEMAP_EMAIL and ONEMAP_PASSWORD are not configured.")
+
+    payload = json.dumps({"email": email, "password": password}).encode("utf-8")
+    request = Request(
+        ONEMAP_AUTH_URL,
+        data=payload,
+        headers={
+            "User-Agent": "Lance-BlueSG-Route-Optimiser/1.0",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    with urlopen(request, timeout=15) as response:
+        response_payload = json.loads(response.read().decode("utf-8"))
+
+    access_token = clean_text(
+        response_payload.get("access_token")
+        or response_payload.get("accessToken")
+        or response_payload.get("token")
+    )
+    if not access_token:
+        raise RuntimeError("OneMap token refresh failed: authentication response did not include an access token.")
+
+    return access_token, _parse_onemap_token_expiry(response_payload)
+
+
+def get_active_onemap_token(force_refresh: bool = False, manual_token: str | None = None) -> str | None:
+    session_token = clean_text(_get_streamlit_session_value("onemap_token", ""))
+    session_expiry = _get_streamlit_session_value("onemap_token_expiry")
+    if isinstance(session_expiry, str):
+        parsed = pd.to_datetime(session_expiry, errors="coerce", utc=True)
+        session_expiry = None if pd.isna(parsed) else parsed.to_pydatetime()
+
+    if not force_refresh and session_token and _cached_onemap_token_is_valid(session_expiry):
+        return session_token
+
+    global ONEMAP_MEMORY_TOKEN, ONEMAP_MEMORY_TOKEN_EXPIRY
+    if not force_refresh and ONEMAP_MEMORY_TOKEN and _cached_onemap_token_is_valid(ONEMAP_MEMORY_TOKEN_EXPIRY):
+        return ONEMAP_MEMORY_TOKEN
+
+    if not force_refresh:
+        initial_token = clean_text(manual_token) or get_onemap_token()
+        if initial_token:
+            return initial_token
+
+    new_token, expiry = request_new_onemap_token()
+    _store_active_onemap_token(new_token, expiry)
+    return new_token
+
+
+def onemap_credentials_configured() -> bool:
+    return bool(_get_onemap_secret("ONEMAP_EMAIL") and _get_onemap_secret("ONEMAP_PASSWORD"))
+
+
 def infer_zone(address: Any) -> str | None:
     text = clean_text(address).lower()
     if not text:
@@ -591,12 +750,41 @@ def load_and_validate_jobs(uploaded_file: Any) -> tuple[pd.DataFrame, list[str],
 
 
 def _fetch_json(url: str, params: dict[str, Any], token: str | None = None, timeout: int = 15) -> dict[str, Any]:
-    headers = {"User-Agent": "Lance-BlueSG-Route-Optimiser/1.0"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    request = Request(f"{url}?{urlencode(params)}", headers=headers)
-    with urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+    def build_request(active_token: str | None) -> Request:
+        headers = {"User-Agent": "Lance-BlueSG-Route-Optimiser/1.0"}
+        if active_token:
+            headers["Authorization"] = f"Bearer {active_token}"
+        return Request(f"{url}?{urlencode(params)}", headers=headers)
+
+    active_token = get_active_onemap_token(manual_token=token)
+    try:
+        with urlopen(build_request(active_token), timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        if exc.code != 401 or not active_token:
+            raise
+
+        print("OneMap token rejected. Requesting a fresh token.")
+        try:
+            refreshed_token = get_active_onemap_token(force_refresh=True)
+        except Exception as refresh_exc:
+            print(f"OneMap token refresh failed: {refresh_exc}")
+            raise exc
+        if not refreshed_token:
+            print("OneMap token refresh failed: no token returned.")
+            raise exc
+
+        try:
+            with urlopen(build_request(refreshed_token), timeout=timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            print("OneMap request succeeded after token refresh.")
+            return payload
+        except HTTPError as retry_exc:
+            print(f"OneMap request failed after token refresh: HTTP {retry_exc.code}.")
+            raise retry_exc
+        except Exception as retry_exc:
+            print(f"OneMap request failed after token refresh: {retry_exc}")
+            raise
 
 
 def geocode_address_onemap(address: str, token: str | None = None) -> GeocodeResult:

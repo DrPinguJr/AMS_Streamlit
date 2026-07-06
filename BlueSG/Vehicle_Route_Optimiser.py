@@ -33,6 +33,7 @@ from BlueSG.vehicle_route_optimizer import (
     get_cached_geocode,
     load_and_validate_jobs,
     load_rider_roster,
+    onemap_credentials_configured,
     optimisation_integrity_report,
     optimise_vehicle_routes,
     read_rider_roster_file,
@@ -93,6 +94,131 @@ def parse_route_path(value: object) -> list[list[float]]:
     return parsed
 
 
+def normalise_map_sequence(value: object) -> str:
+    if value is None or pd.isna(value):
+        return "Missing"
+    text = clean_text(value)
+    if not text:
+        return "Missing"
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return text
+    if number.is_integer():
+        return str(int(number))
+    return str(number).rstrip("0").rstrip(".")
+
+
+def route_sequence_options(route_df: pd.DataFrame) -> list[str]:
+    if route_df.empty or "Sequence" not in route_df.columns:
+        return []
+    options = []
+    seen = set()
+    for value in route_df["Sequence"].tolist():
+        sequence = normalise_map_sequence(value)
+        if sequence in seen:
+            continue
+        seen.add(sequence)
+        options.append(sequence)
+    return options
+
+
+def map_sequence_sort_value(value: object) -> tuple[int, float | str]:
+    sequence = normalise_map_sequence(value)
+    try:
+        return (0, float(sequence))
+    except (TypeError, ValueError):
+        return (1, sequence)
+
+
+def sort_routes_for_map(route_df: pd.DataFrame) -> pd.DataFrame:
+    if route_df.empty:
+        return route_df.copy()
+    sorted_df = route_df.copy()
+    sorted_df["_map_sequence_sort"] = sorted_df["Sequence"].apply(map_sequence_sort_value)
+    sorted_df["_map_original_order"] = range(len(sorted_df))
+    sorted_df = sorted_df.sort_values(
+        ["Rider", "_map_sequence_sort", "_map_original_order"],
+        kind="stable",
+    )
+    return sorted_df.drop(columns=["_map_sequence_sort", "_map_original_order"], errors="ignore")
+
+
+def format_route_metric(value: object, suffix: str) -> str:
+    if value is None or pd.isna(value) or value == "":
+        return "-"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return f"{value} {suffix}"
+    return f"{round(number, 1)} {suffix}"
+
+
+def add_map_point(
+    point_rows: list[dict[str, object]],
+    geocodes: dict[str, dict[str, object]],
+    address: str,
+    location_type: str,
+    tooltip: str,
+    radius: int,
+    fill_color: list[int],
+    is_background: bool = False,
+) -> None:
+    address = clean_text(address)
+    result = geocodes.get(address, {})
+    if result.get("lat") is None or result.get("lon") is None:
+        return
+    point_rows.append(
+        {
+            "Address": address,
+            "Location Type": location_type,
+            "tooltip": tooltip,
+            "lat": result["lat"],
+            "lon": result["lon"],
+            "radius": radius,
+            "fill_color": fill_color,
+            "is_background": is_background,
+        }
+    )
+
+
+def map_view_state(point_df: pd.DataFrame, individual_job_selected: bool) -> pdk.ViewState:
+    if point_df.empty:
+        return pdk.ViewState(latitude=1.3521, longitude=103.8198, zoom=11, pitch=0)
+
+    latitudes = pd.to_numeric(point_df["lat"], errors="coerce").dropna()
+    longitudes = pd.to_numeric(point_df["lon"], errors="coerce").dropna()
+    if latitudes.empty or longitudes.empty:
+        return pdk.ViewState(latitude=1.3521, longitude=103.8198, zoom=11, pitch=0)
+
+    view_lat = float(latitudes.mean())
+    view_lon = float(longitudes.mean())
+    spread = max(float(latitudes.max() - latitudes.min()), float(longitudes.max() - longitudes.min()))
+
+    if len(point_df) <= 1:
+        zoom = 13.5 if individual_job_selected else 12.5
+    elif individual_job_selected:
+        if spread <= 0.01:
+            zoom = 13.4
+        elif spread <= 0.03:
+            zoom = 12.7
+        elif spread <= 0.08:
+            zoom = 11.8
+        else:
+            zoom = 10.9
+    else:
+        if spread <= 0.03:
+            zoom = 12.1
+        elif spread <= 0.08:
+            zoom = 11.3
+        elif spread <= 0.15:
+            zoom = 10.6
+        else:
+            zoom = 10.0
+
+    return pdk.ViewState(latitude=view_lat, longitude=view_lon, zoom=zoom, pitch=0)
+
+
 def add_session_rider_load_column(rider_df: pd.DataFrame) -> pd.DataFrame:
     rider_df = rider_df.copy() if rider_df is not None else pd.DataFrame()
     if "Rider Load" not in rider_df.columns:
@@ -116,6 +242,9 @@ def build_route_map_data(
     jobs_df: pd.DataFrame,
     rider_df: pd.DataFrame,
     token: str | None,
+    visible_route_df: pd.DataFrame | None = None,
+    selected_rider: str = "",
+    show_other_jobs: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     addresses = []
     for column in ["Start Location"]:
@@ -132,52 +261,105 @@ def build_route_map_data(
     geocodes = cached_route_map_geocodes(unique_addresses, token)
 
     point_rows = []
-    for _, rider in rider_df.iterrows():
-        address = clean_text(rider.get("Start Location"))
-        result = geocodes.get(address, {})
-        if result.get("lat") is not None and result.get("lon") is not None:
-            point_rows.append(
-                    {
-                        "Address": address,
-                        "Location Type": "Rider start",
-                        "Rider": clean_text(rider.get("Rider Name")) or "Rider",
-                        "tooltip": f"{clean_text(rider.get('Rider Name')) or 'Rider'}<br/>Rider start<br/>{address}",
-                        "lat": result["lat"],
-                        "lon": result["lon"],
-                        "radius": 90,
-                        "fill_color": [17, 24, 39],
-                }
+    visible_route_df = visible_route_df.copy() if visible_route_df is not None else pd.DataFrame()
+    relevant_addresses = set()
+    if selected_rider and not visible_route_df.empty:
+        for _, route in visible_route_df.iterrows():
+            sequence = normalise_map_sequence(route.get("Sequence"))
+            start_address = clean_text(route.get("Start From"))
+            pickup_address = clean_text(route.get("Pickup Address"))
+            dropoff_address = clean_text(route.get("Drop-off Address"))
+            for address in [start_address, pickup_address, dropoff_address]:
+                if address:
+                    relevant_addresses.add(address.casefold())
+
+            add_map_point(
+                point_rows,
+                geocodes,
+                start_address,
+                "Start from",
+                f"{selected_rider}<br/>Job {sequence} start<br/>{start_address}",
+                74,
+                [17, 24, 39],
+            )
+            add_map_point(
+                point_rows,
+                geocodes,
+                pickup_address,
+                "Pickup",
+                f"{selected_rider}<br/>Job {sequence} pickup<br/>{pickup_address}",
+                70,
+                [14, 165, 233],
+            )
+            add_map_point(
+                point_rows,
+                geocodes,
+                dropoff_address,
+                "Drop-off",
+                f"{selected_rider}<br/>Job {sequence} drop-off<br/>{dropoff_address}",
+                70,
+                [249, 115, 22],
             )
 
-    for _, job in jobs_df.iterrows():
-        for location_type, column, colour in [
-            ("Given pickup", "Pickup Address", [14, 165, 233]),
-            ("Given drop-off", "Drop-off Address", [249, 115, 22]),
-        ]:
-            address = clean_text(job.get(column))
-            result = geocodes.get(address, {})
-            if result.get("lat") is not None and result.get("lon") is not None:
-                point_rows.append(
-                    {
-                        "Address": address,
-                        "Location Type": location_type,
-                        "Rider": "",
-                        "tooltip": f"{location_type}<br/>{address}",
-                        "lat": result["lat"],
-                        "lon": result["lon"],
-                        "radius": 70,
-                        "fill_color": colour,
-                    }
+        if show_other_jobs:
+            for _, job in jobs_df.iterrows():
+                for location_type, column in [
+                    ("Other pickup", "Pickup Address"),
+                    ("Other drop-off", "Drop-off Address"),
+                ]:
+                    address = clean_text(job.get(column))
+                    if not address or address.casefold() in relevant_addresses:
+                        continue
+                    add_map_point(
+                        point_rows,
+                        geocodes,
+                        address,
+                        location_type,
+                        f"{location_type}<br/>{address}",
+                        42,
+                        [156, 163, 175, 95],
+                        is_background=True,
+                    )
+    else:
+        for _, rider in rider_df.iterrows():
+            address = clean_text(rider.get("Start Location"))
+            rider_name = clean_text(rider.get("Rider Name")) or "Rider"
+            add_map_point(
+                point_rows,
+                geocodes,
+                address,
+                "Rider start",
+                f"{rider_name}<br/>Rider start<br/>{address}",
+                74,
+                [17, 24, 39],
+            )
+
+        for _, job in jobs_df.iterrows():
+            for location_type, column, colour in [
+                ("Given pickup", "Pickup Address", [14, 165, 233]),
+                ("Given drop-off", "Drop-off Address", [249, 115, 22]),
+            ]:
+                address = clean_text(job.get(column))
+                add_map_point(
+                    point_rows,
+                    geocodes,
+                    address,
+                    location_type,
+                    f"{location_type}<br/>{address}",
+                    62,
+                    colour,
                 )
 
     leg_rows = []
-    for _, row in route_df.sort_values(["Rider", "Sequence"]).iterrows():
+    for _, row in sort_routes_for_map(route_df).iterrows():
         rider = str(row["Rider"])
+        sequence = normalise_map_sequence(row.get("Sequence"))
         public_colour = [220, 38, 38, 210]
         car_colour = [22, 163, 74, 230]
         legs = [
             {
                 "Mode": "Public transport / empty travel",
+                "Mode Label": "PT",
                 "From": clean_text(row["Start From"]),
                 "To": clean_text(row["Pickup Address"]),
                 "Distance KM": row["Empty Distance KM"],
@@ -188,6 +370,7 @@ def build_route_map_data(
             },
             {
                 "Mode": "Car movement",
+                "Mode Label": "DRIVE",
                 "From": clean_text(row["Pickup Address"]),
                 "To": clean_text(row["Drop-off Address"]),
                 "Distance KM": row["Loaded Distance KM"],
@@ -211,7 +394,8 @@ def build_route_map_data(
             leg_rows.append(
                 {
                     "Rider": rider,
-                    "Sequence": int(row["Sequence"]),
+                    "Sequence": row.get("Sequence"),
+                    "sequence_key": sequence,
                     "Car Plate": clean_text(row["Car Plate"]),
                     "Mode": leg["Mode"],
                     "From": leg["From"],
@@ -225,9 +409,9 @@ def build_route_map_data(
                         (float(start["lon"]) + float(end["lon"])) / 2,
                         (float(start["lat"]) + float(end["lat"])) / 2,
                     ],
-                    "label": f"{rider} S{int(row['Sequence'])} - {'PT' if leg['Mode'].startswith('Public') else 'Drive'}",
+                    "label": f"J{sequence} · {leg['Mode Label']}",
                     "tooltip": (
-                        f"{rider}<br/>Step {int(row['Sequence'])}: {leg['Mode']}<br/>"
+                        f"{rider}<br/>Job {sequence}: {leg['Mode']}<br/>"
                         f"{leg['From']} -> {leg['To']}<br/>"
                         f"{leg['Distance KM']} km, {leg['Duration Min']} min<br/>"
                         f"{leg['Instructions']}<br/>"
@@ -245,26 +429,18 @@ def build_route_map_data(
 
 
 def show_route_map(route_df: pd.DataFrame, jobs_df: pd.DataFrame, rider_df: pd.DataFrame, token: str | None) -> None:
-    point_df, leg_df, missing_locations = build_route_map_data(route_df, jobs_df, rider_df, token)
-
     st.subheader("Singapore Route Map")
-    if leg_df.empty and point_df.empty:
-        st.warning("No map locations could be geocoded. Check the addresses or OneMap token.")
-        return
-
-    if missing_locations:
-        with st.expander("Map locations not found", expanded=False):
-            for warning in missing_locations[:80]:
-                st.warning(warning)
-            if len(missing_locations) > 80:
-                st.info(f"Showing first 80 of {len(missing_locations)} missing location(s).")
-
     rider_names = list(route_df["Rider"].dropna().astype(str).drop_duplicates())
     selected_key = "bluesg_selected_map_rider"
+    sequence_key = "bluesg_selected_map_sequence"
+    labels_key = "bluesg_show_route_labels"
+    labels_context_key = "bluesg_show_route_labels_context"
+    show_other_jobs_key = "bluesg_show_other_jobs"
     selected_rider = st.session_state.get(selected_key, "")
     if selected_rider not in rider_names:
         selected_rider = ""
         st.session_state[selected_key] = ""
+        st.session_state[sequence_key] = "All"
 
     map_col, rider_col = st.columns([4, 1])
     with rider_col:
@@ -280,6 +456,9 @@ def show_route_map(route_df: pd.DataFrame, jobs_df: pd.DataFrame, rider_df: pd.D
                 type=button_type,
                 width="stretch",
             ):
+                if selected_rider != rider_name:
+                    st.session_state[sequence_key] = "All"
+                    st.session_state[labels_context_key] = ""
                 selected_rider = rider_name
                 st.session_state[selected_key] = rider_name
             if selected_rider == rider_name:
@@ -290,9 +469,89 @@ def show_route_map(route_df: pd.DataFrame, jobs_df: pd.DataFrame, rider_df: pd.D
         if selected_rider and st.button("Clear route", key="map_clear_rider", width="stretch"):
             selected_rider = ""
             st.session_state[selected_key] = ""
+            st.session_state[sequence_key] = "All"
+            st.session_state[labels_context_key] = ""
+
+    selected_rider_route_df = pd.DataFrame()
+    visible_route_df = pd.DataFrame()
+    sequence_options: list[str] = []
+    selected_sequence = "All"
+    show_route_labels = False
+    show_other_jobs = False
+    if selected_rider:
+        selected_rider_route_df = sort_routes_for_map(
+            route_df[route_df["Rider"].astype(str) == selected_rider]
+        )
+        sequence_options = route_sequence_options(selected_rider_route_df)
+        route_options = ["All"] + sequence_options
+        if st.session_state.get(sequence_key, "All") not in route_options:
+            st.session_state[sequence_key] = "All"
+
+        with map_col:
+            st.caption("Showing route for:")
+            st.write(f"**{selected_rider}**")
+            if hasattr(st, "segmented_control"):
+                selected_sequence = st.segmented_control(
+                    "Route",
+                    route_options,
+                    key=sequence_key,
+                )
+            else:
+                selected_sequence = st.radio(
+                    "Route",
+                    route_options,
+                    key=sequence_key,
+                    horizontal=True,
+                )
+            selected_sequence = selected_sequence or "All"
+
+            label_context = f"{selected_rider}|{selected_sequence}|{','.join(sequence_options)}"
+            default_show_labels = selected_sequence != "All" or len(sequence_options) <= 3
+            if st.session_state.get(labels_context_key) != label_context:
+                st.session_state[labels_key] = default_show_labels
+                st.session_state[labels_context_key] = label_context
+            if show_other_jobs_key not in st.session_state:
+                st.session_state[show_other_jobs_key] = False
+
+            control_cols = st.columns(2)
+            toggle_fn = st.toggle if hasattr(st, "toggle") else st.checkbox
+            with control_cols[0]:
+                show_route_labels = toggle_fn("Show route labels", key=labels_key)
+            with control_cols[1]:
+                show_other_jobs = toggle_fn("Show other jobs", key=show_other_jobs_key)
+
+        if selected_sequence == "All":
+            visible_route_df = selected_rider_route_df.copy()
+        else:
+            visible_route_df = selected_rider_route_df[
+                selected_rider_route_df["Sequence"].apply(normalise_map_sequence) == selected_sequence
+            ].copy()
+
+    point_df, leg_df, missing_locations = build_route_map_data(
+        route_df,
+        jobs_df,
+        rider_df,
+        token,
+        visible_route_df=visible_route_df,
+        selected_rider=selected_rider,
+        show_other_jobs=show_other_jobs,
+    )
+
+    if leg_df.empty and point_df.empty:
+        st.warning("No map locations could be geocoded. Check the addresses or OneMap token.")
+        return
+
+    if missing_locations:
+        with st.expander("Map locations not found", expanded=False):
+            for warning in missing_locations[:80]:
+                st.warning(warning)
+            if len(missing_locations) > 80:
+                st.info(f"Showing first 80 of {len(missing_locations)} missing location(s).")
 
     if selected_rider and "Rider" in leg_df.columns:
         visible_leg_df = leg_df[leg_df["Rider"] == selected_rider].copy()
+        if selected_sequence != "All" and "sequence_key" in visible_leg_df.columns:
+            visible_leg_df = visible_leg_df[visible_leg_df["sequence_key"] == selected_sequence].copy()
     else:
         visible_leg_df = pd.DataFrame()
 
@@ -308,6 +567,7 @@ def show_route_map(route_df: pd.DataFrame, jobs_df: pd.DataFrame, rider_df: pd.D
                 pickable=True,
             )
         )
+    if show_route_labels and not visible_leg_df.empty:
         layers.append(
             pdk.Layer(
                 "TextLayer",
@@ -315,7 +575,7 @@ def show_route_map(route_df: pd.DataFrame, jobs_df: pd.DataFrame, rider_df: pd.D
                 get_position="label_position",
                 get_text="label",
                 get_color=[17, 24, 39],
-                get_size=13,
+                get_size=12,
                 get_angle=0,
                 get_text_anchor="'middle'",
                 get_alignment_baseline="'center'",
@@ -326,27 +586,47 @@ def show_route_map(route_df: pd.DataFrame, jobs_df: pd.DataFrame, rider_df: pd.D
             )
         )
     if not point_df.empty:
-        layers.append(
-            pdk.Layer(
-                "ScatterplotLayer",
-                point_df,
-                get_position="[lon, lat]",
-                get_fill_color="fill_color",
-                get_radius="radius",
-                radius_min_pixels=6,
-                radius_max_pixels=16,
-                stroked=True,
-                get_line_color=[255, 255, 255],
-                line_width_min_pixels=1,
-                pickable=True,
+        background_point_df = point_df[point_df["is_background"].fillna(False)].copy()
+        active_point_df = point_df[~point_df["is_background"].fillna(False)].copy()
+        if not background_point_df.empty:
+            layers.append(
+                pdk.Layer(
+                    "ScatterplotLayer",
+                    background_point_df,
+                    get_position="[lon, lat]",
+                    get_fill_color="fill_color",
+                    get_radius="radius",
+                    radius_min_pixels=3,
+                    radius_max_pixels=8,
+                    stroked=True,
+                    get_line_color=[255, 255, 255, 120],
+                    line_width_min_pixels=1,
+                    pickable=True,
+                )
             )
-        )
+        if not active_point_df.empty:
+            layers.append(
+                pdk.Layer(
+                    "ScatterplotLayer",
+                    active_point_df,
+                    get_position="[lon, lat]",
+                    get_fill_color="fill_color",
+                    get_radius="radius",
+                    radius_min_pixels=6,
+                    radius_max_pixels=14,
+                    stroked=True,
+                    get_line_color=[255, 255, 255],
+                    line_width_min_pixels=1,
+                    pickable=True,
+                )
+            )
 
-    view_lat = float(point_df["lat"].mean()) if not point_df.empty else 1.3521
-    view_lon = float(point_df["lon"].mean()) if not point_df.empty else 103.8198
+    viewport_points = point_df[~point_df["is_background"].fillna(False)].copy() if not point_df.empty else point_df
+    if viewport_points.empty:
+        viewport_points = point_df
     deck = pdk.Deck(
         map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
-        initial_view_state=pdk.ViewState(latitude=view_lat, longitude=view_lon, zoom=11, pitch=0),
+        initial_view_state=map_view_state(viewport_points, selected_sequence != "All"),
         layers=layers,
         tooltip={
             "html": "{tooltip}",
@@ -355,21 +635,47 @@ def show_route_map(route_df: pd.DataFrame, jobs_df: pd.DataFrame, rider_df: pd.D
     )
     with map_col:
         if selected_rider:
-            st.caption(f"Showing route for {selected_rider}")
             if visible_leg_df.empty:
-                st.warning("This rider has no drawable route legs. Check whether the route addresses were geocoded.")
+                st.warning("This route selection has no drawable route legs. Check whether the route addresses were geocoded.")
         else:
             st.caption("Select a rider on the right to show their route.")
         st.pydeck_chart(deck, width="stretch")
+
+        if selected_rider and selected_sequence != "All" and not visible_route_df.empty:
+            selected_job = visible_route_df.iloc[0]
+            st.caption(f"JOB {selected_sequence}")
+            summary_cols = st.columns(3)
+            summary_cols[0].metric("Car Plate", clean_text(selected_job.get("Car Plate")) or "-")
+            summary_cols[1].metric("Travel to Pickup", format_route_metric(selected_job.get("Empty Distance KM"), "km"))
+            summary_cols[2].metric("Vehicle Movement", format_route_metric(selected_job.get("Loaded Distance KM"), "km"))
+            detail_cols = st.columns(2)
+            with detail_cols[0]:
+                st.caption("Travel to Pickup")
+                st.write(f"{clean_text(selected_job.get('Start From')) or '-'} -> {clean_text(selected_job.get('Pickup Address')) or '-'}")
+                st.caption(
+                    f"{format_route_metric(selected_job.get('Empty Distance KM'), 'km')} / "
+                    f"{format_route_metric(selected_job.get('Empty Duration Min'), 'min')}"
+                )
+            with detail_cols[1]:
+                st.caption("Vehicle Movement")
+                st.write(f"{clean_text(selected_job.get('Pickup Address')) or '-'} -> {clean_text(selected_job.get('Drop-off Address')) or '-'}")
+                st.caption(
+                    f"{format_route_metric(selected_job.get('Loaded Distance KM'), 'km')} / "
+                    f"{format_route_metric(selected_job.get('Loaded Duration Min'), 'min')}"
+                )
 
         legend_cols = st.columns(4)
         legend_cols[0].caption("Red: public transport to pickup")
         legend_cols[1].caption("Green: driving/car movement")
         legend_cols[2].caption("Blue/orange dots: pickups/drop-offs")
-        legend_cols[3].caption("Labels: rider and step")
+        legend_cols[3].caption("Dark dot: job start")
 
 
 def get_onemap_token_from_env() -> str:
+    refreshed_token = st.session_state.get("onemap_token", "")
+    if refreshed_token:
+        return refreshed_token
+
     value = os.getenv("ONEMAP_TOKEN", "")
     if value:
         return value
@@ -615,8 +921,11 @@ with action_col:
             disabled=not use_onemap,
         )
 
-        if use_onemap and not onemap_token:
-            st.warning("OneMap is enabled but no token is entered. Fallback estimates will be used where needed.")
+        if use_onemap and not onemap_token and not onemap_credentials_configured():
+            st.warning(
+                "OneMap is enabled but no token or OneMap credentials are configured. "
+                "Fallback estimates will be used where needed."
+            )
 
         ready_text = "Ready to optimise" if file_is_valid else "Upload a valid job file first"
         st.caption(ready_text)
