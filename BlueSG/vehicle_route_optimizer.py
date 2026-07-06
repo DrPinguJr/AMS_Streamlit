@@ -34,7 +34,8 @@ RIDER_LOAD_SCORE_ADJUSTMENTS = {
     "Very High": -45.0,
 }
 WEEKDAY_SHEETS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-ROSTER_FILE = Path(__file__).resolve().parent / "rider_roster.xlsx"
+BASE_DIR = Path(__file__).resolve().parent
+ROSTER_FILE = BASE_DIR / "rider_roster.xlsx"
 
 ROUTE_COLUMNS = [
     "Rider",
@@ -151,11 +152,19 @@ SHORT_WALK_DURATION_MIN = 15.0
 ONEMAP_SEARCH_URL = "https://www.onemap.gov.sg/api/common/elastic/search"
 ONEMAP_ROUTE_URL = "https://www.onemap.gov.sg/api/public/routingsvc/route"
 ONEMAP_AUTH_URL = "https://www.onemap.gov.sg/api/auth/post/getToken"
-CACHE_DIR = Path(__file__).resolve().parent / "cache"
+CACHE_DIR = BASE_DIR / "cache"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ENV_FILE = PROJECT_ROOT / ".env"
-GEOCODE_CACHE_FILE = CACHE_DIR / "onemap_geocode_cache.csv"
-ROUTE_CACHE_FILE = CACHE_DIR / "onemap_route_cache.csv"
+RUNTIME_CACHE_DIR = Path(
+    os.getenv(
+        "BLUESG_RUNTIME_CACHE_DIR",
+        str(CACHE_DIR / "runtime"),
+    )
+)
+GEOCODE_SEED_CACHE_FILE = CACHE_DIR / "onemap_geocode_cache.csv"
+ROUTE_SEED_CACHE_FILE = CACHE_DIR / "onemap_route_cache.csv"
+GEOCODE_CACHE_FILE = RUNTIME_CACHE_DIR / "onemap_geocode_cache.csv"
+ROUTE_CACHE_FILE = RUNTIME_CACHE_DIR / "onemap_route_cache.csv"
 ProgressCallback = Callable[[dict[str, Any]], None]
 GEOCODE_MEMORY_CACHE: dict[str, GeocodeResult] = {}
 ROUTE_MEMORY_CACHE: dict[str, TravelCost] = {}
@@ -306,30 +315,37 @@ def _read_csv_cache(path: Path, columns: list[str]) -> pd.DataFrame:
 
 
 def _write_csv_cache(path: Path, df: pd.DataFrame) -> None:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    df.to_csv(path, index=False)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(path, index=False)
+    except OSError:
+        return
 
 
 def _append_csv_cache_row(path: Path, row: dict[str, Any], columns: list[str]) -> None:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame([row], columns=columns).to_csv(path, mode="a", index=False, header=not path.exists())
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame([row], columns=columns).to_csv(path, mode="a", index=False, header=not path.exists())
+    except OSError:
+        return
 
 
 def _load_geocode_disk_cache_once() -> None:
     global GEOCODE_DISK_CACHE_LOADED
     if GEOCODE_DISK_CACHE_LOADED:
         return
-    cache = _read_csv_cache(GEOCODE_CACHE_FILE, ["address", "latitude", "longitude"])
-    for row in cache.itertuples(index=False):
-        address = clean_text(getattr(row, "address", ""))
-        if not address:
-            continue
-        try:
-            latitude = float(getattr(row, "latitude"))
-            longitude = float(getattr(row, "longitude"))
-        except (TypeError, ValueError):
-            continue
-        GEOCODE_MEMORY_CACHE[address.casefold()] = GeocodeResult(address, latitude, longitude, "OneMap cache")
+    for cache_file in [GEOCODE_SEED_CACHE_FILE, GEOCODE_CACHE_FILE]:
+        cache = _read_csv_cache(cache_file, ["address", "latitude", "longitude"])
+        for row in cache.itertuples(index=False):
+            address = clean_text(getattr(row, "address", ""))
+            if not address:
+                continue
+            try:
+                latitude = float(getattr(row, "latitude"))
+                longitude = float(getattr(row, "longitude"))
+            except (TypeError, ValueError):
+                continue
+            GEOCODE_MEMORY_CACHE[address.casefold()] = GeocodeResult(address, latitude, longitude, "OneMap cache")
     GEOCODE_DISK_CACHE_LOADED = True
 
 
@@ -337,28 +353,29 @@ def _load_route_disk_cache_once() -> None:
     global ROUTE_DISK_CACHE_LOADED
     if ROUTE_DISK_CACHE_LOADED:
         return
-    cache = _read_csv_cache(ROUTE_CACHE_FILE, ["route_key", "distance_km", "duration_min", "route_text", "route_path"])
-    for row in cache.itertuples(index=False):
-        key = clean_text(getattr(row, "route_key", ""))
-        if not key:
-            continue
-        route_path = None
-        try:
-            route_path = json.loads(getattr(row, "route_path", "") or "null")
-        except (TypeError, json.JSONDecodeError):
+    for cache_file in [ROUTE_SEED_CACHE_FILE, ROUTE_CACHE_FILE]:
+        cache = _read_csv_cache(cache_file, ["route_key", "distance_km", "duration_min", "route_text", "route_path"])
+        for row in cache.itertuples(index=False):
+            key = clean_text(getattr(row, "route_key", ""))
+            if not key:
+                continue
             route_path = None
-        try:
-            distance_km = float(getattr(row, "distance_km"))
-            duration_min = float(getattr(row, "duration_min"))
-        except (TypeError, ValueError):
-            continue
-        ROUTE_MEMORY_CACHE[key] = TravelCost(
-            distance_km,
-            duration_min,
-            "OneMap cache",
-            route_text=clean_text(getattr(row, "route_text", "")),
-            route_path=route_path,
-        )
+            try:
+                route_path = json.loads(getattr(row, "route_path", "") or "null")
+            except (TypeError, json.JSONDecodeError):
+                route_path = None
+            try:
+                distance_km = float(getattr(row, "distance_km"))
+                duration_min = float(getattr(row, "duration_min"))
+            except (TypeError, ValueError):
+                continue
+            ROUTE_MEMORY_CACHE[key] = TravelCost(
+                distance_km,
+                duration_min,
+                "OneMap cache",
+                route_text=clean_text(getattr(row, "route_text", "")),
+                route_path=route_path,
+            )
     ROUTE_DISK_CACHE_LOADED = True
 
 

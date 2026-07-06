@@ -77,6 +77,27 @@ Start the main app, then choose the BlueSG page from the Streamlit sidebar.
 
 The job upload supports the normal route optimiser format and the Antares/Flexar RB Jobs format. If the uploaded Excel file contains multiple dates, choose the date from the **Job date** dropdown before optimising.
 
+### Streamlit Community Cloud Deployment
+
+This app is intended for BlueSG vehicle rostering and route optimisation.
+
+Use these Streamlit Community Cloud settings:
+
+```text
+Repository: DrPinguJr/AMS_Streamlit
+Branch: main
+Main file path: BlueSG/Vehicle_Route_Optimiser.py
+```
+
+Add these Streamlit secrets before enabling OneMap routing:
+
+```toml
+ONEMAP_EMAIL = "your-email"
+ONEMAP_PASSWORD = "your-password"
+```
+
+The tracked files in `BlueSG/cache/` are used as seed cache data. New runtime cache entries are written to `BlueSG/cache/runtime/`, which is ignored by Git and may be temporary on Streamlit Community Cloud.
+
 ## Useful Commands
 
 Run with hot reload:
@@ -99,4 +120,4 @@ Re-process an existing Tender CSV:
 
 ## Credentials
 
-Credentials and tokens are read from the local `.env` file in the project root.
+BlueSG OneMap credentials are read from Streamlit secrets in deployment and from the local `.env` file in development.

@@ -1,10 +1,17 @@
 import os
 import json
+import sys
 import time
+from pathlib import Path
 
 import pandas as pd
 import pydeck as pdk
 import streamlit as st
+
+BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from BlueSG.vehicle_route_optimizer import (
     DEFAULT_DURATION_BUFFER_MULTIPLIER,
@@ -31,6 +38,7 @@ from BlueSG.vehicle_route_optimizer import (
     build_unassigned_jobs_df,
     get_cost_explanation,
     get_cached_geocode,
+    get_onemap_token,
     load_and_validate_jobs,
     load_rider_roster,
     onemap_credentials_configured,
@@ -675,27 +683,7 @@ def get_onemap_token_from_env() -> str:
     refreshed_token = st.session_state.get("onemap_token", "")
     if refreshed_token:
         return refreshed_token
-
-    value = os.getenv("ONEMAP_TOKEN", "")
-    if value:
-        return value
-
-    env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
-    if not os.path.exists(env_path):
-        return ""
-
-    try:
-        with open(env_path, "r", encoding="utf-8") as env_file:
-            for line in env_file:
-                stripped = line.strip()
-                if not stripped or stripped.startswith("#") or "=" not in stripped:
-                    continue
-                key, raw_value = stripped.split("=", 1)
-                if key.strip() == "ONEMAP_TOKEN":
-                    return raw_value.strip().strip('"').strip("'")
-    except OSError:
-        return ""
-    return ""
+    return get_onemap_token()
 
 
 st.title("Vehicle Route Optimiser")
@@ -884,11 +872,14 @@ with riders_col:
             else:
                 st.rerun()
     with roster_action_cols[2]:
-        if st.button("Open Excel File", width="stretch"):
-            try:
-                os.startfile(ROSTER_FILE)
-            except Exception as exc:
-                st.error(f"Could not open roster workbook: {exc}")
+        if hasattr(os, "startfile"):
+            if st.button("Open Excel File", width="stretch"):
+                try:
+                    os.startfile(ROSTER_FILE)
+                except Exception as exc:
+                    st.error(f"Could not open roster workbook: {exc}")
+        else:
+            st.caption("Download the workbook below to edit it locally.")
 
     with st.expander("Roster file options", expanded=False):
         st.caption(f"Persistent roster workbook: {roster_path}")
