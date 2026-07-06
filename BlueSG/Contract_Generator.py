@@ -124,21 +124,21 @@ with st.container(border=True):
         st.markdown('<div class="section-title">SECTION 1 — Contractor Details</div>', unsafe_allow_html=True)
         contractor_name = st.text_input(
             "Contractor Full Name",
-            placeholder="e.g. LIM CHOON YONG LESTER",
+            placeholder="e.g. Name Middle Name Surname",
             key="c_name",
             on_change=clear_generated_contract
         )
         
         nric = st.text_input(
             "NRIC",
-            placeholder="e.g. S1234567A",
+            placeholder="e.g. T0000000A",
             key="c_nric",
             on_change=clear_generated_contract
         )
         
         residential_address = st.text_area(
             "Residential Address",
-            placeholder="e.g. Blk 123 Test Road, #01-01, Singapore 123123",
+            placeholder="e.g. Blk [Block Number] [Street Name], #[Floor]-[Unit], Singapore [Postal Code]",
             key="c_address",
             on_change=clear_generated_contract,
             height=100
