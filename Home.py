@@ -12,6 +12,7 @@ st.page_link("pages/Recruitment_Tracker.py", label="Recruitment Tracker", icon="
 st.page_link("Converter/Converter.py", label="PDF to Word Converter", icon=":material/transform:")
 st.page_link("whatsapp/WhatsApp.py", label="WhatsApp Monitor", icon=":material/chat:")
 st.page_link("BlueSG/Vehicle_Route_Optimiser.py", label="Vehicle Route Optimiser", icon=":material/route:")
+st.page_link("BlueSG/Contract_Generator.py", label="Contract Generator", icon=":material/description:")
 
 st.divider()
 

@@ -18,11 +18,24 @@ bluesg = st.Page(
     title="Vehicle Route Optimiser",
     icon=":material/route:",
 )
+contract_generator = st.Page(
+    "BlueSG/Contract_Generator.py",
+    title="Contract Generator",
+    icon=":material/description:",
+)
 
 pages = st.navigation(
     {
         "Workspace": [home],
-        "Projects": [tender, sesami, recruitment, converter, whatsapp, bluesg],
+        "Projects": [
+            tender,
+            sesami,
+            recruitment,
+            converter,
+            whatsapp,
+            bluesg,
+            contract_generator,
+        ],
     }
 )
 
