@@ -4,39 +4,43 @@ import streamlit as st
 st.set_page_config(page_title="Lance Workspace", layout="wide")
 
 home = st.Page("Home.py", title="Home", icon=":material/home:")
-tender = st.Page("Tender/Tender.py", title="TenderBoard", icon=":material/search:")
-sesami = st.Page("Sesami/Sesami.py", title="Sesami", icon=":material/business_center:")
+tender = st.Page("Lance/Tender/Tender.py", title="TenderBoard", icon=":material/search:")
+sesami = st.Page("Lance/Sesami/Sesami.py", title="Sesami", icon=":material/business_center:")
 recruitment = st.Page(
-    "pages/Recruitment_Tracker.py",
+    "Lance/Recruitment_Tracker.py",
     title="Recruitment Tracker",
     icon=":material/groups:",
 )
-converter = st.Page("Converter/Converter.py", title="Converter", icon=":material/transform:")
-whatsapp = st.Page("whatsapp/WhatsApp.py", title="WhatsApp Monitor", icon=":material/chat:")
+converter = st.Page("Lance/Converter/Converter.py", title="Converter", icon=":material/transform:")
+whatsapp = st.Page("Lance/whatsapp/WhatsApp.py", title="WhatsApp Monitor", icon=":material/chat:")
 bluesg = st.Page(
-    "BlueSG/Vehicle_Route_Optimiser.py",
+    "Flexar/BlueSG/Vehicle_Route_Optimiser.py",
     title="Vehicle Route Optimiser",
     icon=":material/route:",
 )
-contract_generator = st.Page(
-    "BlueSG/Contract_Generator.py",
-    title="Contract Generator",
+cfs_generator = st.Page(
+    "Contracts/pages/CFS_Generator.py",
+    title="CFS Contract Generator",
     icon=":material/description:",
 )
+loa_generator = st.Page(
+    "Contracts/pages/LOA_Generator.py",
+    title="Letter of Appointment",
+    icon=":material/assignment:",
+)
+service_agreement_generator = st.Page(
+    "Contracts/pages/Service_Agreement_Generator.py",
+    title="Service Agreement",
+    icon=":material/contract:",
+)
 
-pages = st.navigation(
+pg = st.navigation(
     {
-        "Workspace": [home],
-        "Projects": [
-            tender,
-            sesami,
-            recruitment,
-            converter,
-            whatsapp,
-            bluesg,
-            contract_generator,
-        ],
+        "Home": [home],
+        "Lance": [tender, sesami, recruitment, converter, whatsapp],
+        "Flexar": [bluesg],
+        "Contracts": [cfs_generator, loa_generator, service_agreement_generator],
     }
 )
 
-pages.run()
+pg.run()

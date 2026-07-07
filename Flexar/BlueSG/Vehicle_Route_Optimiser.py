@@ -1,0 +1,1374 @@
+import os
+import json
+import sys
+import time
+from pathlib import Path
+
+import pandas as pd
+import pydeck as pdk
+import streamlit as st
+
+BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from Flexar.BlueSG.vehicle_route_optimizer import (
+    DEFAULT_DURATION_BUFFER_MULTIPLIER,
+    DEFAULT_DURATION_PENALTY_PER_MIN,
+    DEFAULT_EMPTY_WEIGHT,
+    DEFAULT_LOADED_WEIGHT,
+    DEFAULT_MAX_ADJUSTED_DURATION_MIN,
+    DEFAULT_MAX_JOB_OVERAGE_PENALTY,
+    DEFAULT_EMPTY_TRAVEL_DURATION_MULTIPLIER,
+    DEFAULT_EMPTY_TRAVEL_WAIT_BUFFER_MIN,
+    DEFAULT_CLUSTER_PRESSURE_BONUS_PER_JOB,
+    DEFAULT_SOFT_ADJUSTED_DURATION_MIN,
+    DEFAULT_SOFT_WORKLOAD_MIN,
+    DEFAULT_WORKLOAD_PENALTY_PER_MIN,
+    REQUIRED_JOB_HEADERS,
+    RIDER_COLUMNS,
+    RIDER_LOAD_LEVELS,
+    ROSTER_FILE,
+    clean_text,
+    WEEKDAY_SHEETS,
+    dedupe_rider_roster,
+    ensure_rider_roster_workbook,
+    export_routes_to_excel,
+    build_unassigned_jobs_df,
+    get_cost_explanation,
+    get_cached_geocode,
+    get_onemap_token,
+    load_and_validate_jobs,
+    load_rider_roster,
+    onemap_credentials_configured,
+    optimisation_integrity_report,
+    optimise_vehicle_routes,
+    read_rider_roster_file,
+    save_rider_roster,
+    validate_riders,
+)
+
+try:
+    st.set_page_config(page_title="Vehicle Route Optimiser", layout="wide")
+except st.errors.StreamlitAPIException:
+    pass
+
+
+@st.cache_data(show_spinner=False)
+def cached_cost_explanation() -> pd.DataFrame:
+    return get_cost_explanation()
+
+
+@st.cache_data(show_spinner=False)
+def cached_route_map_geocodes(addresses: tuple[str, ...], token: str | None) -> dict[str, dict[str, object]]:
+    geocodes: dict[str, dict[str, object]] = {}
+    for address in addresses:
+        result = get_cached_geocode(address, token=token, use_onemap=True)
+        geocodes[address] = {
+            "lat": result.latitude,
+            "lon": result.longitude,
+            "source": result.source,
+            "error": result.error,
+        }
+    return geocodes
+
+
+def rider_colour(index: int) -> list[int]:
+    colours = [
+        [37, 99, 235],
+        [220, 38, 38],
+        [5, 150, 105],
+        [147, 51, 234],
+        [217, 119, 6],
+        [8, 145, 178],
+        [190, 24, 93],
+        [77, 124, 15],
+    ]
+    return colours[index % len(colours)]
+
+
+def parse_route_path(value: object) -> list[list[float]]:
+    if isinstance(value, list):
+        return value
+    if value is None or pd.isna(value) or value == "":
+        return []
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, json.JSONDecodeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return parsed
+
+
+def normalise_map_sequence(value: object) -> str:
+    if value is None or pd.isna(value):
+        return "Missing"
+    text = clean_text(value)
+    if not text:
+        return "Missing"
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return text
+    if number.is_integer():
+        return str(int(number))
+    return str(number).rstrip("0").rstrip(".")
+
+
+def route_sequence_options(route_df: pd.DataFrame) -> list[str]:
+    if route_df.empty or "Sequence" not in route_df.columns:
+        return []
+    options = []
+    seen = set()
+    for value in route_df["Sequence"].tolist():
+        sequence = normalise_map_sequence(value)
+        if sequence in seen:
+            continue
+        seen.add(sequence)
+        options.append(sequence)
+    return options
+
+
+def map_sequence_sort_value(value: object) -> tuple[int, float | str]:
+    sequence = normalise_map_sequence(value)
+    try:
+        return (0, float(sequence))
+    except (TypeError, ValueError):
+        return (1, sequence)
+
+
+def sort_routes_for_map(route_df: pd.DataFrame) -> pd.DataFrame:
+    if route_df.empty:
+        return route_df.copy()
+    sorted_df = route_df.copy()
+    sorted_df["_map_sequence_sort"] = sorted_df["Sequence"].apply(map_sequence_sort_value)
+    sorted_df["_map_original_order"] = range(len(sorted_df))
+    sorted_df = sorted_df.sort_values(
+        ["Rider", "_map_sequence_sort", "_map_original_order"],
+        kind="stable",
+    )
+    return sorted_df.drop(columns=["_map_sequence_sort", "_map_original_order"], errors="ignore")
+
+
+def format_route_metric(value: object, suffix: str) -> str:
+    if value is None or pd.isna(value) or value == "":
+        return "-"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return f"{value} {suffix}"
+    return f"{round(number, 1)} {suffix}"
+
+
+def add_map_point(
+    point_rows: list[dict[str, object]],
+    geocodes: dict[str, dict[str, object]],
+    address: str,
+    location_type: str,
+    tooltip: str,
+    radius: int,
+    fill_color: list[int],
+    is_background: bool = False,
+) -> None:
+    address = clean_text(address)
+    result = geocodes.get(address, {})
+    if result.get("lat") is None or result.get("lon") is None:
+        return
+    point_rows.append(
+        {
+            "Address": address,
+            "Location Type": location_type,
+            "tooltip": tooltip,
+            "lat": result["lat"],
+            "lon": result["lon"],
+            "radius": radius,
+            "fill_color": fill_color,
+            "is_background": is_background,
+        }
+    )
+
+
+def map_view_state(point_df: pd.DataFrame, individual_job_selected: bool) -> pdk.ViewState:
+    if point_df.empty:
+        return pdk.ViewState(latitude=1.3521, longitude=103.8198, zoom=11, pitch=0)
+
+    latitudes = pd.to_numeric(point_df["lat"], errors="coerce").dropna()
+    longitudes = pd.to_numeric(point_df["lon"], errors="coerce").dropna()
+    if latitudes.empty or longitudes.empty:
+        return pdk.ViewState(latitude=1.3521, longitude=103.8198, zoom=11, pitch=0)
+
+    view_lat = float(latitudes.mean())
+    view_lon = float(longitudes.mean())
+    spread = max(float(latitudes.max() - latitudes.min()), float(longitudes.max() - longitudes.min()))
+
+    if len(point_df) <= 1:
+        zoom = 13.5 if individual_job_selected else 12.5
+    elif individual_job_selected:
+        if spread <= 0.01:
+            zoom = 13.4
+        elif spread <= 0.03:
+            zoom = 12.7
+        elif spread <= 0.08:
+            zoom = 11.8
+        else:
+            zoom = 10.9
+    else:
+        if spread <= 0.03:
+            zoom = 12.1
+        elif spread <= 0.08:
+            zoom = 11.3
+        elif spread <= 0.15:
+            zoom = 10.6
+        else:
+            zoom = 10.0
+
+    return pdk.ViewState(latitude=view_lat, longitude=view_lon, zoom=zoom, pitch=0)
+
+
+def add_session_rider_load_column(rider_df: pd.DataFrame) -> pd.DataFrame:
+    rider_df = rider_df.copy() if rider_df is not None else pd.DataFrame()
+    if "Rider Load" not in rider_df.columns:
+        rider_df["Rider Load"] = "Normal"
+    rider_df["Rider Load"] = rider_df["Rider Load"].apply(
+        lambda value: value if value in RIDER_LOAD_LEVELS else "Normal"
+    )
+    return rider_df
+
+
+def persistent_roster_columns(rider_df: pd.DataFrame) -> pd.DataFrame:
+    rider_df = rider_df.copy() if rider_df is not None else pd.DataFrame()
+    for column in RIDER_COLUMNS:
+        if column not in rider_df.columns:
+            rider_df[column] = None
+    return rider_df.loc[:, RIDER_COLUMNS].copy()
+
+
+def build_route_map_data(
+    route_df: pd.DataFrame,
+    jobs_df: pd.DataFrame,
+    rider_df: pd.DataFrame,
+    token: str | None,
+    visible_route_df: pd.DataFrame | None = None,
+    selected_rider: str = "",
+    show_other_jobs: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    addresses = []
+    for column in ["Start Location"]:
+        if column in rider_df.columns:
+            addresses.extend(rider_df[column].apply(clean_text).tolist())
+    for column in ["Start From", "Pickup Address", "Drop-off Address"]:
+        if column in route_df.columns:
+            addresses.extend(route_df[column].apply(clean_text).tolist())
+    for column in ["Pickup Address", "Drop-off Address"]:
+        if column in jobs_df.columns:
+            addresses.extend(jobs_df[column].apply(clean_text).tolist())
+
+    unique_addresses = tuple(sorted({address for address in addresses if address}))
+    geocodes = cached_route_map_geocodes(unique_addresses, token)
+
+    point_rows = []
+    visible_route_df = visible_route_df.copy() if visible_route_df is not None else pd.DataFrame()
+    relevant_addresses = set()
+    if selected_rider and not visible_route_df.empty:
+        for _, route in visible_route_df.iterrows():
+            sequence = normalise_map_sequence(route.get("Sequence"))
+            start_address = clean_text(route.get("Start From"))
+            pickup_address = clean_text(route.get("Pickup Address"))
+            dropoff_address = clean_text(route.get("Drop-off Address"))
+            for address in [start_address, pickup_address, dropoff_address]:
+                if address:
+                    relevant_addresses.add(address.casefold())
+
+            add_map_point(
+                point_rows,
+                geocodes,
+                start_address,
+                "Start from",
+                f"{selected_rider}<br/>Job {sequence} start<br/>{start_address}",
+                74,
+                [17, 24, 39],
+            )
+            add_map_point(
+                point_rows,
+                geocodes,
+                pickup_address,
+                "Pickup",
+                f"{selected_rider}<br/>Job {sequence} pickup<br/>{pickup_address}",
+                70,
+                [14, 165, 233],
+            )
+            add_map_point(
+                point_rows,
+                geocodes,
+                dropoff_address,
+                "Drop-off",
+                f"{selected_rider}<br/>Job {sequence} drop-off<br/>{dropoff_address}",
+                70,
+                [249, 115, 22],
+            )
+
+        if show_other_jobs:
+            for _, job in jobs_df.iterrows():
+                for location_type, column in [
+                    ("Other pickup", "Pickup Address"),
+                    ("Other drop-off", "Drop-off Address"),
+                ]:
+                    address = clean_text(job.get(column))
+                    if not address or address.casefold() in relevant_addresses:
+                        continue
+                    add_map_point(
+                        point_rows,
+                        geocodes,
+                        address,
+                        location_type,
+                        f"{location_type}<br/>{address}",
+                        42,
+                        [156, 163, 175, 95],
+                        is_background=True,
+                    )
+    else:
+        for _, rider in rider_df.iterrows():
+            address = clean_text(rider.get("Start Location"))
+            rider_name = clean_text(rider.get("Rider Name")) or "Rider"
+            add_map_point(
+                point_rows,
+                geocodes,
+                address,
+                "Rider start",
+                f"{rider_name}<br/>Rider start<br/>{address}",
+                74,
+                [17, 24, 39],
+            )
+
+        for _, job in jobs_df.iterrows():
+            for location_type, column, colour in [
+                ("Given pickup", "Pickup Address", [14, 165, 233]),
+                ("Given drop-off", "Drop-off Address", [249, 115, 22]),
+            ]:
+                address = clean_text(job.get(column))
+                add_map_point(
+                    point_rows,
+                    geocodes,
+                    address,
+                    location_type,
+                    f"{location_type}<br/>{address}",
+                    62,
+                    colour,
+                )
+
+    leg_rows = []
+    for _, row in sort_routes_for_map(route_df).iterrows():
+        rider = str(row["Rider"])
+        sequence = normalise_map_sequence(row.get("Sequence"))
+        public_colour = [220, 38, 38, 210]
+        car_colour = [22, 163, 74, 230]
+        legs = [
+            {
+                "Mode": "Public transport / empty travel",
+                "Mode Label": "PT",
+                "From": clean_text(row["Start From"]),
+                "To": clean_text(row["Pickup Address"]),
+                "Distance KM": row["Empty Distance KM"],
+                "Duration Min": row["Empty Duration Min"],
+                "Instructions": clean_text(row.get("Empty PT Instructions")),
+                "Route Path": parse_route_path(row.get("Empty Route Path")),
+                "color": public_colour,
+            },
+            {
+                "Mode": "Car movement",
+                "Mode Label": "DRIVE",
+                "From": clean_text(row["Pickup Address"]),
+                "To": clean_text(row["Drop-off Address"]),
+                "Distance KM": row["Loaded Distance KM"],
+                "Duration Min": row["Loaded Duration Min"],
+                "Instructions": clean_text(row.get("Loaded Drive Instructions")),
+                "Route Path": parse_route_path(row.get("Loaded Route Path")),
+                "color": car_colour,
+            },
+        ]
+        for leg in legs:
+            start = geocodes.get(leg["From"], {})
+            end = geocodes.get(leg["To"], {})
+            if (
+                start.get("lat") is None
+                or start.get("lon") is None
+                or end.get("lat") is None
+                or end.get("lon") is None
+            ):
+                continue
+            path = leg["Route Path"] or [[start["lon"], start["lat"]], [end["lon"], end["lat"]]]
+            leg_rows.append(
+                {
+                    "Rider": rider,
+                    "Sequence": row.get("Sequence"),
+                    "sequence_key": sequence,
+                    "Car Plate": clean_text(row["Car Plate"]),
+                    "Mode": leg["Mode"],
+                    "From": leg["From"],
+                    "To": leg["To"],
+                    "Distance KM": leg["Distance KM"],
+                    "Duration Min": leg["Duration Min"],
+                    "Cost Source": clean_text(row["Cost Source"]),
+                    "path": path,
+                    "color": leg["color"],
+                    "label_position": [
+                        (float(start["lon"]) + float(end["lon"])) / 2,
+                        (float(start["lat"]) + float(end["lat"])) / 2,
+                    ],
+                    "label": f"J{sequence} · {leg['Mode Label']}",
+                    "tooltip": (
+                        f"{rider}<br/>Job {sequence}: {leg['Mode']}<br/>"
+                        f"{leg['From']} -> {leg['To']}<br/>"
+                        f"{leg['Distance KM']} km, {leg['Duration Min']} min<br/>"
+                        f"{leg['Instructions']}<br/>"
+                        f"{clean_text(row['Car Plate'])}"
+                    ),
+                }
+            )
+
+    missing = [
+        f"{address}: {result.get('error') or 'No coordinates returned'}"
+        for address, result in geocodes.items()
+        if result.get("lat") is None or result.get("lon") is None
+    ]
+    return pd.DataFrame(point_rows), pd.DataFrame(leg_rows), missing
+
+
+def show_route_map(route_df: pd.DataFrame, jobs_df: pd.DataFrame, rider_df: pd.DataFrame, token: str | None) -> None:
+    st.subheader("Singapore Route Map")
+    rider_names = list(route_df["Rider"].dropna().astype(str).drop_duplicates())
+    selected_key = "bluesg_selected_map_rider"
+    sequence_key = "bluesg_selected_map_sequence"
+    labels_key = "bluesg_show_route_labels"
+    labels_context_key = "bluesg_show_route_labels_context"
+    show_other_jobs_key = "bluesg_show_other_jobs"
+    selected_rider = st.session_state.get(selected_key, "")
+    if selected_rider not in rider_names:
+        selected_rider = ""
+        st.session_state[selected_key] = ""
+        st.session_state[sequence_key] = "All"
+
+    map_col, rider_col = st.columns([4, 1])
+    with rider_col:
+        st.caption("Riders")
+        for rider_name in rider_names:
+            rider_routes = route_df[route_df["Rider"].astype(str) == rider_name]
+            total_distance = float(rider_routes["Total Distance KM"].fillna(0).sum())
+            total_duration = float(rider_routes["Total Duration Min"].fillna(0).sum())
+            button_type = "primary" if selected_rider == rider_name else "secondary"
+            if st.button(
+                f"{rider_name}",
+                key=f"map_rider_{rider_name}",
+                type=button_type,
+                width="stretch",
+            ):
+                if selected_rider != rider_name:
+                    st.session_state[sequence_key] = "All"
+                    st.session_state[labels_context_key] = ""
+                selected_rider = rider_name
+                st.session_state[selected_key] = rider_name
+            if selected_rider == rider_name:
+                st.caption(f"{len(rider_routes)} job(s)")
+                st.caption(f"{round(total_distance, 2)} km")
+                st.caption(f"{round(total_duration, 1)} min")
+
+        if selected_rider and st.button("Clear route", key="map_clear_rider", width="stretch"):
+            selected_rider = ""
+            st.session_state[selected_key] = ""
+            st.session_state[sequence_key] = "All"
+            st.session_state[labels_context_key] = ""
+
+    selected_rider_route_df = pd.DataFrame()
+    visible_route_df = pd.DataFrame()
+    sequence_options: list[str] = []
+    selected_sequence = "All"
+    show_route_labels = False
+    show_other_jobs = False
+    if selected_rider:
+        selected_rider_route_df = sort_routes_for_map(
+            route_df[route_df["Rider"].astype(str) == selected_rider]
+        )
+        sequence_options = route_sequence_options(selected_rider_route_df)
+        route_options = ["All"] + sequence_options
+        if st.session_state.get(sequence_key, "All") not in route_options:
+            st.session_state[sequence_key] = "All"
+
+        with map_col:
+            st.caption("Showing route for:")
+            st.write(f"**{selected_rider}**")
+            if hasattr(st, "segmented_control"):
+                selected_sequence = st.segmented_control(
+                    "Route",
+                    route_options,
+                    key=sequence_key,
+                )
+            else:
+                selected_sequence = st.radio(
+                    "Route",
+                    route_options,
+                    key=sequence_key,
+                    horizontal=True,
+                )
+            selected_sequence = selected_sequence or "All"
+
+            label_context = f"{selected_rider}|{selected_sequence}|{','.join(sequence_options)}"
+            default_show_labels = selected_sequence != "All" or len(sequence_options) <= 3
+            if st.session_state.get(labels_context_key) != label_context:
+                st.session_state[labels_key] = default_show_labels
+                st.session_state[labels_context_key] = label_context
+            if show_other_jobs_key not in st.session_state:
+                st.session_state[show_other_jobs_key] = False
+
+            control_cols = st.columns(2)
+            toggle_fn = st.toggle if hasattr(st, "toggle") else st.checkbox
+            with control_cols[0]:
+                show_route_labels = toggle_fn("Show route labels", key=labels_key)
+            with control_cols[1]:
+                show_other_jobs = toggle_fn("Show other jobs", key=show_other_jobs_key)
+
+        if selected_sequence == "All":
+            visible_route_df = selected_rider_route_df.copy()
+        else:
+            visible_route_df = selected_rider_route_df[
+                selected_rider_route_df["Sequence"].apply(normalise_map_sequence) == selected_sequence
+            ].copy()
+
+    point_df, leg_df, missing_locations = build_route_map_data(
+        route_df,
+        jobs_df,
+        rider_df,
+        token,
+        visible_route_df=visible_route_df,
+        selected_rider=selected_rider,
+        show_other_jobs=show_other_jobs,
+    )
+
+    if leg_df.empty and point_df.empty:
+        st.warning("No map locations could be geocoded. Check the addresses or OneMap token.")
+        return
+
+    if missing_locations:
+        with st.expander("Map locations not found", expanded=False):
+            for warning in missing_locations[:80]:
+                st.warning(warning)
+            if len(missing_locations) > 80:
+                st.info(f"Showing first 80 of {len(missing_locations)} missing location(s).")
+
+    if selected_rider and "Rider" in leg_df.columns:
+        visible_leg_df = leg_df[leg_df["Rider"] == selected_rider].copy()
+        if selected_sequence != "All" and "sequence_key" in visible_leg_df.columns:
+            visible_leg_df = visible_leg_df[visible_leg_df["sequence_key"] == selected_sequence].copy()
+    else:
+        visible_leg_df = pd.DataFrame()
+
+    layers = []
+    if not visible_leg_df.empty:
+        layers.append(
+            pdk.Layer(
+                "PathLayer",
+                visible_leg_df,
+                get_path="path",
+                get_color="color",
+                width_min_pixels=4,
+                pickable=True,
+            )
+        )
+    if show_route_labels and not visible_leg_df.empty:
+        layers.append(
+            pdk.Layer(
+                "TextLayer",
+                visible_leg_df,
+                get_position="label_position",
+                get_text="label",
+                get_color=[17, 24, 39],
+                get_size=12,
+                get_angle=0,
+                get_text_anchor="'middle'",
+                get_alignment_baseline="'center'",
+                background=True,
+                get_background_color=[255, 255, 255, 215],
+                background_padding=[4, 3],
+                pickable=True,
+            )
+        )
+    if not point_df.empty:
+        background_point_df = point_df[point_df["is_background"].fillna(False)].copy()
+        active_point_df = point_df[~point_df["is_background"].fillna(False)].copy()
+        if not background_point_df.empty:
+            layers.append(
+                pdk.Layer(
+                    "ScatterplotLayer",
+                    background_point_df,
+                    get_position="[lon, lat]",
+                    get_fill_color="fill_color",
+                    get_radius="radius",
+                    radius_min_pixels=3,
+                    radius_max_pixels=8,
+                    stroked=True,
+                    get_line_color=[255, 255, 255, 120],
+                    line_width_min_pixels=1,
+                    pickable=True,
+                )
+            )
+        if not active_point_df.empty:
+            layers.append(
+                pdk.Layer(
+                    "ScatterplotLayer",
+                    active_point_df,
+                    get_position="[lon, lat]",
+                    get_fill_color="fill_color",
+                    get_radius="radius",
+                    radius_min_pixels=6,
+                    radius_max_pixels=14,
+                    stroked=True,
+                    get_line_color=[255, 255, 255],
+                    line_width_min_pixels=1,
+                    pickable=True,
+                )
+            )
+
+    viewport_points = point_df[~point_df["is_background"].fillna(False)].copy() if not point_df.empty else point_df
+    if viewport_points.empty:
+        viewport_points = point_df
+    deck = pdk.Deck(
+        map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+        initial_view_state=map_view_state(viewport_points, selected_sequence != "All"),
+        layers=layers,
+        tooltip={
+            "html": "{tooltip}",
+            "style": {"backgroundColor": "#111827", "color": "white"},
+        },
+    )
+    with map_col:
+        if selected_rider:
+            if visible_leg_df.empty:
+                st.warning("This route selection has no drawable route legs. Check whether the route addresses were geocoded.")
+        else:
+            st.caption("Select a rider on the right to show their route.")
+        st.pydeck_chart(deck, width="stretch")
+
+        if selected_rider and selected_sequence != "All" and not visible_route_df.empty:
+            selected_job = visible_route_df.iloc[0]
+            st.caption(f"JOB {selected_sequence}")
+            summary_cols = st.columns(3)
+            summary_cols[0].metric("Car Plate", clean_text(selected_job.get("Car Plate")) or "-")
+            summary_cols[1].metric("Travel to Pickup", format_route_metric(selected_job.get("Empty Distance KM"), "km"))
+            summary_cols[2].metric("Vehicle Movement", format_route_metric(selected_job.get("Loaded Distance KM"), "km"))
+            detail_cols = st.columns(2)
+            with detail_cols[0]:
+                st.caption("Travel to Pickup")
+                st.write(f"{clean_text(selected_job.get('Start From')) or '-'} -> {clean_text(selected_job.get('Pickup Address')) or '-'}")
+                st.caption(
+                    f"{format_route_metric(selected_job.get('Empty Distance KM'), 'km')} / "
+                    f"{format_route_metric(selected_job.get('Empty Duration Min'), 'min')}"
+                )
+            with detail_cols[1]:
+                st.caption("Vehicle Movement")
+                st.write(f"{clean_text(selected_job.get('Pickup Address')) or '-'} -> {clean_text(selected_job.get('Drop-off Address')) or '-'}")
+                st.caption(
+                    f"{format_route_metric(selected_job.get('Loaded Distance KM'), 'km')} / "
+                    f"{format_route_metric(selected_job.get('Loaded Duration Min'), 'min')}"
+                )
+
+        legend_cols = st.columns(4)
+        legend_cols[0].caption("Red: public transport to pickup")
+        legend_cols[1].caption("Green: driving/car movement")
+        legend_cols[2].caption("Blue/orange dots: pickups/drop-offs")
+        legend_cols[3].caption("Dark dot: job start")
+
+
+def get_onemap_token_from_env() -> str:
+    refreshed_token = st.session_state.get("onemap_token", "")
+    if refreshed_token:
+        return refreshed_token
+    return get_onemap_token()
+
+
+st.title("Vehicle Route Optimiser")
+st.caption("Upload vehicle relocation jobs, confirm riders, optimise routes, and download dispatch instructions.")
+
+st.info(
+    "How to use:\n"
+    "1. Upload the job Excel file.\n"
+    "2. Check the rider roster.\n"
+    "3. Click Optimise Routes.\n"
+    "4. Review the map and download the output."
+)
+
+with st.expander("How the route optimiser works", expanded=False):
+    st.write(
+        "Each job is a fixed pickup-to-drop-off vehicle relocation. The rider first travels "
+        "to the pickup location without the car, then drives the car to the drop-off location. "
+        "The empty travel duration is adjusted upward to allow for public transport, walking, and waiting time. "
+        "After each drop-off, that drop-off becomes the rider's next starting point. OneMap is "
+        "used where available; fallback zone estimates are used when a lookup is unavailable."
+    )
+
+jobs_df = pd.DataFrame()
+file_is_valid = False
+missing_headers: list[str] = []
+validation_warnings: list[str] = []
+upload_error = ""
+roster_path = ensure_rider_roster_workbook()
+scoring_defaults = {
+    "empty_weight": DEFAULT_EMPTY_WEIGHT,
+    "loaded_weight": DEFAULT_LOADED_WEIGHT,
+    "soft_workload_min": DEFAULT_SOFT_WORKLOAD_MIN,
+    "workload_penalty_per_min": DEFAULT_WORKLOAD_PENALTY_PER_MIN,
+    "soft_adjusted_duration_min": DEFAULT_SOFT_ADJUSTED_DURATION_MIN,
+    "duration_penalty_per_min": DEFAULT_DURATION_PENALTY_PER_MIN,
+    "max_job_overage_penalty": DEFAULT_MAX_JOB_OVERAGE_PENALTY,
+    "duration_buffer_multiplier": DEFAULT_DURATION_BUFFER_MULTIPLIER,
+    "max_adjusted_duration_min": DEFAULT_MAX_ADJUSTED_DURATION_MIN,
+    "empty_travel_duration_multiplier": DEFAULT_EMPTY_TRAVEL_DURATION_MULTIPLIER,
+    "empty_travel_wait_buffer_min": DEFAULT_EMPTY_TRAVEL_WAIT_BUFFER_MIN,
+    "cluster_pressure_bonus_per_job": DEFAULT_CLUSTER_PRESSURE_BONUS_PER_JOB,
+}
+
+upload_col, riders_col = st.columns(2, gap="large")
+
+with upload_col:
+    st.subheader("1. Upload Job List")
+    uploaded_file = st.file_uploader("Upload vehicle jobs Excel file", type=["xlsx", "xls"])
+
+    if uploaded_file is None:
+        st.caption("Upload an Excel file to begin.")
+    else:
+        try:
+            jobs_df, missing_headers, validation_warnings = load_and_validate_jobs(uploaded_file)
+        except ValueError as exc:
+            upload_error = str(exc)
+            st.error(upload_error)
+        else:
+            if missing_headers:
+                st.error("Missing required header(s): " + ", ".join(missing_headers))
+            else:
+                file_is_valid = True
+                skipped_rows = int(jobs_df.attrs.get("blank_address_rows_dropped", 0))
+                if "Date" in jobs_df.columns:
+                    parsed_dates = pd.to_datetime(jobs_df["Date"], errors="coerce").dt.date
+                    available_dates = sorted(parsed_dates.dropna().unique())
+                    if available_dates:
+                        today = pd.Timestamp.now(tz="Asia/Singapore").date()
+                        default_date_index = (
+                            available_dates.index(today)
+                            if today in available_dates
+                            else len(available_dates) - 1
+                        )
+                        selected_job_date = st.selectbox(
+                            "Job date",
+                            available_dates,
+                            index=default_date_index,
+                            format_func=lambda value: value.strftime("%d/%m/%Y"),
+                            help="Only jobs for the selected date are sent into the optimiser.",
+                        )
+                        all_date_jobs_count = len(jobs_df)
+                        jobs_df = jobs_df.loc[parsed_dates == selected_job_date].copy()
+                        jobs_df.attrs.update(
+                            {
+                                "uploaded_count": all_date_jobs_count,
+                                "blank_address_rows_dropped": skipped_rows,
+                            }
+                        )
+                        st.caption(
+                            f"Showing {len(jobs_df)} of {all_date_jobs_count} valid job(s) "
+                            f"for {selected_job_date.strftime('%d/%m/%Y')}."
+                        )
+                status_cols = st.columns(2)
+                status_cols[0].metric("Valid Jobs", len(jobs_df))
+                status_cols[1].metric("Skipped Rows", skipped_rows)
+                preview_columns = [
+                    "Date",
+                    "Car Plate",
+                    "Pickup Address",
+                    "Pickup Lot",
+                    "Drop-off Address",
+                    "Pickup Zone",
+                    "Drop-off Zone",
+                ]
+                preview_columns = [column for column in preview_columns if column in jobs_df.columns]
+                with st.expander("Preview uploaded jobs", expanded=True):
+                    st.dataframe(
+                        jobs_df[preview_columns],
+                        width="stretch",
+                        hide_index=True,
+                        height=220,
+                    )
+
+    with st.expander("Excel format and data checks", expanded=False):
+        st.write("Required headers:")
+        st.write(", ".join(REQUIRED_JOB_HEADERS))
+        st.write("Optional headers: Date, Fuel %, Pickup Time, Notes")
+        if upload_error:
+            st.error(upload_error)
+        if missing_headers:
+            st.error("Missing required header(s): " + ", ".join(missing_headers))
+        for warning in validation_warnings:
+            st.warning(warning)
+
+with riders_col:
+    st.subheader("2. Confirm Riders")
+    roster_header_cols = st.columns([2, 1])
+    with roster_header_cols[0]:
+        selected_roster_day = st.selectbox("Roster day", WEEKDAY_SHEETS)
+    with roster_header_cols[1]:
+        st.caption("Max Jobs is a soft guide.")
+
+    if st.session_state.get("bluesg_roster_day") != selected_roster_day:
+        st.session_state.bluesg_roster_day = selected_roster_day
+        st.session_state.bluesg_riders = add_session_rider_load_column(load_rider_roster(selected_roster_day))
+
+    if "bluesg_riders" not in st.session_state:
+        st.session_state.bluesg_riders = add_session_rider_load_column(load_rider_roster(selected_roster_day))
+    else:
+        st.session_state.bluesg_riders = add_session_rider_load_column(st.session_state.bluesg_riders)
+
+    rider_df = st.data_editor(
+        st.session_state.bluesg_riders,
+        num_rows="dynamic",
+        width="stretch",
+        hide_index=True,
+        height=330,
+        column_config={
+            "Rider Name": st.column_config.TextColumn(required=True),
+            "Start Location": st.column_config.TextColumn(required=True),
+            "Start Zone": st.column_config.SelectboxColumn(
+                options=["", "North", "North-East", "East", "Central", "West", "South/CBD"],
+                help="Used as an initial fallback estimate and tie-breaker.",
+            ),
+            "Max Jobs": st.column_config.NumberColumn(
+                min_value=1,
+                step=1,
+                help="Soft preference only. A rider can exceed it if they are still the best nearby match.",
+            ),
+            "Rider Load": st.column_config.SelectboxColumn(
+                options=RIDER_LOAD_LEVELS,
+                help="Session-only priority. Low gets fewer jobs; High and Very High are preferred for more jobs.",
+            ),
+        },
+    )
+    rider_df = add_session_rider_load_column(rider_df)
+    st.session_state.bluesg_riders = rider_df
+
+    roster_action_cols = st.columns([1, 1, 1])
+    with roster_action_cols[0]:
+        if st.button("Save Roster", type="secondary", width="stretch"):
+            try:
+                saved_path = save_rider_roster(selected_roster_day, persistent_roster_columns(rider_df))
+            except PermissionError:
+                st.error("Could not save roster. Close the Excel workbook if it is open, then try again.")
+            except Exception as exc:
+                st.error(f"Could not save roster: {exc}")
+            else:
+                st.success(f"Saved {selected_roster_day} roster to {saved_path}")
+    with roster_action_cols[1]:
+        if st.button("Reload From Excel", width="stretch"):
+            try:
+                st.session_state.bluesg_riders = add_session_rider_load_column(load_rider_roster(selected_roster_day))
+            except Exception as exc:
+                st.error(f"Could not reload roster: {exc}")
+            else:
+                st.rerun()
+    with roster_action_cols[2]:
+        if hasattr(os, "startfile"):
+            if st.button("Open Excel File", width="stretch"):
+                try:
+                    os.startfile(ROSTER_FILE)
+                except Exception as exc:
+                    st.error(f"Could not open roster workbook: {exc}")
+        else:
+            st.caption("Download the workbook below to edit it locally.")
+
+    with st.expander("Roster file options", expanded=False):
+        st.caption(f"Persistent roster workbook: {roster_path}")
+        st.download_button(
+            "Download Roster Workbook",
+            data=read_rider_roster_file(),
+            file_name="rider_roster.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+action_col, review_col = st.columns([1, 2], gap="large")
+
+with action_col:
+    st.subheader("3. Optimise Routes")
+    with st.container(border=True):
+        optimise_by_label = st.radio(
+            "Optimise by",
+            ["Duration", "Distance"],
+            horizontal=True,
+            captions=["Lowest total minutes", "Lowest total kilometres"],
+        )
+        optimise_by = optimise_by_label.lower()
+
+        use_onemap = st.toggle("Use OneMap distance/time", value=True)
+        onemap_token = st.text_input(
+            "OneMap access token",
+            value=get_onemap_token_from_env(),
+            type="password",
+            help="Required for OneMap routing distance/time. If blank or invalid, the app will use fallback estimates.",
+            disabled=not use_onemap,
+        )
+
+        if use_onemap and not onemap_token and not onemap_credentials_configured():
+            st.warning(
+                "OneMap is enabled but no token or OneMap credentials are configured. "
+                "Fallback estimates will be used where needed."
+            )
+
+        ready_text = "Ready to optimise" if file_is_valid else "Upload a valid job file first"
+        st.caption(ready_text)
+        optimise_cols = st.columns(2)
+        with optimise_cols[0]:
+            optimise_clicked = st.button(
+                "Optimise Routes",
+                type="primary",
+                disabled=not file_is_valid,
+                width="stretch",
+            )
+        with optimise_cols[1]:
+            optimise_new_route_clicked = st.button(
+                "Optimise New Route",
+                disabled=not file_is_valid,
+                width="stretch",
+                help="Generate an alternate valid route plan by nudging assignment choices.",
+            )
+
+        if optimise_clicked:
+            st.session_state.bluesg_route_variant_index = 0
+        elif optimise_new_route_clicked:
+            st.session_state.bluesg_route_variant_index = int(
+                st.session_state.get("bluesg_route_variant_index", 0)
+            ) + 1
+        route_variant_index = int(st.session_state.get("bluesg_route_variant_index", 0))
+        if route_variant_index > 0:
+            st.caption(f"Alternate route variant #{route_variant_index}")
+
+    with st.expander("Advanced Settings", expanded=False):
+        st.write("Fallback travel cost table")
+        st.dataframe(cached_cost_explanation(), width="stretch", hide_index=True, height=180)
+
+        st.markdown("**Public Transport Empty Leg**")
+        pt_col_a, pt_col_b = st.columns(2)
+        with pt_col_a:
+            empty_travel_duration_multiplier = st.number_input(
+                "Empty duration multiplier",
+                value=scoring_defaults["empty_travel_duration_multiplier"],
+                min_value=1.0,
+                max_value=3.0,
+                step=0.1,
+                key="bluesg_empty_travel_duration_multiplier",
+            )
+        with pt_col_b:
+            empty_travel_wait_buffer_min = st.number_input(
+                "Wait/walk buffer min",
+                value=scoring_defaults["empty_travel_wait_buffer_min"],
+                min_value=0.0,
+                max_value=30.0,
+                step=1.0,
+                key="bluesg_empty_travel_wait_buffer_min",
+            )
+
+        st.markdown("**Assignment Scoring**")
+        force_complete_assignment = st.checkbox(
+            "Force complete assignment where possible",
+            value=True,
+            help="If enabled, the optimiser retries unassigned jobs in different route positions, but never exceeds the max adjusted minutes cap.",
+        )
+        if st.button("Reset to Recommended Defaults", width="stretch"):
+            for key, value in scoring_defaults.items():
+                st.session_state[f"bluesg_{key}"] = value
+
+        score_col_a, score_col_b = st.columns(2)
+        with score_col_a:
+            empty_weight = st.number_input(
+                "Empty leg weight",
+                value=scoring_defaults["empty_weight"],
+                min_value=1.0,
+                max_value=10.0,
+                step=0.5,
+                key="bluesg_empty_weight",
+            )
+        with score_col_b:
+            loaded_weight = st.number_input(
+                "Loaded leg weight",
+                value=scoring_defaults["loaded_weight"],
+                min_value=0.5,
+                max_value=5.0,
+                step=0.5,
+                key="bluesg_loaded_weight",
+            )
+        workload_col_a, workload_col_b = st.columns(2)
+        with workload_col_a:
+            soft_workload_min = st.number_input(
+                "Soft workload min",
+                value=scoring_defaults["soft_workload_min"],
+                min_value=30.0,
+                max_value=180.0,
+                step=5.0,
+                key="bluesg_soft_workload_min",
+            )
+        with workload_col_b:
+            workload_penalty_per_min = st.number_input(
+                "Workload penalty/min",
+                value=scoring_defaults["workload_penalty_per_min"],
+                min_value=0.0,
+                max_value=10.0,
+                step=0.5,
+                key="bluesg_workload_penalty_per_min",
+            )
+        duration_col_a, duration_col_b = st.columns(2)
+        with duration_col_a:
+            soft_adjusted_duration_min = st.number_input(
+                "Soft adjusted min",
+                value=scoring_defaults["soft_adjusted_duration_min"],
+                min_value=60.0,
+                max_value=240.0,
+                step=5.0,
+                key="bluesg_soft_adjusted_duration_min",
+            )
+        with duration_col_b:
+            duration_penalty_per_min = st.number_input(
+                "Duration penalty/min",
+                value=scoring_defaults["duration_penalty_per_min"],
+                min_value=0.0,
+                max_value=15.0,
+                step=0.5,
+                key="bluesg_duration_penalty_per_min",
+            )
+        cap_col_a, cap_col_b = st.columns(2)
+        with cap_col_a:
+            max_job_overage_penalty = st.number_input(
+                "Max jobs overage penalty",
+                value=scoring_defaults["max_job_overage_penalty"],
+                min_value=0.0,
+                max_value=300.0,
+                step=10.0,
+                key="bluesg_max_job_overage_penalty",
+            )
+        with cap_col_b:
+            duration_buffer_multiplier = st.number_input(
+                "Duration buffer multiplier",
+                value=scoring_defaults["duration_buffer_multiplier"],
+                min_value=1.0,
+                max_value=2.0,
+                step=0.1,
+                key="bluesg_duration_buffer_multiplier",
+            )
+        max_adjusted_duration_min = st.number_input(
+            "Max adjusted minutes",
+            value=scoring_defaults["max_adjusted_duration_min"],
+            min_value=60.0,
+            max_value=360.0,
+            step=15.0,
+            key="bluesg_max_adjusted_duration_min",
+        )
+        cluster_pressure_bonus_per_job = st.number_input(
+            "Cluster pressure bonus per remaining pickup",
+            value=scoring_defaults["cluster_pressure_bonus_per_job"],
+            min_value=0.0,
+            max_value=30.0,
+            step=1.0,
+            key="bluesg_cluster_pressure_bonus_per_job",
+        )
+
+if optimise_clicked or optimise_new_route_clicked:
+    rider_df_for_optimise, duplicate_rider_rows_removed = dedupe_rider_roster(rider_df)
+    if duplicate_rider_rows_removed:
+        st.warning(f"Duplicate rider rows removed before optimisation: {duplicate_rider_rows_removed}")
+    riders, rider_errors = validate_riders(rider_df_for_optimise)
+    if rider_errors:
+        for error in rider_errors:
+            st.error(error)
+    elif jobs_df.empty:
+        st.error("Upload at least one valid job before optimising.")
+    else:
+        estimated_checks = max(1, len(riders) * len(jobs_df) * (len(jobs_df) + 1) // 2)
+        if use_onemap:
+            st.info(
+                f"OneMap mode may take a while: this run can compare up to about "
+                f"{estimated_checks:,} rider-job combinations. Cached addresses and routes are reused, "
+                "and OneMap PT is only called for distinct empty-leg pairs where needed."
+            )
+
+        progress_panel = st.container(border=True)
+        with progress_panel:
+            st.markdown("**Optimisation in progress**")
+            metric_cols = st.columns(5)
+            phase_metric = metric_cols[0].empty()
+            assigned_metric = metric_cols[1].empty()
+            remaining_metric = metric_cols[2].empty()
+            elapsed_metric = metric_cols[3].empty()
+            checks_metric = metric_cols[4].empty()
+            progress_bar = st.progress(0, text="Preparing optimisation...")
+            activity_text = st.empty()
+            detail_text = st.empty()
+        started_at = time.monotonic()
+        last_progress_event: dict = {}
+
+        def show_progress(event: dict) -> None:
+            last_progress_event.clear()
+            last_progress_event.update(event)
+            elapsed = time.monotonic() - started_at
+            progress_value = max(0.0, min(1.0, float(event.get("progress", 0))))
+            assigned_jobs = int(event.get("assigned_jobs", 0) or 0)
+            total_jobs = int(event.get("total_jobs", 0) or 0)
+            remaining_jobs = int(event.get("remaining_jobs", 0) or 0)
+            comparison_count = int(event.get("comparison_count", 0) or 0)
+            estimated_comparisons = int(event.get("estimated_comparisons", 0) or 0)
+            phase = str(event.get("phase", "Working"))
+            status = str(event.get("status", "Optimising routes..."))
+
+            phase_metric.metric("Phase", phase)
+            assigned_metric.metric("Assigned", f"{assigned_jobs}/{total_jobs}")
+            remaining_metric.metric("Remaining", remaining_jobs)
+            elapsed_metric.metric("Elapsed", f"{elapsed:,.1f}s")
+            checks_metric.metric("Checks", f"{comparison_count:,}/{estimated_comparisons:,}")
+            progress_bar.progress(progress_value, text=f"{status} ({progress_value * 100:.0f}%)")
+            activity_text.info(status)
+
+            detail_parts = []
+            if event.get("current_address"):
+                detail_parts.append(("Address", event["current_address"]))
+            if event.get("current_rider"):
+                detail_parts.append(("Rider", event["current_rider"]))
+            if event.get("current_pickup"):
+                detail_parts.append(("Pickup", event["current_pickup"]))
+            if event.get("current_dropoff"):
+                detail_parts.append(("Drop-off", event["current_dropoff"]))
+
+            if detail_parts:
+                detail_text.dataframe(
+                    pd.DataFrame(detail_parts, columns=["Current item", "Value"]),
+                    width="stretch",
+                    hide_index=True,
+                )
+            else:
+                detail_text.caption("Warming up caches and preparing route checks...")
+
+        try:
+            route_df, summary_df, lookup_warnings = optimise_vehicle_routes(
+                jobs_df,
+                riders,
+                use_onemap=use_onemap,
+                optimise_by=optimise_by,
+                token=onemap_token or None,
+                progress_callback=show_progress,
+                empty_weight=empty_weight,
+                loaded_weight=loaded_weight,
+                soft_workload_min=soft_workload_min,
+                workload_penalty_per_min=workload_penalty_per_min,
+                soft_adjusted_duration_min=soft_adjusted_duration_min,
+                duration_penalty_per_min=duration_penalty_per_min,
+                max_job_overage_penalty=max_job_overage_penalty,
+                duration_buffer_multiplier=duration_buffer_multiplier,
+                max_adjusted_duration_min=max_adjusted_duration_min,
+                empty_travel_duration_multiplier=empty_travel_duration_multiplier,
+                empty_travel_wait_buffer_min=empty_travel_wait_buffer_min,
+                force_complete_assignment=force_complete_assignment,
+                cluster_pressure_bonus_per_job=cluster_pressure_bonus_per_job,
+                route_variant_index=route_variant_index,
+            )
+            integrity_report = optimisation_integrity_report(route_df, jobs_df)
+            if not integrity_report["is_valid"]:
+                st.error(integrity_report["message"])
+                if integrity_report["duplicate_details"]:
+                    st.dataframe(pd.DataFrame(integrity_report["duplicate_details"]), width="stretch", hide_index=True)
+                st.stop()
+        except ValueError as exc:
+            st.error(str(exc))
+            st.stop()
+        finally:
+            progress_bar.progress(1.0, text="Finished optimisation.")
+            activity_text.success("Finished optimisation.")
+        elapsed_total = time.monotonic() - started_at
+        if route_df.empty:
+            st.session_state.bluesg_latest_optimisation = None
+            st.warning("No jobs could be assigned. Check rider roster and input data.")
+        else:
+            st.session_state.bluesg_selected_map_rider = ""
+            st.session_state.bluesg_latest_optimisation = {
+                "route_df": route_df.copy(),
+                "summary_df": summary_df.copy(),
+                "jobs_df": jobs_df.copy(),
+                "rider_df": rider_df_for_optimise.copy(),
+                "validation_warnings": list(validation_warnings),
+                "lookup_warnings": list(lookup_warnings),
+                "token": onemap_token or None,
+                "integrity_report": integrity_report,
+                "duplicate_rider_rows_removed": duplicate_rider_rows_removed,
+                "route_variant_index": route_variant_index,
+                "diagnostics": {
+                    "rider_job_checks": int(last_progress_event.get("comparison_count", 0)),
+                    "estimated_checks": int(last_progress_event.get("estimated_comparisons", estimated_checks)),
+                    "elapsed_seconds": elapsed_total,
+                },
+            }
+
+latest_optimisation = st.session_state.get("bluesg_latest_optimisation")
+if latest_optimisation:
+    route_df = latest_optimisation["route_df"]
+    summary_df = latest_optimisation["summary_df"]
+    result_jobs_df = latest_optimisation["jobs_df"]
+    result_rider_df = latest_optimisation["rider_df"]
+    result_validation_warnings = latest_optimisation["validation_warnings"]
+    result_lookup_warnings = latest_optimisation["lookup_warnings"]
+    result_token = latest_optimisation["token"]
+    result_diagnostics = latest_optimisation.get("diagnostics", {})
+    result_integrity = latest_optimisation.get("integrity_report") or optimisation_integrity_report(route_df, result_jobs_df)
+    duplicate_rider_rows_removed = int(latest_optimisation.get("duplicate_rider_rows_removed", 0))
+    result_route_variant_index = int(latest_optimisation.get("route_variant_index", 0))
+    unassigned_jobs_df = result_integrity["unassigned_df"]
+
+    if not result_integrity["is_valid"]:
+        st.error(result_integrity["message"])
+        if result_integrity["duplicate_details"]:
+            st.dataframe(pd.DataFrame(result_integrity["duplicate_details"]), width="stretch", hide_index=True)
+        st.stop()
+
+    with review_col:
+        st.subheader("4. Review Results")
+        assigned_jobs = int(result_integrity["assigned_unique_jobs"])
+        assigned_route_rows = int(result_integrity["assigned_route_rows"])
+        total_jobs_uploaded = int(result_integrity["total_valid_jobs"])
+        unassigned_jobs = int(result_integrity["unassigned_jobs"])
+        riders_used = (
+            int((summary_df["Total Jobs"].fillna(0).astype(int) > 0).sum())
+            if "Total Jobs" in summary_df.columns
+            else 0
+        )
+        total_duration = (
+            float(summary_df["Total Route Duration Min"].fillna(0).sum())
+            if "Total Route Duration Min" in summary_df.columns
+            else 0.0
+        )
+        metric_cols = st.columns(4)
+        metric_cols[0].metric("Jobs Assigned", f"{assigned_jobs}/{total_jobs_uploaded}")
+        metric_cols[1].metric("Riders Used", riders_used)
+        metric_cols[2].metric("Total Estimated Duration", f"{total_duration:.1f} min")
+        metric_cols[3].metric("Unassigned Jobs", unassigned_jobs)
+
+        with st.expander("Optimisation Integrity Checks", expanded=False):
+            integrity_rows = [
+                ["Total valid jobs", total_jobs_uploaded],
+                ["Unique assigned jobs", assigned_jobs],
+                ["Assigned route rows", assigned_route_rows],
+                ["Unassigned jobs", unassigned_jobs],
+                ["Duplicate assigned Uploaded Rows", ", ".join(map(str, result_integrity["duplicate_uploaded_rows"])) or "None"],
+                ["Jobs in both assigned and unassigned", ", ".join(map(str, result_integrity["overlap_uploaded_rows"])) or "None"],
+                ["Duplicate rider rows removed", duplicate_rider_rows_removed],
+                ["Route variant", f"Alternate #{result_route_variant_index}" if result_route_variant_index else "Default"],
+            ]
+            st.dataframe(pd.DataFrame(integrity_rows, columns=["Check", "Value"]), width="stretch", hide_index=True)
+            if result_integrity["duplicate_details"]:
+                st.write("Duplicate assignment details")
+                st.dataframe(pd.DataFrame(result_integrity["duplicate_details"]), width="stretch", hide_index=True)
+
+        if unassigned_jobs:
+            st.warning(
+                f"Assigned {assigned_jobs} of {total_jobs_uploaded} job(s). "
+                "Some jobs were left unassigned because no rider route could fit them inside the 14:00-17:00 job window."
+            )
+            if not unassigned_jobs_df.empty:
+                st.write("Unassigned jobs")
+                st.dataframe(unassigned_jobs_df, width="stretch", hide_index=True, height=160)
+
+        failed_validation = route_df["Route Validation Status"].ne("OK")
+        if failed_validation.any():
+            st.warning("Some rider route rows did not chain correctly. Open Data and route warnings for details.")
+
+        with st.expander("Data and route warnings", expanded=False):
+            if result_lookup_warnings:
+                st.write("OneMap lookups that used fallback estimates:")
+                for warning in result_lookup_warnings[:100]:
+                    st.warning(warning)
+                if len(result_lookup_warnings) > 100:
+                    st.info(f"Showing first 100 of {len(result_lookup_warnings)} lookup warning(s).")
+            else:
+                st.caption("No OneMap fallback warnings for the latest run.")
+
+            for warning in result_validation_warnings:
+                st.warning(warning)
+
+            if failed_validation.any():
+                st.write("Route validation rows to review:")
+                validation_cols = [
+                    column
+                    for column in ["Rider", "Sequence", "Start From", "Drop-off Address", "Route Validation Status"]
+                    if column in route_df.columns
+                ]
+                st.dataframe(route_df.loc[failed_validation, validation_cols], width="stretch", hide_index=True)
+
+        with st.expander("Optimisation diagnostics", expanded=False):
+            diag_cols = st.columns(3)
+            diag_cols[0].metric("Rider-job checks", f"{int(result_diagnostics.get('rider_job_checks', 0)):,}")
+            diag_cols[1].metric("Estimated checks", f"{int(result_diagnostics.get('estimated_checks', 0)):,}")
+            diag_cols[2].metric("Elapsed time", f"{float(result_diagnostics.get('elapsed_seconds', 0.0)):.1f}s")
+
+    show_route_map(route_df, result_jobs_df, result_rider_df, result_token)
+
+    st.subheader("Dispatch View")
+    dispatch_columns = [
+        "Rider",
+        "Sequence",
+        "Car Plate",
+        "Pickup Address",
+        "Pickup Lot",
+        "Drop-off Address",
+        "Empty Travel To Pickup",
+        "Loaded Travel / Car Movement",
+        "Total Distance KM",
+        "Total Duration Min",
+    ]
+    dispatch_columns = [column for column in dispatch_columns if column in route_df.columns]
+    st.dataframe(route_df[dispatch_columns], width="stretch", hide_index=True)
+
+    with st.expander("Technical route details", expanded=False):
+        st.dataframe(route_df, width="stretch", hide_index=True)
+
+    st.subheader("Summary")
+    summary_columns = [
+        "Rider",
+        "Total Jobs",
+        "Total Route Distance KM",
+        "Total Route Duration Min",
+        "Adjusted Route Duration Min",
+        "Within 3 Hours",
+        "Final Location",
+        "Workload Comment",
+    ]
+    summary_columns = [column for column in summary_columns if column in summary_df.columns]
+    st.dataframe(summary_df[summary_columns], width="stretch", hide_index=True)
+
+    detail_summary_columns = [
+        "Rider",
+        "Total Empty Distance KM",
+        "Total Empty Duration Min",
+        "Total Loaded Distance KM",
+        "Total Loaded Duration Min",
+        "Empty Travel %",
+        "Loaded Travel %",
+    ]
+    detail_summary_columns = [column for column in detail_summary_columns if column in summary_df.columns]
+    with st.expander("Detailed summary columns", expanded=False):
+        st.dataframe(summary_df[detail_summary_columns], width="stretch", hide_index=True)
+
+    st.subheader("5. Download")
+    st.download_button(
+        "Download Excel Output",
+        data=export_routes_to_excel(
+            route_df,
+            summary_df,
+            jobs_df=result_jobs_df,
+            validation_warnings=result_validation_warnings,
+            lookup_warnings=result_lookup_warnings,
+        ),
+        file_name="vehicle_route_optimisation.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+else:
+    with review_col:
+        st.subheader("4. Review Results")
+        st.caption("Optimised routes will appear here after you run step 3.")
