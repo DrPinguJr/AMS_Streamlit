@@ -33,6 +33,11 @@ service_agreement_generator = st.Page(
     title="Service Agreement",
     icon=":material/contract:",
 )
+rdl_management_studio = st.Page(
+    "HR/RDL/app.py",
+    title="RDL Management Studio",
+    icon=":material/edit_document:",
+)
 
 pg = st.navigation(
     {
@@ -40,6 +45,7 @@ pg = st.navigation(
         "Lance": [tender, sesami, recruitment, converter, whatsapp],
         "Flexar": [bluesg],
         "Contracts": [cfs_generator, loa_generator, service_agreement_generator],
+        "HR": [rdl_management_studio],
     }
 )
 

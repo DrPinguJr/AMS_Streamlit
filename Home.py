@@ -22,6 +22,10 @@ st.page_link("Contracts/pages/CFS_Generator.py", label="CFS Contract Generator",
 st.page_link("Contracts/pages/LOA_Generator.py", label="Letter of Appointment", icon=":material/assignment:")
 st.page_link("Contracts/pages/Service_Agreement_Generator.py", label="Service Agreement", icon=":material/contract:")
 
+st.subheader("HR")
+
+st.page_link("HR/RDL/app.py", label="RDL Management Studio", icon=":material/edit_document:")
+
 st.divider()
 
 st.write("Add new project pages as separate folders, then register them in `app.py`.")

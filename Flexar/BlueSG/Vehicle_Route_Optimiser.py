@@ -2,6 +2,8 @@ import os
 import json
 import sys
 import time
+import copy
+import hashlib
 from pathlib import Path
 
 import pandas as pd
@@ -26,10 +28,18 @@ from Flexar.BlueSG.vehicle_route_optimizer import (
     DEFAULT_SOFT_ADJUSTED_DURATION_MIN,
     DEFAULT_SOFT_WORKLOAD_MIN,
     DEFAULT_WORKLOAD_PENALTY_PER_MIN,
+    DEFAULT_SELECTIVE_CHANGED_RIDER_PENALTY,
+    DEFAULT_SELECTIVE_MOVED_JOB_PENALTY,
+    DEFAULT_SELECTIVE_SEQUENCE_CHANGE_PENALTY,
     REQUIRED_JOB_HEADERS,
     RIDER_COLUMNS,
     RIDER_LOAD_LEVELS,
     ROSTER_FILE,
+    build_jobs_by_stable_id,
+    build_rider_sequences_from_route_df,
+    find_best_selective_reshuffle,
+    rebuild_outputs_from_sequences,
+    stable_job_id_from_route_row,
     clean_text,
     WEEKDAY_SHEETS,
     dedupe_rider_roster,
@@ -41,6 +51,7 @@ from Flexar.BlueSG.vehicle_route_optimizer import (
     get_onemap_token,
     load_and_validate_jobs,
     load_rider_roster,
+    normalise_rider_load_level,
     onemap_credentials_configured,
     optimisation_integrity_report,
     optimise_vehicle_routes,
@@ -230,9 +241,9 @@ def map_view_state(point_df: pd.DataFrame, individual_job_selected: bool) -> pdk
 def add_session_rider_load_column(rider_df: pd.DataFrame) -> pd.DataFrame:
     rider_df = rider_df.copy() if rider_df is not None else pd.DataFrame()
     if "Rider Load" not in rider_df.columns:
-        rider_df["Rider Load"] = "Normal"
+        rider_df["Rider Load"] = "Medium"
     rider_df["Rider Load"] = rider_df["Rider Load"].apply(
-        lambda value: value if value in RIDER_LOAD_LEVELS else "Normal"
+        normalise_rider_load_level
     )
     return rider_df
 
@@ -686,6 +697,381 @@ def get_onemap_token_from_env() -> str:
     return get_onemap_token()
 
 
+def safe_widget_id(value: object) -> str:
+    text = clean_text(value)
+    return "".join(ch if ch.isalnum() else "_" for ch in text)[:80] or "item"
+
+
+def route_editor_source_signature(route_df: pd.DataFrame) -> str:
+    if route_df is None or route_df.empty:
+        return ""
+    rows = []
+    for _, row in route_df.sort_values(["Rider", "Sequence"], kind="stable").iterrows():
+        rows.append(
+            "|".join(
+                [
+                    clean_text(row.get("Rider")),
+                    clean_text(row.get("Sequence")),
+                    clean_text(row.get("Uploaded Row")),
+                    clean_text(row.get("Car Plate")),
+                    clean_text(row.get("Pickup Address")),
+                    clean_text(row.get("Drop-off Address")),
+                ]
+            )
+        )
+    return hashlib.sha1("\n".join(rows).encode("utf-8")).hexdigest()
+
+
+def initialise_route_editor_state(route_df: pd.DataFrame) -> dict:
+    signature = route_editor_source_signature(route_df)
+    state = st.session_state.get("bluesg_route_editor_state")
+    if state and state.get("source_signature") == signature:
+        return state
+    state = {
+        "version": 1,
+        "source_signature": signature,
+        "rider_sequences": build_rider_sequences_from_route_df(route_df),
+        "locked_riders": set(),
+        "locked_job_ids": set(),
+        "reshuffle_job_ids": set(),
+        "eligible_receiver_riders": set(),
+    }
+    st.session_state.bluesg_route_editor_state = state
+    st.session_state.bluesg_selective_reshuffle_result = None
+    st.session_state.bluesg_selective_option_index = 0
+    return state
+
+
+def selected_job_lookup(route_df: pd.DataFrame) -> dict[str, dict[str, object]]:
+    lookup = {}
+    if route_df is None or route_df.empty:
+        return lookup
+    for _, row in route_df.iterrows():
+        job_id = stable_job_id_from_route_row(row)
+        lookup[job_id] = {
+            "rider": clean_text(row.get("Rider")),
+            "sequence": int(float(row.get("Sequence") or 0)),
+            "car_plate": clean_text(row.get("Car Plate")),
+            "pickup": clean_text(row.get("Pickup Address")),
+            "dropoff": clean_text(row.get("Drop-off Address")),
+            "duration": row.get("Total Duration Min", ""),
+            "adjusted": row.get("Projected Adjusted Duration Min", ""),
+            "uploaded_row": row.get("Uploaded Row", ""),
+        }
+    return lookup
+
+
+def push_route_history() -> None:
+    history = list(st.session_state.get("bluesg_route_history", []))
+    snapshot = {
+        "latest_optimisation": copy.deepcopy(st.session_state.get("bluesg_latest_optimisation")),
+        "editor_state": copy.deepcopy(st.session_state.get("bluesg_route_editor_state")),
+    }
+    history.append(snapshot)
+    st.session_state.bluesg_route_history = history[-10:]
+
+
+def restore_last_route_history() -> bool:
+    history = list(st.session_state.get("bluesg_route_history", []))
+    if not history:
+        return False
+    snapshot = history.pop()
+    st.session_state.bluesg_route_history = history
+    st.session_state.bluesg_latest_optimisation = snapshot.get("latest_optimisation")
+    st.session_state.bluesg_route_editor_state = snapshot.get("editor_state")
+    st.session_state.bluesg_selective_reshuffle_result = None
+    st.session_state.bluesg_selective_option_index = 0
+    return True
+
+
+def apply_sequence_proposal_to_latest(proposed_sequences: dict[str, list[str]]) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    latest = st.session_state.get("bluesg_latest_optimisation")
+    if not latest:
+        raise RuntimeError("No optimisation result is available.")
+    previous_editor_state = st.session_state.get("bluesg_route_editor_state") or {}
+    locked_riders = set(previous_editor_state.get("locked_riders", set()))
+    rider_df = latest["rider_df"]
+    riders, rider_errors = validate_riders(rider_df)
+    if rider_errors:
+        raise RuntimeError("; ".join(rider_errors))
+    jobs_df = latest["jobs_df"]
+    jobs_by_id = build_jobs_by_stable_id(jobs_df)
+    settings = latest.get("optimisation_settings", {})
+    route_df, summary_df, lookup_warnings = rebuild_outputs_from_sequences(
+        proposed_sequences,
+        riders,
+        jobs_by_id,
+        jobs_df=jobs_df,
+        **settings,
+    )
+    latest["route_df"] = route_df.copy()
+    latest["summary_df"] = summary_df.copy()
+    latest["lookup_warnings"] = lookup_warnings
+    latest["integrity_report"] = optimisation_integrity_report(route_df, jobs_df)
+    st.session_state.bluesg_latest_optimisation = latest
+    st.session_state.bluesg_route_editor_state = {
+        "version": 1,
+        "source_signature": route_editor_source_signature(route_df),
+        "rider_sequences": {rider: list(jobs) for rider, jobs in proposed_sequences.items()},
+        "locked_riders": locked_riders,
+        "locked_job_ids": set(),
+        "reshuffle_job_ids": set(),
+        "eligible_receiver_riders": set(proposed_sequences) - locked_riders,
+    }
+    st.session_state.bluesg_selective_reshuffle_result = None
+    st.session_state.bluesg_selective_option_index = 0
+    return route_df, summary_df, lookup_warnings
+
+
+def sequence_display_df(sequences: dict[str, list[str]], job_info: dict[str, dict[str, object]], riders: list[str]) -> pd.DataFrame:
+    rows = []
+    for rider in riders:
+        for index, job_id in enumerate(sequences.get(rider, []), start=1):
+            info = job_info.get(job_id, {})
+            rows.append(
+                {
+                    "Rider": rider,
+                    "Sequence": index,
+                    "Car Plate": info.get("car_plate", job_id),
+                    "Pickup": info.get("pickup", ""),
+                    "Drop-off": info.get("dropoff", ""),
+                    "Job ID": job_id,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def render_route_editor(route_df: pd.DataFrame, summary_df: pd.DataFrame, result_jobs_df: pd.DataFrame, result_rider_df: pd.DataFrame) -> None:
+    st.subheader("Route Reshuffle")
+    editor_state = initialise_route_editor_state(route_df)
+    job_info = selected_job_lookup(route_df)
+    rider_names = list(editor_state["rider_sequences"].keys())
+
+    if st.session_state.get("bluesg_route_editor_last_message"):
+        st.success(st.session_state.bluesg_route_editor_last_message)
+        if st.button("Undo last reshuffle", key="reshuffle_undo_after_apply"):
+            st.session_state.bluesg_route_editor_last_message = ""
+            if restore_last_route_history():
+                st.rerun()
+
+    summary_by_rider = summary_df.set_index("Rider") if not summary_df.empty and "Rider" in summary_df.columns else pd.DataFrame()
+
+    st.markdown("**1. Lock Good Routes**")
+    card_cols = st.columns(4)
+    for index, rider in enumerate(rider_names):
+        rider_routes = route_df[route_df["Rider"].astype(str) == rider]
+        rider_locked = rider in editor_state["locked_riders"]
+        if rider in summary_by_rider.index:
+            rider_summary = summary_by_rider.loc[rider]
+            adjusted_duration = float(rider_summary.get("Adjusted Route Duration Min", 0) or 0)
+        else:
+            adjusted_duration = float(rider_routes["Total Duration Min"].fillna(0).sum()) if "Total Duration Min" in rider_routes.columns else 0.0
+        label = f"{'🔒' if rider_locked else '👤'} {rider}"
+        card = card_cols[index % 4]
+        if card.button(label, key=f"toggle_rider_lock_{safe_widget_id(rider)}", width="stretch"):
+            if rider_locked:
+                editor_state["locked_riders"].discard(rider)
+            else:
+                editor_state["locked_riders"].add(rider)
+                for job_id in editor_state["rider_sequences"].get(rider, []):
+                    editor_state["reshuffle_job_ids"].discard(job_id)
+            editor_state["eligible_receiver_riders"] = set(rider_names) - set(editor_state["locked_riders"])
+            st.session_state.bluesg_selective_reshuffle_result = None
+            st.session_state.bluesg_route_editor_last_message = ""
+            st.rerun()
+        card.caption(f"{len(rider_routes)} jobs · {adjusted_duration:.0f} min")
+
+    st.markdown("**2. Select Orders to Fix**")
+    for rider in rider_names:
+        rider_routes = route_df[route_df["Rider"].astype(str) == rider].sort_values("Sequence")
+        rider_locked = rider in editor_state["locked_riders"]
+        header = f"{'🔒 ' if rider_locked else ''}{rider}"
+        with st.expander(header, expanded=bool(set(editor_state["reshuffle_job_ids"]) & set(editor_state["rider_sequences"].get(rider, [])))):
+            if rider_locked:
+                st.caption("Route locked. Unlock this rider above before selecting one of their orders.")
+            for _, route in rider_routes.iterrows():
+                job_id = stable_job_id_from_route_row(route)
+                sequence = clean_text(route.get("Sequence"))
+                car_plate = clean_text(route.get("Car Plate"))
+                pickup = clean_text(route.get("Pickup Address"))
+                dropoff = clean_text(route.get("Drop-off Address"))
+                selected = job_id in editor_state["reshuffle_job_ids"]
+                order_label = f"{'🔄 ' if selected else ''}{sequence}. {car_plate}"
+                order_caption = f"{pickup} → {dropoff}"
+                row_cols = st.columns([2, 5])
+                if row_cols[0].button(
+                    order_label,
+                    key=f"toggle_reshuffle_order_{safe_widget_id(job_id)}",
+                    disabled=rider_locked,
+                    width="stretch",
+                    type="primary" if selected else "secondary",
+                ):
+                    if selected:
+                        editor_state["reshuffle_job_ids"].discard(job_id)
+                    else:
+                        editor_state["reshuffle_job_ids"].add(job_id)
+                    editor_state["locked_job_ids"] = set()
+                    st.session_state.bluesg_selective_reshuffle_result = None
+                    st.session_state.bluesg_route_editor_last_message = ""
+                    st.rerun()
+                row_cols[1].caption(
+                    f"{order_caption}" + (" · selected for reshuffle" if selected else "")
+                )
+
+    selected_pool = [
+        {
+            "Car Plate": job_info.get(job_id, {}).get("car_plate", job_id),
+            "Current Rider": job_info.get(job_id, {}).get("rider", ""),
+            "Current Sequence": job_info.get(job_id, {}).get("sequence", ""),
+            "Pickup": job_info.get(job_id, {}).get("pickup", ""),
+            "Drop-off": job_info.get(job_id, {}).get("dropoff", ""),
+        }
+        for job_id in sorted(editor_state["reshuffle_job_ids"])
+    ]
+    st.write(f"Selected: {len(selected_pool)} order{'s' if len(selected_pool) != 1 else ''}")
+    if selected_pool:
+        for item in selected_pool:
+            st.caption(
+                f"{item['Car Plate']} — {item['Current Rider']} · Job {item['Current Sequence']}"
+            )
+    else:
+        st.caption("Click an order under an unlocked rider to add it here.")
+
+    with st.expander("Advanced reshuffle scoring", expanded=False):
+        score_cols = st.columns(3)
+        changed_rider_penalty = score_cols[0].number_input(
+            "Changed rider penalty",
+            value=DEFAULT_SELECTIVE_CHANGED_RIDER_PENALTY,
+            min_value=0.0,
+            max_value=200.0,
+            step=5.0,
+        )
+        moved_job_penalty = score_cols[1].number_input(
+            "Moved job penalty",
+            value=DEFAULT_SELECTIVE_MOVED_JOB_PENALTY,
+            min_value=0.0,
+            max_value=100.0,
+            step=5.0,
+        )
+        sequence_change_penalty = score_cols[2].number_input(
+            "Sequence change penalty",
+            value=DEFAULT_SELECTIVE_SEQUENCE_CHANGE_PENALTY,
+            min_value=0.0,
+            max_value=100.0,
+            step=5.0,
+        )
+
+    eligible_receivers = set(rider_names) - set(editor_state["locked_riders"])
+    editor_state["eligible_receiver_riders"] = eligible_receivers
+    find_clicked = st.button("🔀 Find Best Reshuffle", type="primary", disabled=not editor_state["reshuffle_job_ids"], width="stretch")
+    if find_clicked:
+        riders, rider_errors = validate_riders(result_rider_df)
+        if rider_errors:
+            st.error("; ".join(rider_errors))
+        else:
+            with st.spinner("Searching selected route changes..."):
+                result = find_best_selective_reshuffle(
+                    editor_state["rider_sequences"],
+                    build_jobs_by_stable_id(result_jobs_df),
+                    riders,
+                    jobs_df=result_jobs_df,
+                    locked_riders=set(editor_state["locked_riders"]),
+                    locked_job_ids=set(),
+                    reshuffle_job_ids=set(editor_state["reshuffle_job_ids"]),
+                    eligible_receiver_riders=eligible_receivers,
+                    changed_rider_penalty=changed_rider_penalty,
+                    moved_job_penalty=moved_job_penalty,
+                    sequence_change_penalty=sequence_change_penalty,
+                    **st.session_state.bluesg_latest_optimisation.get("optimisation_settings", {}),
+                )
+            st.session_state.bluesg_selective_reshuffle_result = result
+            st.session_state.bluesg_selective_option_index = 0
+            st.rerun()
+
+    result = st.session_state.get("bluesg_selective_reshuffle_result")
+    if not result:
+        return
+    if not result.get("success"):
+        st.warning(result.get("reason", "No proposal was found."))
+        if result.get("search_limited"):
+            st.info("Candidate search hit the safety limit before all plans were evaluated.")
+        return
+
+    alternatives = result.get("alternatives", [])
+    if not alternatives:
+        return
+    option_index = int(st.session_state.get("bluesg_selective_option_index", 0))
+    option_index = max(0, min(option_index, len(alternatives) - 1))
+    option = alternatives[option_index]
+
+    st.markdown("**3. Best Outcome**")
+    affected_riders = option.get("changed_riders", []) or sorted({
+        item.get("from_rider", "")
+        for item in option.get("moved_jobs", [])
+        if item.get("from_rider")
+    } | {
+        item.get("to_rider", "")
+        for item in option.get("moved_jobs", [])
+        if item.get("to_rider")
+    })
+    before_col, after_col = st.columns(2)
+    with before_col:
+        st.write("Before")
+        for rider in affected_riders:
+            st.caption(rider)
+            for index, job_id in enumerate(option["original_sequences"].get(rider, []), start=1):
+                info = job_info.get(job_id, {})
+                st.write(f"{index}. {info.get('car_plate', job_id)}")
+    with after_col:
+        st.write("Best Outcome" if option_index == 0 else f"Option {option_index + 1}")
+        move_notes = {item["job_id"]: item for item in option.get("moved_jobs", [])}
+        for rider in affected_riders:
+            st.caption(rider)
+            for index, job_id in enumerate(option["proposed_sequences"].get(rider, []), start=1):
+                info = job_info.get(job_id, {})
+                note = move_notes.get(job_id)
+                st.write(f"{index}. {info.get('car_plate', job_id)}")
+                if note and note.get("from_rider") != rider:
+                    st.caption(f"Moved from {note.get('from_rider')}")
+
+    locked_changed = len(set(option.get("changed_riders", [])) & set(editor_state["locked_riders"]))
+    reassigned = sum(1 for item in option.get("moved_jobs", []) if item.get("changed_rider"))
+    improvement = -float(option.get("duration_delta", 0) or 0)
+    metric_cols = st.columns(5)
+    metric_cols[0].metric("Locked Routes Changed", locked_changed)
+    metric_cols[1].metric("Problem Orders Reassigned", reassigned)
+    metric_cols[2].metric("Estimated Improvement", f"{improvement:.1f} min")
+    metric_cols[3].metric("Latest Before", option.get("latest_completion_before", "-"))
+    metric_cols[4].metric("Latest After", option.get("latest_completion_after", "-"))
+
+    with st.expander("Advanced result details", expanded=False):
+        st.caption(
+            f"Option {option_index + 1} of {len(alternatives)}. "
+            f"Candidates evaluated: {option.get('candidate_count', 0):,}. "
+            f"Plan score: {float(option.get('plan_score', 0)):.1f}."
+        )
+        if option.get("search_limited"):
+            st.info("Search hit the safety limit; showing the best candidates found before stopping.")
+        if len(alternatives) > 1 and st.button("Show another option", key="reshuffle_next_option"):
+            st.session_state.bluesg_selective_option_index = (option_index + 1) % len(alternatives)
+            st.rerun()
+
+    action_cols = st.columns(2)
+    if action_cols[0].button("✓ Apply Reshuffle", type="primary", width="stretch"):
+        try:
+            push_route_history()
+            apply_sequence_proposal_to_latest(option["proposed_sequences"])
+        except Exception as exc:
+            st.error(f"Could not accept proposal: {exc}")
+        else:
+            st.session_state.bluesg_route_editor_last_message = "Reshuffle applied."
+            st.rerun()
+    if action_cols[1].button("Cancel", width="stretch"):
+        st.session_state.bluesg_selective_reshuffle_result = None
+        st.session_state.bluesg_selective_option_index = 0
+        st.rerun()
+
+
 st.title("Vehicle Route Optimiser")
 st.caption("Upload vehicle relocation jobs, confirm riders, optimise routes, and download dispatch instructions.")
 
@@ -845,7 +1231,10 @@ with riders_col:
             ),
             "Rider Load": st.column_config.SelectboxColumn(
                 options=RIDER_LOAD_LEVELS,
-                help="Session-only priority. Low gets fewer jobs; High and Very High are preferred for more jobs.",
+                help=(
+                    "Session-only priority. Low keeps PT/empty travel and area changes low; "
+                    "Medium is balanced; High and Very High are preferred for clustered work."
+                ),
             ),
         },
     )
@@ -1200,6 +1589,21 @@ if optimise_clicked or optimise_new_route_clicked:
                 "integrity_report": integrity_report,
                 "duplicate_rider_rows_removed": duplicate_rider_rows_removed,
                 "route_variant_index": route_variant_index,
+                "optimisation_settings": {
+                    "use_onemap": use_onemap,
+                    "optimise_by": optimise_by,
+                    "token": onemap_token or None,
+                    "empty_weight": empty_weight,
+                    "loaded_weight": loaded_weight,
+                    "soft_workload_min": soft_workload_min,
+                    "workload_penalty_per_min": workload_penalty_per_min,
+                    "soft_adjusted_duration_min": soft_adjusted_duration_min,
+                    "duration_penalty_per_min": duration_penalty_per_min,
+                    "max_job_overage_penalty": max_job_overage_penalty,
+                    "duration_buffer_multiplier": duration_buffer_multiplier,
+                    "empty_travel_duration_multiplier": empty_travel_duration_multiplier,
+                    "empty_travel_wait_buffer_min": empty_travel_wait_buffer_min,
+                },
                 "diagnostics": {
                     "rider_job_checks": int(last_progress_event.get("comparison_count", 0)),
                     "estimated_checks": int(last_progress_event.get("estimated_comparisons", estimated_checks)),
@@ -1261,7 +1665,8 @@ if latest_optimisation:
                 ["Duplicate rider rows removed", duplicate_rider_rows_removed],
                 ["Route variant", f"Alternate #{result_route_variant_index}" if result_route_variant_index else "Default"],
             ]
-            st.dataframe(pd.DataFrame(integrity_rows, columns=["Check", "Value"]), width="stretch", hide_index=True)
+            integrity_df = pd.DataFrame(integrity_rows, columns=["Check", "Value"]).astype(str)
+            st.dataframe(integrity_df, width="stretch", hide_index=True)
             if result_integrity["duplicate_details"]:
                 st.write("Duplicate assignment details")
                 st.dataframe(pd.DataFrame(result_integrity["duplicate_details"]), width="stretch", hide_index=True)
@@ -1306,6 +1711,8 @@ if latest_optimisation:
             diag_cols[0].metric("Rider-job checks", f"{int(result_diagnostics.get('rider_job_checks', 0)):,}")
             diag_cols[1].metric("Estimated checks", f"{int(result_diagnostics.get('estimated_checks', 0)):,}")
             diag_cols[2].metric("Elapsed time", f"{float(result_diagnostics.get('elapsed_seconds', 0.0)):.1f}s")
+
+    render_route_editor(route_df, summary_df, result_jobs_df, result_rider_df)
 
     show_route_map(route_df, result_jobs_df, result_rider_df, result_token)
 
