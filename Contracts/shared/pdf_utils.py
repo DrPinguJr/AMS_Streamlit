@@ -1,16 +1,29 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
 def find_libreoffice() -> str | None:
+    configured_path = os.getenv("LIBREOFFICE_PATH")
+    if configured_path:
+        candidate = Path(configured_path)
+        if candidate.exists():
+            return str(candidate)
+
     executable = shutil.which("soffice") or shutil.which("libreoffice")
     if executable:
         return executable
 
     candidates = [
+        PROJECT_ROOT / "tools" / "LibreOfficePortable" / "App" / "libreoffice" / "program" / "soffice.exe",
+        PROJECT_ROOT / "tools" / "LibreOfficePortable" / "LibreOfficePortable" / "App" / "libreoffice" / "program" / "soffice.exe",
+        PROJECT_ROOT / "tools" / "PortableApps" / "LibreOfficePortable" / "App" / "libreoffice" / "program" / "soffice.exe",
         Path("C:/Program Files/LibreOffice/program/soffice.exe"),
         Path("C:/Program Files (x86)/LibreOffice/program/soffice.exe"),
     ]
@@ -26,18 +39,23 @@ def convert_docx_to_pdf(input_path: Path, output_path: Path) -> None:
 
     word_error_message = ""
     try:
+        import pythoncom  # type: ignore
         import win32com.client  # type: ignore
 
-        word = win32com.client.DispatchEx("Word.Application")
-        word.Visible = False
+        pythoncom.CoInitialize()
+        word = None
         document = None
         try:
+            word = win32com.client.DispatchEx("Word.Application")
+            word.Visible = False
             document = word.Documents.Open(str(input_path.resolve()))
             document.SaveAs(str(output_path.resolve()), FileFormat=17)
         finally:
             if document is not None:
                 document.Close(False)
-            word.Quit()
+            if word is not None:
+                word.Quit()
+            pythoncom.CoUninitialize()
     except Exception as word_error:
         word_error_message = f"{type(word_error).__name__}: {word_error}"
         soffice = find_libreoffice()
@@ -45,6 +63,9 @@ def convert_docx_to_pdf(input_path: Path, output_path: Path) -> None:
             raise RuntimeError(
                 "PDF conversion requires Microsoft Word automation or LibreOffice. "
                 "Word conversion failed and LibreOffice was not found. "
+                "To install a project-local converter without admin rights, run "
+                r"`powershell -ExecutionPolicy Bypass -File .\tools\install_libreoffice_portable.ps1` "
+                "from the project folder, then restart Streamlit. "
                 f"Word error: {word_error_message}"
             ) from word_error
 

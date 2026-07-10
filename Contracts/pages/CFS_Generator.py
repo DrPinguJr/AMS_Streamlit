@@ -227,7 +227,7 @@ def render_individual_contract_generator() -> None:
                 validation_error = "Service Fee must be a positive number."
     
             # Generate Button
-            if st.button("Generate Contract", type="primary", use_container_width=True):
+            if st.button("Generate Contract", type="primary", width="stretch"):
                 if validation_error:
                     st.error(validation_error)
                 else:
@@ -269,7 +269,7 @@ def render_individual_contract_generator() -> None:
                     data=st.session_state["contract_gen_bytes"],
                     file_name=st.session_state["contract_gen_filename"],
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    use_container_width=True
+                    width="stretch"
                 )
 
 def render_bulk_contract_generator() -> None:
@@ -281,7 +281,7 @@ def render_bulk_contract_generator() -> None:
             initial_bulk_contractors(),
             key="bulk_contract_gen_contractors",
             num_rows="dynamic",
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             on_change=clear_bulk_contracts,
             column_config={
@@ -366,7 +366,7 @@ def render_bulk_contract_generator() -> None:
             st.success(f"{ready_count} contractors ready\n\n0 rows with errors")
         else:
             st.warning(f"{ready_count} contractors ready\n\n{len(row_errors)} rows need attention")
-            st.dataframe(row_errors, hide_index=True, use_container_width=True)
+            st.dataframe(row_errors, hide_index=True, width="stretch")
 
         generate_disabled = has_errors or contractors.empty
         if contractors.empty:
@@ -375,7 +375,7 @@ def render_bulk_contract_generator() -> None:
         if st.button(
             f"Generate {ready_count} PDF Contracts",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             disabled=generate_disabled,
         ):
             clear_bulk_contracts()
@@ -406,7 +406,7 @@ def render_bulk_contract_generator() -> None:
                 data=st.session_state["bulk_contract_gen_zip_bytes"],
                 file_name=st.session_state["bulk_contract_gen_zip_filename"],
                 mime="application/zip",
-                use_container_width=True,
+                width="stretch",
             )
 
 mode = st.radio(
