@@ -1,0 +1,13 @@
+__pycache__/
+.pytest_cache/
+*.pyc
+data/*.db
+data/*.db-shm
+data/*.db-wal
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+data/placeholder_*.gif
+.env

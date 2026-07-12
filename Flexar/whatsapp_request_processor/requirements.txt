@@ -1,0 +1,8 @@
+streamlit>=1.37,<2
+fastapi
+uvicorn[standard]
+pydantic>=2
+python-dotenv
+httpx
+pytest
+pandas

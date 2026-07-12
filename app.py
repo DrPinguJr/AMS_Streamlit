@@ -18,6 +18,12 @@ bluesg = st.Page(
     title="Vehicle Route Optimiser",
     icon=":material/route:",
 )
+whatsapp_request_processor = st.Page(
+    "Flexar/whatsapp_request_processor/app.py",
+    title="WhatsApp Request Processor",
+    icon=":material/forum:",
+    url_path="whatsapp-request-processor",
+)
 cfs_generator = st.Page(
     "Contracts/pages/CFS_Generator.py",
     title="CFS Contract Generator",
@@ -43,7 +49,7 @@ pg = st.navigation(
     {
         "Home": [home],
         "Lance": [tender, sesami, recruitment, converter, whatsapp],
-        "Flexar": [bluesg],
+        "Flexar": [bluesg, whatsapp_request_processor],
         "Contracts": [cfs_generator, loa_generator, service_agreement_generator],
         "HR": [rdl_management_studio],
     }
