@@ -147,6 +147,16 @@ SUMMARY_COLUMNS = [
     "Loaded Travel %",
     "Workload Comment",
 ]
+MAP_LOADER_COLUMNS = [
+    "Rider",
+    "Sequence",
+    "Uploaded Row",
+    "Start From",
+    "Car Plate",
+    "Pickup Address",
+    "Pickup Lot",
+    "Drop-off Address",
+]
 
 ZONE_KEYWORDS = {
     "North": ["Woodlands", "Admiralty", "Yishun", "Sembawang", "Canberra"],
@@ -3989,6 +3999,27 @@ def _write_rejected_candidate_audit_sheet(writer: pd.ExcelWriter, route_df: pd.D
     _autosize_columns(ws, 55)
 
 
+def _write_map_loader_sheet(writer: pd.ExcelWriter, route_df: pd.DataFrame) -> None:
+    ws = writer.book.create_sheet("Map Loader")
+    loader_df = route_df.copy() if route_df is not None else pd.DataFrame()
+    for column in MAP_LOADER_COLUMNS:
+        if column not in loader_df.columns:
+            loader_df[column] = ""
+    loader_df = loader_df.loc[:, MAP_LOADER_COLUMNS]
+
+    for col, column_name in enumerate(MAP_LOADER_COLUMNS, start=1):
+        ws.cell(row=1, column=col, value=_excel_safe_value(column_name))
+    _style_header_row(ws, 1, len(MAP_LOADER_COLUMNS))
+
+    for row_idx, row in enumerate(loader_df.itertuples(index=False), start=2):
+        for col_idx, value in enumerate(row, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=_excel_safe_value(value))
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+    ws.freeze_panes = "A2"
+    _autosize_columns(ws, 45)
+
+
 def export_routes_to_excel(
     route_df: pd.DataFrame,
     summary_df: pd.DataFrame,
@@ -4026,6 +4057,7 @@ def export_routes_to_excel(
             if hidden_column in route_header_map:
                 route_ws.column_dimensions[get_column_letter(route_header_map[hidden_column])].hidden = True
 
+        _write_map_loader_sheet(writer, route_df)
         _write_unassigned_jobs_sheet(writer, jobs_df, route_df)
 
         summary_ws = writer.book.create_sheet("Summary")

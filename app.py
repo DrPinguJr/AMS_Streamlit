@@ -18,6 +18,11 @@ bluesg = st.Page(
     title="Vehicle Route Optimiser",
     icon=":material/route:",
 )
+bluesg_map = st.Page(
+    "Flexar/BlueSG/Route_Map_Viewer.py",
+    title="Route Map Viewer",
+    icon=":material/map:",
+)
 whatsapp_request_processor = st.Page(
     "Flexar/whatsapp_request_processor/app.py",
     title="WhatsApp Request Processor",
@@ -49,7 +54,7 @@ pg = st.navigation(
     {
         "Home": [home],
         "Lance": [tender, sesami, recruitment, converter, whatsapp],
-        "Flexar": [bluesg, whatsapp_request_processor],
+        "Flexar": [bluesg, bluesg_map, whatsapp_request_processor],
         "Contracts": [cfs_generator, loa_generator, service_agreement_generator],
         "HR": [rdl_management_studio],
     }
