@@ -1458,8 +1458,8 @@ with action_col:
             "Cluster pressure bonus per remaining pickup",
             value=scoring_defaults["cluster_pressure_bonus_per_job"],
             min_value=0.0,
-            max_value=30.0,
-            step=1.0,
+            max_value=100.0,
+            step=5.0,
             key="bluesg_cluster_pressure_bonus_per_job",
         )
 
