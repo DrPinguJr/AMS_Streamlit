@@ -27,16 +27,24 @@ class DueRequestWorker:
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="flexar-due-request-worker", daemon=True)
         self._thread.start()
+        LOGGER.info("AMS_COMPONENT=WORKER Background request worker started")
 
     def stop(self) -> None:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=2)
+        LOGGER.info("AMS_COMPONENT=WORKER Background request worker stopped")
+
+    @property
+    def is_alive(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
 
     def _run(self) -> None:
         while not self._stop.wait(self.interval_seconds):
             try:
                 self.engine.update_time_states()
-                self.engine.process_due_dispatches()
+                processed = self.engine.process_due_dispatches()
+                if processed:
+                    LOGGER.info("AMS_COMPONENT=WORKER Processed %s due simulated request(s)", processed)
             except Exception:
                 LOGGER.exception("Due-request worker tick failed")

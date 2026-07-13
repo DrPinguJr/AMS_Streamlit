@@ -20,7 +20,7 @@ bluesg = st.Page(
 )
 bluesg_map = st.Page(
     "Flexar/BlueSG/Route_Map_Viewer.py",
-    title="Route Map Viewer",
+    title="Route Planner",
     icon=":material/map:",
 )
 whatsapp_request_processor = st.Page(

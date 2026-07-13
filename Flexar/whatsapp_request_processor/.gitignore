@@ -11,3 +11,5 @@ data/*.db-wal
 *.db-shm
 data/placeholder_*.gif
 .env
+logs/
+runtime/

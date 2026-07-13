@@ -26,6 +26,9 @@ class Settings:
     """Runtime settings for the prototype."""
 
     waapi_enabled: bool = False
+    waapi_outbound_enabled: bool = False
+    waapi_rider_reply_enabled: bool = False
+    waapi_ops_update_enabled: bool = False
     waapi_instance_id: str = ""
     waapi_token: str = ""
     waapi_base_url: str = ""
@@ -95,6 +98,9 @@ def get_settings(env_file: str | Path | None = None) -> Settings:
 
     return Settings(
         waapi_enabled=_to_bool(os.getenv("WAAPI_ENABLED"), False),
+        waapi_outbound_enabled=_to_bool(os.getenv("WAAPI_OUTBOUND_ENABLED"), False),
+        waapi_rider_reply_enabled=_to_bool(os.getenv("WAAPI_RIDER_REPLY_ENABLED"), False),
+        waapi_ops_update_enabled=_to_bool(os.getenv("WAAPI_OPS_UPDATE_ENABLED"), False),
         waapi_instance_id=os.getenv("WAAPI_INSTANCE_ID", ""),
         waapi_token=os.getenv("WAAPI_TOKEN", ""),
         waapi_base_url=_env("WAAPI_BASE_URL").rstrip("/"),

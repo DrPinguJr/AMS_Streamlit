@@ -533,6 +533,7 @@ class Database:
                     "latest_container_id": int(revision_row["container_id"]),
                     "latest_outbound_action_id": int(revision_row["outbound_action_id"]),
                     "recent_events": recent_events,
+                    "recent_activity": activity_rows[:10],
                     "containers": containers,
                     "active_requests": active_requests,
                     "needs_review_requests": review_requests,

@@ -1,206 +1,175 @@
-# Flexar WhatsApp Request Processor
+# AMS WhatsApp Request Processor
 
-This module is a local simulator for assembling WhatsApp-style rider messages into one operational request.
+This package is the simulation-only WhatsApp request assembly service used by the AMS Streamlit workspace. It combines rider-style text and images into operational vehicle requests, validates them, waits for a quiet period, and records simulated rider and OPS actions.
 
-It is part of the existing AMS Streamlit app under **Flexar -> WhatsApp Request Processor** and keeps the route:
+WAAPI is intentionally disabled. Starting this local system does not register a webhook, test a WAAPI credential, call WAAPI, or send a WhatsApp message.
 
-```text
-/whatsapp-request-processor
+## Daily Use
+
+1. Double-click `START AMS WHATSAPP SYSTEM.bat` in the repository root.
+2. Wait until the terminal shows `SYSTEM READY`.
+3. Use the Streamlit dashboard that opens in the browser.
+4. Leave the terminal open while the system is in use.
+5. Double-click `STOP AMS WHATSAPP SYSTEM.bat` when finished.
+
+The console must remain open because it supervises FastAPI, the request worker, ngrok, and Streamlit. Starting the system a second time will not create duplicate services.
+
+## What Starts
+
+The launcher starts services in this order:
+
+1. FastAPI on `http://127.0.0.1:8000`.
+2. The existing request worker through FastAPI's lifespan startup.
+3. ngrok connected to FastAPI port `8000`, when ngrok is installed and authenticated.
+4. Streamlit on `http://127.0.0.1:8501`.
+5. The browser at `http://127.0.0.1:8501/whatsapp-request-processor`.
+
+All child output is captured in the one visible supervisor console and in a timestamped log directory. The launcher does not use Uvicorn reload mode.
+
+If ngrok is unavailable, FastAPI and Streamlit can still operate locally. The console and dashboard show the tunnel as offline and never claim the complete system is online.
+
+## Administrator Setup
+
+### Python environment
+
+Create the repository virtual environment once from the repository root:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-No live WAAPI messages are sent in the default configuration.
+The launcher searches for Python in this order:
 
-## What It Does
+1. The active project virtual environment.
+2. `.venv\Scripts\python.exe`.
+3. `venv\Scripts\python.exe`.
+4. `AMS_PYTHON`, when explicitly configured.
+5. System Python as a final fallback.
 
-```text
-Rider text/images
-  -> payload parser
-  -> deterministic request matching
-  -> request container
-  -> automatic validation
-  -> quiet-window wait
-  -> backend worker dispatch
-  -> simulated rider reply and OPS group update
+It validates required imports but never installs packages automatically.
+
+### ngrok installation
+
+Install ngrok once using the organization's approved installation method. The launcher searches:
+
+- `AMS_NGROK_PATH` or `NGROK_PATH`;
+- the system `PATH`;
+- `tools\ngrok.exe` in this repository;
+- common per-user Windows installation locations.
+
+Authenticate ngrok once under the same Windows account that will run the AMS system. Use ngrok's normal configuration command or approved configuration deployment. Never place the authentication token in the START file or repository.
+
+The supervisor runs the equivalent of:
+
+```powershell
+ngrok http http://127.0.0.1:8000
 ```
 
-A request is automatically processed only when it has:
+It reads the public HTTPS tunnel from ngrok's local API at `http://127.0.0.1:4040/api/tunnels`. It displays the future webhook URL but does not submit it anywhere.
 
-- one valid licence plate;
-- at least `MIN_REQUIRED_IMAGES` approved images, default `4`;
-- one clear action: `LOCKED` or `UNLOCKED`;
-- no unresolved matching or licence-plate conflict.
+### Required local ports
 
-## Simulation Mode
+| Port | Service |
+|---|---|
+| `8000` | FastAPI |
+| `8501` | Streamlit |
+| `4040` | ngrok local inspection API |
 
-Simulation is enabled by default:
+If another program owns a required port, the launcher reports its PID and stops safely. It does not kill unrelated processes. An already-running AMS service is reused only when its health response and Windows command line both match the expected service. Existing FastAPI is never reused unless it reports simulation mode enabled and WAAPI disabled.
 
-```env
+### Safety configuration
+
+The supervisor overrides these values only in its child-process environment:
+
+```dotenv
 SIMULATION_MODE=true
 WAAPI_ENABLED=false
+WAAPI_OUTBOUND_ENABLED=false
+WAAPI_RIDER_REPLY_ENABLED=false
+WAAPI_OPS_UPDATE_ENABLED=false
 ```
 
-In this mode, outbound sends only update SQLite rows. The app does not call WAAPI, ngrok, cloud storage, external AI, OCR, or any paid service.
+It does not edit `.env`. The outbound client also requires the master outbound gate and the relevant destination-specific gate before a future network call could be allowed.
 
-## Automation Mode
+Confirm safe status in either place:
 
-Automation is enabled by default:
+- The console summary must show `Simulation Mode: ENABLED`, `WAAPI: DISABLED`, and `Live Sending: DISABLED`.
+- `http://127.0.0.1:8000/health` must show `simulation_mode: true`, WAAPI `status: disabled`, and `outbound_enabled: false`.
 
-```env
-AUTOMATION_MODE=true
-REQUIRE_OPERATOR_APPROVAL=false
-AUTO_DISPATCH_COMPLETE_REQUESTS=true
-AUTO_DISPATCH_IN_SIMULATION=true
+### Logs and runtime files
+
+Each session writes to:
+
+```text
+Flexar\whatsapp_request_processor\logs\YYYY-MM-DD_HH-mm-ss\
 ```
 
-When every hard validation check passes, the request moves to `READY_WAITING_QUIET` for `REQUEST_QUIET_SECONDS`, default `8`. The FastAPI lifespan starts a lightweight due-request worker from `worker.py`; that worker atomically claims due rows, creates exactly two normal outbound actions, simulates both sends in simulation mode, and marks the request completed. Streamlit does not run this worker and does not decide when quiet timers finish.
+Files include:
 
-## Start The System
+- `supervisor.log`
+- `fastapi.log`
+- `streamlit.log`
+- `ngrok.log`
+- `errors.log`
+
+Safe runtime state is stored atomically in:
+
+```text
+Flexar\whatsapp_request_processor\runtime\ams_processes.json
+Flexar\whatsapp_request_processor\runtime\system_status.json
+```
+
+These files contain process IDs and operational URLs, not credentials. Logs and runtime files are excluded from Git. The SQLite database is not deleted during startup or shutdown.
+
+### Shutdown behavior
+
+The STOP launcher requests shutdown from the active supervisor. The supervisor verifies each recorded PID's command line, then stops Streamlit, ngrok, and FastAPI in that order. Stopping FastAPI triggers its lifespan shutdown and stops the request worker. A recorded child is force-stopped only if it does not exit after the graceful attempt. Unrelated Python, PowerShell, Streamlit, or ngrok processes are never globally terminated.
+
+## Troubleshooting
+
+### ngrok was not found
+
+FastAPI and Streamlit remain available locally. Install ngrok once, authenticate it under the daily user's Windows account, and start the system again.
+
+### FastAPI could not start
+
+Check the displayed `fastapi.log` path. Confirm the virtual environment contains the project requirements and port `8000` is free.
+
+### Streamlit could not start
+
+Check `streamlit.log`. The supervisor cleans up services that it started so a failed dashboard does not leave an unintended partial session.
+
+### A port is already in use
+
+Close the named application if appropriate or contact the administrator. The launcher deliberately does not terminate unidentified processes.
+
+### START says the system is already running
+
+Use the existing browser dashboard and console. If the old console is unavailable, double-click STOP, wait for the offline summary, then START again. Stale process files are ignored when their PIDs or command lines no longer match.
+
+### Database locked
+
+Close duplicate development sessions and retry. The normal launcher prevents duplicate managed services and SQLite uses WAL plus a busy timeout.
+
+## Future WAAPI Preparation
+
+Do not activate WAAPI as part of local daily setup. Future integration work should separately verify real webhook payloads, HMAC validation, event filtering, media downloads, chat IDs, outbound delivery, retries, and idempotency. Only after that work is reviewed should an administrator deliberately configure live credentials and change all required safety gates.
+
+The current future webhook shape is:
+
+```text
+https://YOUR-STABLE-PUBLIC-DOMAIN/webhooks/waapi
+```
+
+Displaying that URL does not register it and does not connect WAAPI.
+
+## Tests
 
 From the repository root:
 
 ```powershell
-.\.venv\Scripts\Activate.ps1
-uvicorn Flexar.whatsapp_request_processor.api:app --host 127.0.0.1 --port 8000 --reload
+.\.venv\Scripts\python.exe -m pytest Flexar\whatsapp_request_processor\tests -v
 ```
 
-In a second terminal:
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-streamlit run app.py
-```
-
-The convenience script does the same:
-
-```powershell
-Flexar\whatsapp_request_processor\start_local.bat
-```
-
-## Payloads A To J
-
-- A: LP, action, useful text, and seven images.
-- B: useful location text and seven images, but no LP.
-- C: text with LP and lock action, no images.
-- D: seven images, no text.
-- E: filler text only.
-- F: genuine duplicate of A.
-- G: conflicting LP data.
-- H: three images.
-- I: four images.
-- J: a second vehicle request with a different LP.
-- K: MSCP request without deck, blocked until deck/level arrives.
-- L: surface parking with lot number and no deck, valid.
-- M: MSCP white-lot parking with deck but no numbered lot, valid because lot is optional.
-- N: complete LP/location/images with no lock or unlock action, blocked until action arrives.
-
-## Guided Scenarios
-
-Use the guided scenario selector to play:
-
-- Scenario A - Slow Rider A, Fast Rider B.
-- Scenario B - Fifteen Events in One Request.
-- Scenario C - Quiet Timer Reset.
-- Scenario D - Paused and Resumed.
-- Scenario E - Late Image.
-- Scenario F - New Request After Completion.
-
-## Understanding Containers
-
-A container is one vehicle request being assembled. It appears only after useful text or image data arrives. Completed containers leave the live lane and move into the collapsed history area.
-
-Common states:
-
-- Collecting rider messages.
-- Complete - waiting for messages to finish.
-- Sending rider and OPS updates.
-- Completed.
-- Paused - waiting for the rider to continue.
-- Needs review.
-- Send failed.
-
-## Inactivity And Expiry
-
-Defaults:
-
-```env
-REQUEST_INACTIVE_SECONDS=60
-LATE_MEDIA_GRACE_SECONDS=120
-```
-
-Paused requests can be reactivated by a compatible payload from the same rider. Late images inside the grace window can create an OPS-only supplemental media action without creating a second rider reply.
-
-## Database Location
-
-The active SQLite database resolves in this order:
-
-1. `DATABASE_PATH` from environment configuration.
-2. `%LOCALAPPDATA%\AMS_Streamlit\Flexar\flexar_requests.db`
-3. `Flexar/whatsapp_request_processor/data/flexar_requests.db`
-
-The app creates parent directories automatically. Existing DB files are migrated safely and are not deleted automatically.
-
-If you previously used the repo-local database and want to copy it to the new default location, first close Streamlit and FastAPI, then run a one-time copy after checking both paths:
-
-```powershell
-$source = "Flexar\whatsapp_request_processor\data\flexar_requests.db"
-$target = "$env:LOCALAPPDATA\AMS_Streamlit\Flexar\flexar_requests.db"
-New-Item -ItemType Directory -Force (Split-Path $target)
-Copy-Item $source $target -WhatIf
-```
-
-Remove `-WhatIf` only after the printed source and target look correct.
-
-Database files are excluded from Git:
-
-```text
-*.db
-*.sqlite
-*.sqlite3
-*.db-wal
-*.db-shm
-```
-
-## Tests
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-python -m pytest Flexar\whatsapp_request_processor\tests -v
-```
-
-Tests use temporary SQLite databases and do not modify the operator database.
-
-## Future WAAPI Configuration
-
-Copy `.env.example` and fill these only when a real WAAPI account is ready:
-
-```env
-WAAPI_ENABLED=false
-WAAPI_INSTANCE_ID=
-WAAPI_TOKEN=
-WAAPI_BASE_URL=
-WAAPI_WEBHOOK_SECRET=
-OPS_GROUP_CHAT_ID=
-```
-
-Future ngrok command:
-
-```powershell
-ngrok http 8000
-```
-
-Future webhook URL:
-
-```text
-https://YOUR-NGROK-DOMAIN/webhooks/waapi
-```
-
-Live WAAPI delivery is not production-ready until the actual account, endpoint format, webhook format, media handling, and retry behaviour have been tested.
-
-## Troubleshooting
-
-- FastAPI offline: start `uvicorn Flexar.whatsapp_request_processor.api:app --host 127.0.0.1 --port 8000 --reload`.
-- Database locked: close duplicate app sessions, then retry; SQLite uses WAL and busy timeout.
-- Duplicate ignored: the same external message ID was already processed.
-- No container for filler: standalone text like "okay thanks" is intentionally ignored.
-- Virtual environment missing: create it with `python -m venv .venv`.
-- Port already in use: run Uvicorn on another port and update `API_BASE_URL` if needed.
+Tests use temporary SQLite databases and mocked process/network behavior where appropriate. They do not require a WAAPI account and must not make a WAAPI network request.

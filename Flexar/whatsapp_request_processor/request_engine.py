@@ -1084,6 +1084,7 @@ class RequestEngine:
             """,
             (container_uuid, activity_type, friendly_message, json.dumps(details, sort_keys=True), event_id, to_db_time()),
         )
+        LOGGER.info("AMS_COMPONENT=DATABASE Request %s activity=%s", container_uuid[:8], activity_type)
 
     def correct_action(self, container_uuid: str, action: str) -> dict[str, Any]:
         normalized = action.strip().upper()

@@ -20,7 +20,7 @@ class WAAPIClient:
         self.settings = settings or get_settings()
 
     def validate_configuration(self) -> None:
-        if not self.settings.waapi_enabled or self.settings.simulation_mode:
+        if not self._live_outbound_allowed():
             return
         missing = []
         if not self.settings.waapi_instance_id:
@@ -33,7 +33,7 @@ class WAAPIClient:
             raise ValueError(f"Missing WAAPI configuration: {', '.join(missing)}")
 
     def health_check(self) -> dict[str, Any]:
-        if not self.settings.waapi_enabled or self.settings.simulation_mode:
+        if not self._live_outbound_allowed():
             return {"ok": True, "simulated": True, "message": "WAAPI is disabled or simulation mode is enabled."}
         try:
             self.validate_configuration()
@@ -50,9 +50,13 @@ class WAAPIClient:
         return self._send_action("send-media", payload)
 
     def send_rider_reply(self, chat_id: str, message_text: str) -> dict[str, Any]:
+        if not self.settings.waapi_rider_reply_enabled:
+            return self._disabled_result("send-message", "WAAPI rider replies are disabled.")
         return self.send_text_message(chat_id, message_text)
 
     def send_ops_group_update(self, chat_id: str, message_text: str, media: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        if not self.settings.waapi_ops_update_enabled:
+            return self._disabled_result("send-media" if media else "send-message", "WAAPI OPS updates are disabled.")
         if media:
             return self.send_media_message(chat_id, {"items": media}, caption=message_text)
         return self.send_text_message(chat_id, message_text)
@@ -65,14 +69,8 @@ class WAAPIClient:
         return self.send_text_message(destination, message)
 
     def _send_action(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if not self.settings.waapi_enabled or self.settings.simulation_mode:
-            return {
-                "ok": True,
-                "simulated": True,
-                "status": "SIMULATED_SENT",
-                "action": action,
-                "message": "No external WAAPI request was made.",
-            }
+        if not self._live_outbound_allowed():
+            return self._disabled_result(action, "No external WAAPI request was made.")
 
         self.validate_configuration()
         url = f"{self.settings.waapi_base_url}/api/v1/instances/{self.settings.waapi_instance_id}/client/action/{action}"
@@ -88,4 +86,23 @@ class WAAPIClient:
         except httpx.HTTPError as exc:
             LOGGER.warning("WAAPI request failed for action %s: %s", action, exc)
             return {"ok": False, "simulated": False, "error": str(exc)}
+
+    def _live_outbound_allowed(self) -> bool:
+        """Require every master safety gate before any WAAPI network request."""
+
+        return bool(
+            self.settings.waapi_enabled
+            and self.settings.waapi_outbound_enabled
+            and not self.settings.simulation_mode
+        )
+
+    @staticmethod
+    def _disabled_result(action: str, message: str) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "simulated": True,
+            "status": "SIMULATED_SENT",
+            "action": action,
+            "message": message,
+        }
 

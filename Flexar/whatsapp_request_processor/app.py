@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Callable
 
 import httpx
@@ -11,6 +12,7 @@ import streamlit as st
 from Flexar.whatsapp_request_processor.config import Settings, get_settings
 from Flexar.whatsapp_request_processor.database import Database
 from Flexar.whatsapp_request_processor.models import ContainerState
+from Flexar.whatsapp_request_processor.runtime_support import STATUS_FILE, read_system_status
 from Flexar.whatsapp_request_processor.simulator_service import (
     GUIDED_SCENARIOS,
     build_guided_scenario,
@@ -19,11 +21,6 @@ from Flexar.whatsapp_request_processor.simulator_service import (
 )
 from Flexar.whatsapp_request_processor.ui_components import (
     container_card,
-    event_card,
-    flow_explainer,
-    automation_badge,
-    simulation_badge,
-    status_legend,
 )
 
 
@@ -47,13 +44,6 @@ def _fragment_decorator() -> Callable[..., Callable[[Callable[..., None]], Calla
 
 
 fragment = _fragment_decorator()
-
-
-@st.dialog("How to read this page")
-def help_dialog() -> None:
-    st.write("This page shows one row per vehicle request.")
-    st.write("Rider messages and images may arrive separately; FastAPI and the request engine assemble them into the active request row.")
-    st.write("A request dispatches only after the checklist passes and the quiet window finishes in the backend worker.")
 
 
 def post_payload_to_fastapi(settings: Settings, payload: dict[str, Any]) -> dict[str, Any]:
@@ -92,7 +82,7 @@ def simulator_overrides() -> dict[str, Any]:
 
 
 def render_simulator(settings: Settings) -> None:
-    st.subheader("Test payload controls")
+    st.subheader("Simulator")
     controls = st.columns([1, 1, 1, 1])
     st.session_state["sim_sender"] = controls[0].text_input("Rider phone", value=st.session_state.get("sim_sender", "6591234567"))
     st.session_state["sim_chat"] = controls[1].text_input("Chat ID", value=st.session_state.get("sim_chat", "6598765432@c.us"))
@@ -191,18 +181,15 @@ def render_live_sections(db: Database, required_images: int) -> None:
 
     active_requests = snapshot.get("active_requests", [])
     paused_requests = snapshot.get("paused_requests", [])
-    review_requests = snapshot.get("review_requests", [])
-    completed_requests = snapshot.get("completed_requests", [])
+    review_requests = snapshot.get("needs_review_requests", [])
+    completed_today = snapshot.get("completed_today", [])
     metrics_data = snapshot["metrics"]
 
-    st.subheader("System status")
-    metrics = st.columns(6)
-    metrics[0].metric("Events", metrics_data["events"])
-    metrics[1].metric("Active requests", metrics_data["active_requests"])
+    metrics = st.columns(4)
+    metrics[0].metric("Active", metrics_data["active_requests"])
+    metrics[1].metric("Needs attention", metrics_data["manual_review"])
     metrics[2].metric("Paused", metrics_data["inactive"])
-    metrics[3].metric("Needs review", metrics_data["manual_review"])
-    metrics[4].metric("Completed", metrics_data["completed"])
-    metrics[5].metric("Outbound actions", metrics_data["outbound_actions"])
+    metrics[3].metric("Completed", metrics_data["completed"])
 
     def table_rows(rows: list[dict[str, Any]], completed: bool = False) -> list[dict[str, Any]]:
         output = []
@@ -243,9 +230,10 @@ def render_live_sections(db: Database, required_images: int) -> None:
 
     st.subheader("Active Requests")
     if active_requests:
+        st.caption("Vehicles: " + ", ".join(str(row.get("detected_licence_plate") or "Waiting for plate") for row in active_requests))
         st.dataframe(pd.DataFrame(table_rows(active_requests)), use_container_width=True, hide_index=True)
     else:
-        st.info("No active requests. New rider messages will create request rows here.")
+        st.info("No active requests.")
 
     detail_options = {
         f"{row.get('request_reference') or row['container_uuid'][:8]} - {row.get('sender_display_name') or row.get('sender_id')}": row
@@ -258,7 +246,7 @@ def render_live_sections(db: Database, required_images: int) -> None:
             container_card(selected, required_images)
 
     if review_requests:
-        st.subheader("Needs Review")
+        st.subheader("Requests needing attention")
         st.dataframe(
             pd.DataFrame(
                 [
@@ -278,7 +266,7 @@ def render_live_sections(db: Database, required_images: int) -> None:
             hide_index=True,
         )
 
-    with st.expander(f"Paused Requests ({len(paused_requests)})", expanded=False):
+    with st.expander(f"Paused requests ({len(paused_requests)})", expanded=False):
         if paused_requests:
             st.dataframe(
                 pd.DataFrame(
@@ -301,7 +289,7 @@ def render_live_sections(db: Database, required_images: int) -> None:
         else:
             st.write("No paused requests.")
 
-    st.subheader("Completed Today")
+    st.subheader("Recently completed requests")
     completed_filters = st.columns(4)
     rider_filter = completed_filters[0].text_input("Filter rider", value="")
     lp_filter = completed_filters[1].text_input("Filter LP", value="")
@@ -317,13 +305,42 @@ def render_live_sections(db: Database, required_images: int) -> None:
     if status_filter:
         filtered_completed = [row for row in filtered_completed if status_filter in {row.get("rider_reply_status"), row.get("ops_update_status"), row.get("supplemental_status")}]
     if filtered_completed:
+        st.caption("Vehicles: " + ", ".join(str(row.get("detected_licence_plate") or "Unknown") for row in filtered_completed))
         st.dataframe(pd.DataFrame(table_rows(filtered_completed, completed=True)), use_container_width=True, hide_index=True)
     else:
         st.write("No completed requests match the current filters.")
 
-    with st.expander("Technical Event Log", expanded=False):
-        for event in snapshot["recent_events"]:
-            event_card(event)
+    st.subheader("Recent System Activity")
+    activity_labels = {
+        "CONTAINER_CREATED": "Request created",
+        "IMAGE_ADDED": "Simulator images received",
+        "TEXT_ADDED": "Simulator message received",
+        "LP_DETECTED": "Licence plate detected",
+        "ACTION_DETECTED": "Lock/unlock action detected",
+        "LOCATION_DETECTED": "Parking location detected",
+        "VALIDATION_UPDATED": "Request validation updated",
+        "READY_WAITING_QUIET": "Waiting for quiet period",
+        "AUTO_DISPATCH_STARTED": "Simulation dispatch started",
+        "RIDER_REPLY_CREATED": "Simulation rider action created",
+        "OPS_UPDATE_CREATED": "Simulation OPS action created",
+        "RIDER_REPLY_SIMULATED": "Rider reply simulated",
+        "OPS_UPDATE_SIMULATED": "OPS update simulated",
+        "COMPLETED": "Simulation actions completed",
+        "PAUSED_FOR_INACTIVITY": "Request paused for inactivity",
+    }
+    recent_activity = snapshot.get("recent_activity", [])[:8]
+    if recent_activity:
+        activity_rows = [
+            {
+                "Time": str(item.get("created_at") or "")[11:19],
+                "Activity": activity_labels.get(item.get("activity_type"), str(item.get("activity_type") or "Activity").replace("_", " ").title()),
+                "Request": str(item.get("container_uuid") or "")[:8],
+            }
+            for item in recent_activity
+        ]
+        st.dataframe(pd.DataFrame(activity_rows), use_container_width=True, hide_index=True)
+    else:
+        st.caption("No recent activity.")
 
     st.session_state["dashboard_latest_event_id"] = snapshot["latest_event_id"]
     st.session_state["dashboard_latest_outbound_action_id"] = snapshot["latest_outbound_action_id"]
@@ -336,18 +353,36 @@ def render_live_sections(db: Database, required_images: int) -> None:
 db = get_database()
 settings = get_settings()
 
-st.title("Flexar WhatsApp Request Processor")
-simulation_badge(settings.simulation_mode, settings.waapi_enabled)
-automation_badge(settings.automation_mode)
+st.title("WhatsApp Request Processor")
+runtime_status = read_system_status()
 
-top_cols = st.columns([1, 1, 1])
-if top_cols[0].button("Open Guided Walkthrough"):
-    help_dialog()
-top_cols[1].caption("FastAPI/request_engine handles webhook processing independently.")
-if top_cols[2].button("Reset Simulator Data"):
+try:
+    with httpx.Client(timeout=0.75) as health_client:
+        api_health_response = health_client.get(f"{settings.api_base_url}/health")
+        api_health = api_health_response.json() if api_health_response.is_success else {}
+except (httpx.HTTPError, ValueError):
+    api_health = {}
+
+api_online = api_health.get("status") == "ok"
+worker_online = api_health.get("worker", {}).get("status") == "online"
+database_online = bool(api_health.get("database", {}).get("ok"))
+tunnel_online = runtime_status.get("ngrok", {}).get("status") == "online"
+status_cols = st.columns(6)
+for column, label, online in [
+    (status_cols[0], "API", api_online),
+    (status_cols[1], "Worker", worker_online),
+    (status_cols[2], "Database", database_online),
+    (status_cols[3], "Tunnel", tunnel_online),
+    (status_cols[4], "Simulation", True),
+    (status_cols[5], "WAAPI", False),
+]:
+    value = "On" if label == "Simulation" else "Disabled" if label == "WAAPI" else "Online" if online else "Offline"
+    column.metric(label, value)
+
+top_cols = st.columns([1, 1, 4])
+if top_cols[0].button("Reset simulator data"):
     st.session_state["confirm_reset"] = True
-
-if st.checkbox("Pause live visual refresh", value=st.session_state.get("pause_live_refresh", False)):
+if top_cols[1].checkbox("Pause refresh", value=st.session_state.get("pause_live_refresh", False)):
     st.session_state["pause_live_refresh"] = True
 else:
     st.session_state["pause_live_refresh"] = False
@@ -365,34 +400,38 @@ if st.session_state.get("confirm_reset"):
             st.session_state["confirm_reset"] = False
             st.rerun()
 
-flow_explainer()
-status_legend()
 render_simulator(settings)
 st.divider()
 render_live_sections(db, settings.min_required_images)
 
-with st.expander("Completed requests and diagnostics", expanded=False):
-    snapshot = db.get_dashboard_snapshot()
-    completed = snapshot["recent_completed_requests"]
-    outbound_actions = snapshot["outbound_actions"]
-    st.markdown("**Completed containers**")
-    st.dataframe(pd.DataFrame(completed), use_container_width=True) if completed else st.write("No completed containers yet.")
-    st.markdown("**Outbound actions**")
-    st.dataframe(pd.DataFrame(outbound_actions), use_container_width=True) if outbound_actions else st.write("No outbound actions yet.")
-    st.markdown("**System diagnostics**")
-    health = db.health()
+with st.expander("Technical Details", expanded=False):
+    public_url = runtime_status.get("ngrok", {}).get("public_url")
+    process_status = {
+        name: details.get("pid")
+        for name, details in {
+            "FastAPI": runtime_status.get("fastapi", {}),
+            "ngrok": runtime_status.get("ngrok", {}),
+            "Streamlit": runtime_status.get("streamlit", {}),
+        }.items()
+        if details.get("pid")
+    }
     st.json(
         {
-            "database_path": str(settings.database_path),
-            "database_connection_status": "ok" if health["ok"] else "error",
-            "waapi_enabled": settings.waapi_enabled,
-            "simulation_mode": settings.simulation_mode,
-            "minimum_required_image_count": settings.min_required_images,
-            "container_inactive_seconds": settings.container_inactive_seconds,
-            "container_expiry_seconds": settings.container_expiry_seconds,
-            "fastapi_local_endpoint": f"{settings.api_base_url}/webhooks/waapi",
+            "local_api": settings.api_base_url,
+            "public_api": public_url or "Unavailable",
+            "future_webhook": f"{public_url}/webhooks/waapi" if public_url else "Unavailable",
+            "fastapi_docs": f"{settings.api_base_url}/docs",
+            "ngrok_inspector": "http://127.0.0.1:4040" if tunnel_online else "Unavailable",
+            "runtime_log_directory": runtime_status.get("log_directory") or "Not started by supervisor",
+            "process_ids": process_status,
+            "last_health_check": runtime_status.get("last_health_check"),
+            "configuration": {
+                "simulation_mode": True,
+                "waapi": "disabled",
+                "live_sending": "disabled",
+                "minimum_images": settings.min_required_images,
+            },
+            "runtime_status_file": str(Path(STATUS_FILE)),
             "last_application_error": st.session_state.get("last_error"),
-            "last_result": st.session_state.get("last_result"),
-            "health_checks": {"sqlite": health},
         }
     )

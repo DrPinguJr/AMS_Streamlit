@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import json
+import logging
 import math
 import sys
 import time
@@ -25,6 +26,7 @@ from Flexar.BlueSG.vehicle_route_optimizer import (
     DEFAULT_EMPTY_WEIGHT,
     DEFAULT_LOADED_WEIGHT,
     DEFAULT_MAX_JOB_OVERAGE_PENALTY,
+    DEFAULT_MAX_ADJUSTED_DURATION_MIN,
     DEFAULT_SOFT_ADJUSTED_DURATION_MIN,
     DEFAULT_SOFT_WORKLOAD_MIN,
     DEFAULT_WORKLOAD_PENALTY_PER_MIN,
@@ -43,6 +45,42 @@ from Flexar.BlueSG.vehicle_route_optimizer import (
     stable_job_id_from_route_row,
     validate_riders,
 )
+from Flexar.BlueSG.route_planner import (
+    HISTORY_LIMIT,
+    UNASSIGNED_LANE,
+    assignment_from_routes,
+    build_focus_map_data,
+    build_compact_rider_summary,
+    build_planner_session_state,
+    build_draft_preview_routes,
+    build_route_leg_signatures,
+    clone_assignment,
+    detect_affected_riders,
+    detect_changed_route_legs,
+    incremental_recalculate,
+    enter_focus_mode_state,
+    exit_focus_mode_state,
+    focus_apply_failure_state,
+    focus_apply_success_state,
+    invalidate_red_preview,
+    matching_red_preview_routes,
+    normalise_assignment_board,
+    refresh_red_connector_preview,
+    renderable_red_preview_routes,
+    redo_draft,
+    reset_draft,
+    undo_draft,
+    update_draft_history,
+    validate_assignment_board,
+)
+
+try:
+    from streamlit_sortables import sort_items
+except ImportError:  # Displayed as an actionable page error below.
+    sort_items = None
+
+
+LOGGER = logging.getLogger(__name__)
 
 try:
     st.set_page_config(page_title="Route Map Viewer", layout="wide")
@@ -645,37 +683,883 @@ def render_summary(route_df: pd.DataFrame, summary_df: pd.DataFrame) -> None:
     metric_cols[2].metric("Total Duration", f"{total_duration:.1f} min")
 
 
-st.title("Route Map Viewer")
-st.caption("Upload an optimiser export, move orders between riders, recalculate, and inspect the route map.")
+def assignment_signature(assignment: dict[str, list[str]]) -> str:
+    return hashlib.sha1(json.dumps(assignment, sort_keys=True).encode("utf-8")).hexdigest()[:12]
 
-uploaded_file = st.file_uploader(
-    "Upload vehicle_route_optimisation.xlsx",
-    type=["xlsx", "xls"],
-    help="Use the Excel file downloaded from the Vehicle Route Optimiser.",
+
+def short_location(value: object, limit: int = 34) -> str:
+    text = clean_text(value)
+    return text if len(text) <= limit else f"{text[: limit - 1].rstrip()}…"
+
+
+def initialise_route_planner(state: dict[str, Any], workbook_id: str) -> None:
+    """Reset every planner-specific state when a different workbook is loaded."""
+
+    rider_names = state["rider_df"]["Rider Name"].apply(clean_text).dropna().tolist()
+    payload = build_planner_session_state(state["route_df"], state["jobs_df"], rider_names, workbook_id)
+    for key, value in payload.items():
+        st.session_state[key] = value
+    st.session_state["route_planner_last_apply_stats"] = {}
+    st.session_state["route_planner_map_focus"] = False
+    LOGGER.info("Route planner initialised workbook=%s jobs=%s", workbook_id[:12], len(state["jobs_df"]))
+
+
+def lane_duration(summary_df: pd.DataFrame, rider: str) -> float:
+    if summary_df is None or summary_df.empty:
+        return 0.0
+    matches = summary_df[summary_df["Rider"].apply(clean_text) == rider]
+    return float(matches.iloc[0].get("Total Route Duration Min") or 0) if not matches.empty else 0.0
+
+
+def build_sortable_board(
+    assignment: dict[str, list[str]],
+    jobs_by_id: dict[str, dict[str, Any]],
+    summary_df: pd.DataFrame,
+    rider_df: pd.DataFrame,
+) -> tuple[list[dict[str, Any]], dict[str, str], dict[str, str], list[str]]:
+    """Build display-only strings with exact reversible mappings to stable IDs."""
+
+    rider_names = rider_df["Rider Name"].apply(clean_text).dropna().tolist()
+    lane_order = [*rider_names, UNASSIGNED_LANE]
+    max_jobs_by_rider = {
+        clean_text(row.get("Rider Name")): pd.to_numeric(pd.Series([row.get("Max Jobs")]), errors="coerce").iloc[0]
+        for _, row in rider_df.iterrows()
+    }
+    board: list[dict[str, Any]] = []
+    header_to_lane: dict[str, str] = {}
+    card_to_job_id: dict[str, str] = {}
+    for lane_index, lane in enumerate(lane_order, start=1):
+        jobs = assignment.get(lane, [])
+        display_name = "Unassigned" if lane == UNASSIGNED_LANE else lane
+        duration = 0.0 if lane == UNASSIGNED_LANE else lane_duration(summary_df, lane)
+        max_jobs = max_jobs_by_rider.get(lane)
+        over_jobs = lane != UNASSIGNED_LANE and pd.notna(max_jobs) and float(max_jobs) > 0 and len(jobs) > int(max_jobs)
+        warning = " ⚠" if over_jobs or duration > 180 or lane == UNASSIGNED_LANE and jobs else ""
+        duration_label = "not routed" if lane == UNASSIGNED_LANE else f"{duration:.0f} confirmed min"
+        header = f"{display_name} · {len(jobs)} jobs · {duration_label}{warning} · lane-{lane_index:02d}"
+        header_to_lane[header] = lane
+        cards: list[str] = []
+        for job_id in jobs:
+            job = jobs_by_id[job_id]
+            token = hashlib.sha1(job_id.encode("utf-8")).hexdigest()[:7]
+            card = (
+                f"{clean_text(job.get('Car Plate')) or 'No plate'}  · {token}\n"
+                f"{short_location(job.get('Pickup Address'))}\n"
+                f"→ {short_location(job.get('Drop-off Address'))}"
+            )
+            while card in card_to_job_id:
+                card += "·"
+            card_to_job_id[card] = job_id
+            cards.append(card)
+        board.append({"header": header, "items": cards})
+    return board, header_to_lane, card_to_job_id, lane_order
+
+
+def render_route_assignment_board(
+    assignment: dict[str, list[str]],
+    jobs_by_id: dict[str, dict[str, Any]],
+    summary_df: pd.DataFrame,
+    rider_df: pd.DataFrame,
+    *,
+    dark_mode: bool = False,
+) -> dict[str, list[str]] | None:
+    if sort_items is None:
+        st.error("Drag-and-drop planner dependency is missing. Install project requirements and restart Streamlit.")
+        st.code(r".\.venv\Scripts\python.exe -m pip install -r requirements.txt")
+        return None
+    board, header_to_lane, card_to_job_id, lane_order = build_sortable_board(
+        assignment, jobs_by_id, summary_df, rider_df
+    )
+    custom_style = """
+    .sortable-component { padding: 0; }
+    .sortable-container { border: 1px solid #d8dee9; border-radius: 9px; margin-bottom: .55rem; background: #f8fafc; }
+    .sortable-container-header { padding: .48rem .65rem; background: #e8eef7; color: #172033; font-weight: 700; font-size: .85rem; }
+    .sortable-container-body { min-height: 38px; padding: .35rem; }
+    .sortable-item, .sortable-item:hover { white-space: pre-line; border: 1px solid #cbd5e1; border-radius: 7px; background: white; color: #172033; padding: .45rem .55rem; margin: .28rem 0; font-size: .78rem; line-height: 1.25; cursor: grab; counter-increment: item; }
+    .sortable-container-body { counter-reset: item; }
+    .sortable-item::before { content: counter(item) ". "; font-weight: 800; color: #2563eb; }
+    """
+    if dark_mode:
+        custom_style = """
+        .sortable-component { display: flex !important; flex-direction: column !important; flex-wrap: nowrap !important; align-items: stretch !important; width: 100% !important; padding: 0; background: #111827; color: #e5e7eb; }
+        .sortable-container { display: block !important; flex: 0 0 auto !important; width: 100% !important; min-width: 100% !important; max-width: 100% !important; box-sizing: border-box !important; border: 1px solid #374151; border-radius: 9px; margin: 0 0 .55rem 0 !important; background: #111827; overflow: hidden; }
+        .sortable-container-header { padding: .48rem .6rem; background: #1f2937; color: #f9fafb; font-weight: 700; font-size: .78rem; line-height: 1.2; }
+        .sortable-container-body { display: flex !important; flex-direction: column !important; flex-wrap: nowrap !important; width: 100% !important; min-height: 38px; padding: .3rem; box-sizing: border-box !important; background: #111827; counter-reset: item; }
+        .sortable-item, .sortable-item:hover { display: block !important; flex: 0 0 auto !important; width: 100% !important; max-width: 100% !important; box-sizing: border-box !important; white-space: pre-line; border: 1px solid #4b5563; border-radius: 7px; background: #182235; color: #e5e7eb; padding: .42rem .5rem; margin: .25rem 0; font-size: .74rem; line-height: 1.25; cursor: grab; counter-increment: item; box-shadow: none; }
+        .sortable-item:hover { border-color: #10b981; background: #1d2b3f; }
+        .sortable-item::before { content: counter(item) ". "; font-weight: 800; color: #34d399; }
+        """
+    raw_board = sort_items(
+        board,
+        multi_containers=True,
+        direction="vertical",
+        custom_style=custom_style,
+        key=f"route_planner_board_{assignment_signature(assignment)}",
+    )
+    try:
+        return normalise_assignment_board(raw_board, header_to_lane, card_to_job_id, lane_order)
+    except ValueError as exc:
+        LOGGER.warning("Route planner component validation failed: %s", exc)
+        st.error(str(exc))
+        return None
+
+
+def _assignment_positions(assignment: dict[str, list[str]]) -> dict[str, tuple[str, int]]:
+    return {
+        job_id: (lane, position)
+        for lane, job_ids in assignment.items()
+        for position, job_id in enumerate(job_ids, start=1)
+    }
+
+
+def _store_draft_change(
+    before: dict[str, list[str]],
+    proposed: dict[str, list[str]],
+    confirmed: dict[str, list[str]],
+    rider_starts: dict[str, str],
+) -> bool:
+    updated, undo_stack, redo_stack, changed = update_draft_history(
+        before,
+        proposed,
+        st.session_state.get("route_planner_undo_stack", []),
+        st.session_state.get("route_planner_redo_stack", []),
+        HISTORY_LIMIT,
+    )
+    if not changed:
+        return False
+    affected = detect_affected_riders(confirmed, updated, rider_starts, rider_starts)
+    st.session_state["route_planner_draft_assignment"] = updated
+    st.session_state["route_planner_undo_stack"] = undo_stack
+    st.session_state["route_planner_redo_stack"] = redo_stack
+    st.session_state["route_planner_is_dirty"] = updated != confirmed
+    st.session_state["route_planner_affected_riders"] = affected
+    st.session_state["route_planner_preview_stale_riders"] = list(
+        invalidate_red_preview(
+            before,
+            updated,
+            st.session_state.get("route_planner_preview_stale_riders", []),
+        )
+    )
+    st.session_state["route_planner_preview_error"] = ""
+    before_positions = _assignment_positions(before)
+    after_positions = _assignment_positions(updated)
+    for job_id in sorted(set(before_positions) | set(after_positions)):
+        old = before_positions.get(job_id)
+        new = after_positions.get(job_id)
+        if old == new:
+            continue
+        event = "moved" if old and new and old[0] != new[0] else "reordered"
+        LOGGER.info("Route planner draft job %s job_id=%s before=%s after=%s", event, job_id, old, new)
+    LOGGER.info("Route planner draft changed affected_riders=%s", affected)
+    return True
+
+
+def render_focus_green_map(
+    draft_assignment: dict[str, list[str]],
+    visible_riders: list[str],
+    confirmed_routes: pd.DataFrame,
+    jobs_df: pd.DataFrame,
+    preview_routes: pd.DataFrame | None = None,
+    stale_preview_riders: list[str] | None = None,
+    show_red_preview: bool = False,
+) -> tuple[int, int]:
+    """Render cached loaded legs only. No geocoding or routing is performed here."""
+
+    focus_data = build_focus_map_data(draft_assignment, visible_riders, confirmed_routes, jobs_df)
+    layers: list[pdk.Layer] = []
+    if not focus_data.route_df.empty:
+        layers.append(
+            pdk.Layer(
+                "PathLayer",
+                focus_data.route_df,
+                id="focus-green-loaded-routes",
+                get_path="path",
+                get_color="color",
+                width_min_pixels=5,
+                pickable=True,
+            )
+        )
+    if show_red_preview and preview_routes is not None and not preview_routes.empty:
+        red_df = renderable_red_preview_routes(preview_routes, visible_riders, stale_preview_riders or [])
+        if not red_df.empty:
+            red_df["path"] = red_df["Route Path"].apply(parse_route_path)
+            red_df = red_df[red_df["path"].apply(lambda path: len(path) >= 2)]
+            red_df["color"] = [[239, 68, 68, 220]] * len(red_df)
+            red_df["tooltip"] = red_df.apply(
+                lambda row: (
+                    f"{row['Rider']}<br/>Connector to job {row['Sequence']}<br/>"
+                    f"{row['Start Label']} → {row['End Label']}<br/>"
+                    f"{row['Distance KM']} km, {row['Duration Min']} min<br/>{row['Source']}"
+                ),
+                axis=1,
+            )
+            layers.append(
+                pdk.Layer(
+                    "PathLayer",
+                    red_df,
+                    id="focus-red-connector-preview",
+                    get_path="path",
+                    get_color="color",
+                    width_min_pixels=4,
+                    pickable=True,
+                )
+            )
+    if not focus_data.marker_df.empty:
+        layers.append(
+            pdk.Layer(
+                "ScatterplotLayer",
+                focus_data.marker_df,
+                id="focus-job-markers",
+                get_position="[lon, lat]",
+                get_fill_color="fill_color",
+                get_radius=65,
+                radius_min_pixels=5,
+                radius_max_pixels=12,
+                stroked=True,
+                get_line_color=[255, 255, 255],
+                line_width_min_pixels=2,
+                pickable=True,
+            )
+        )
+    if not layers:
+        st.info("No cached loaded routes are available for the visible riders.")
+    else:
+        deck = pdk.Deck(
+            map_style="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
+            initial_view_state=map_view_state(focus_data.marker_df),
+            layers=layers,
+            tooltip={"html": "{tooltip}", "style": {"backgroundColor": "#111827", "color": "white"}},
+        )
+        st.pydeck_chart(
+            deck,
+            height="stretch",
+            width="stretch",
+            key="route_planner_focus_map_chart",
+        )
+    return len(focus_data.pending_job_ids), len(focus_data.route_df)
+
+
+def _commit_recalculation_result(state: dict[str, Any], draft_assignment: dict[str, list[str]], result: Any) -> None:
+    for key, value in focus_apply_success_state(draft_assignment, result).items():
+        st.session_state[key] = value
+    state["route_df"] = result.route_df.copy()
+    state["summary_df"] = result.summary_df.copy()
+    state["lookup_warnings"] = result.warnings
+    st.session_state.bluesg_map_viewer_state = state
+
+
+def _render_map_planner_focus_legacy(
+    state: dict[str, Any],
+    jobs_df: pd.DataFrame,
+    rider_df: pd.DataFrame,
+    rider_names: list[str],
+    rider_starts: dict[str, str],
+    jobs_by_id: dict[str, dict[str, Any]],
+) -> None:
+    """Dedicated manager view sharing the normal planner's draft and confirmed state."""
+
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"], [data-testid="stHeader"], [data-testid="stToolbar"] { display: none !important; }
+        [data-testid="stAppViewContainer"] { position: fixed; inset: 0; width: 100vw; height: 100vh; z-index: 9990; overflow: hidden; background: #080d16; color: #e5e7eb; }
+        [data-testid="stMain"] { height: 100vh; overflow: hidden; background: #080d16; color: #e5e7eb; }
+        .block-container { max-width: 100vw !important; height: 100vh; padding: .65rem .9rem !important; overflow: hidden; }
+        [data-testid="stVerticalBlock"] { gap: .45rem; }
+        .block-container > [data-testid="stVerticalBlock"] { height: 100%; }
+        [data-testid="stHorizontalBlock"]:has([data-testid="stDeckGlJsonChart"]) { height: calc(100vh - 4.7rem) !important; min-height: 0 !important; align-items: stretch !important; }
+        [data-testid="stHorizontalBlock"]:has([data-testid="stDeckGlJsonChart"]) > [data-testid="stColumn"] { height: 100% !important; min-height: 0 !important; overflow: hidden !important; }
+        [data-testid="stDeckGlJsonChart"] { height: calc(100vh - 7.1rem) !important; min-height: 0 !important; }
+        [data-testid="stDeckGlJsonChart"] > div { height: 100% !important; }
+        [data-testid="stDeckGlJsonChart"] canvas { height: 100% !important; }
+        [data-testid="stAppViewContainer"] p,
+        [data-testid="stAppViewContainer"] label,
+        [data-testid="stAppViewContainer"] h1,
+        [data-testid="stAppViewContainer"] h2,
+        [data-testid="stAppViewContainer"] h3,
+        [data-testid="stAppViewContainer"] h4 { color: #e5e7eb !important; }
+        [data-testid="stVerticalBlockBorderWrapper"],
+        [data-testid="stVerticalBlockBorderWrapper"] > div { height: calc(100vh - 5.2rem) !important; max-height: calc(100vh - 5.2rem) !important; min-height: 0 !important; background: #111827 !important; border-color: #374151 !important; }
+        [data-testid="stCheckbox"] label span { color: #e5e7eb !important; }
+        [data-testid="stCheckbox"] input { accent-color: #10b981; }
+        [data-testid="stAlert"] { background: #422006 !important; color: #fde68a !important; border: 1px solid #a16207; }
+        [data-testid="stAlert"] p { color: inherit !important; }
+        [data-testid="stIFrame"] { background: #111827; border-radius: 8px; }
+        .stButton > button { background: #151d2b; color: #f9fafb; border-color: #4b5563; }
+        .stButton > button:hover { background: #1f2937; color: #ffffff; border-color: #10b981; }
+        .stButton > button:disabled { background: #111827; color: #6b7280; border-color: #273244; }
+        @media (max-width: 1150px) { .block-container { padding: .5rem !important; } }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    confirmed_routes = st.session_state["route_planner_confirmed_routes"]
+    confirmed_assignment = clone_assignment(st.session_state["route_planner_confirmed_assignment"])
+    draft_assignment = clone_assignment(st.session_state["route_planner_draft_assignment"])
+    dirty = bool(st.session_state.get("route_planner_is_dirty"))
+    total_jobs = sum(len(job_ids) for lane, job_ids in draft_assignment.items() if lane != UNASSIGNED_LANE)
+
+    title_col, status_col, undo_col, redo_col, apply_col, exit_col = st.columns([3.2, 1.3, .7, .7, 1.8, 1.65])
+    title_col.markdown(f"### Route Planner  ·  {total_jobs} jobs  ·  {len(rider_names)} riders")
+    status_col.markdown("**Draft changes**" if dirty else "Plan up to date")
+    undo_clicked = undo_col.button("Undo", disabled=not st.session_state.get("route_planner_undo_stack"), width="stretch")
+    redo_clicked = redo_col.button("Redo", disabled=not st.session_state.get("route_planner_redo_stack"), width="stretch")
+    apply_clicked = apply_col.button("Apply & Recalculate", type="primary", disabled=not dirty, width="stretch")
+    exit_clicked = exit_col.button("Exit Without Applying", width="stretch")
+
+    if exit_clicked:
+        for key, value in exit_focus_mode_state(st.session_state).items():
+            st.session_state[key] = value
+        st.session_state["route_planner_focus_notice"] = (
+            "Map Planner closed. Your unapplied draft is still saved." if dirty else "Map Planner closed."
+        )
+        LOGGER.info("Route planner exited focus mode dirty=%s", dirty)
+        st.rerun()
+
+    if undo_clicked or redo_clicked:
+        operation = undo_draft if undo_clicked else redo_draft
+        updated, undo_stack, redo_stack, changed = operation(
+            draft_assignment,
+            st.session_state.get("route_planner_undo_stack", []),
+            st.session_state.get("route_planner_redo_stack", []),
+        )
+        if changed:
+            st.session_state["route_planner_draft_assignment"] = updated
+            st.session_state["route_planner_undo_stack"] = undo_stack
+            st.session_state["route_planner_redo_stack"] = redo_stack
+            st.session_state["route_planner_is_dirty"] = updated != confirmed_assignment
+            st.session_state["route_planner_affected_riders"] = detect_affected_riders(confirmed_assignment, updated)
+            LOGGER.info("Route planner focus %s", "undo" if undo_clicked else "redo")
+            st.rerun()
+
+    if apply_clicked:
+        validation = validate_assignment_board(draft_assignment, jobs_by_id, rider_names)
+        if not validation.is_valid:
+            st.error("Routes could not be updated because the draft contains an invalid assignment. Your changes have not been applied.")
+            LOGGER.warning("Route planner focus apply validation failed errors=%s", validation.errors)
+        else:
+            affected = detect_affected_riders(confirmed_assignment, draft_assignment, rider_starts, rider_starts)
+            LOGGER.info("Route planner focus apply requested affected_riders=%s", affected)
+            try:
+                with st.spinner(f"Recalculating {len(affected)} affected rider(s)..."):
+                    result = incremental_recalculate(
+                        confirmed_routes=confirmed_routes,
+                        confirmed_assignment=confirmed_assignment,
+                        draft_assignment=draft_assignment,
+                        rider_df=rider_df,
+                        jobs_df=jobs_df,
+                        settings=recalculation_settings(
+                            True,
+                            st.session_state.get("route_planner_onemap_token") or get_onemap_token() or None,
+                            "duration",
+                        ),
+                        summary_builder=build_summary_from_routes,
+                    )
+            except Exception:
+                LOGGER.exception("Route planner focus apply failed")
+                for key, value in focus_apply_failure_state(st.session_state).items():
+                    st.session_state[key] = value
+                st.error("Routes could not be updated because one or more journeys could not be routed. Your changes have not been applied.")
+            else:
+                _commit_recalculation_result(state, draft_assignment, result)
+                st.session_state["route_planner_focus_notice"] = (
+                    f"Routes updated successfully. {len(result.affected_riders)} riders recalculated. "
+                    f"{result.stats['reused_legs']} cached legs reused. "
+                    f"{result.stats['onemap_requests']} new OneMap routes requested."
+                )
+                LOGGER.info(
+                    "Route planner focus apply succeeded affected=%s green_reused=%s red_reused=%s onemap=%s",
+                    result.affected_riders,
+                    result.stats.get("reused_loaded", 0),
+                    result.stats.get("reused_connectors", 0),
+                    result.stats.get("onemap_requests", 0),
+                )
+                st.rerun()
+
+    map_col, panel_col = st.columns([3, 1], gap="small")
+    with panel_col:
+        with st.container(height=720, border=True):
+            st.markdown("#### Riders")
+            show_col, hide_col = st.columns(2)
+            show_all = show_col.button("Show All", width="stretch")
+            hide_all = hide_col.button("Hide All", width="stretch")
+            if show_all or hide_all:
+                selected = rider_names if show_all else []
+                st.session_state["route_planner_visible_riders"] = selected
+                for rider in rider_names:
+                    st.session_state[f"route_planner_visible_{hashlib.sha1(rider.encode()).hexdigest()[:10]}"] = rider in selected
+                LOGGER.info("Route planner rider visibility changed visible=%s", selected)
+                st.rerun()
+            current_visible = set(st.session_state.get("route_planner_visible_riders", rider_names))
+            selected_riders: list[str] = []
+            for rider in rider_names:
+                key = f"route_planner_visible_{hashlib.sha1(rider.encode()).hexdigest()[:10]}"
+                if key not in st.session_state:
+                    st.session_state[key] = rider in current_visible
+                count = len(draft_assignment.get(rider, []))
+                if st.checkbox(f"{rider} · {count} jobs", key=key):
+                    selected_riders.append(rider)
+            if selected_riders != list(st.session_state.get("route_planner_visible_riders", [])):
+                st.session_state["route_planner_visible_riders"] = selected_riders
+                LOGGER.info("Route planner rider visibility changed visible=%s", selected_riders)
+            st.caption("Visibility changes the map only.")
+            proposed = render_route_assignment_board(
+                draft_assignment,
+                jobs_by_id,
+                state["summary_df"],
+                rider_df,
+                dark_mode=True,
+            )
+            if proposed is not None and proposed != draft_assignment:
+                validation = validate_assignment_board(proposed, jobs_by_id, rider_names)
+                if validation.is_valid and _store_draft_change(
+                    draft_assignment, proposed, confirmed_assignment, rider_starts
+                ):
+                    st.rerun()
+                if not validation.is_valid:
+                    st.error("That move would create an invalid assignment.")
+                    LOGGER.warning("Route planner focus drag validation failed errors=%s", validation.errors)
+            if st.button("Reset Draft to Confirmed", width="stretch"):
+                updated, undo_stack, redo_stack, changed = reset_draft(confirmed_assignment, draft_assignment)
+                if changed:
+                    st.session_state["route_planner_draft_assignment"] = updated
+                    st.session_state["route_planner_undo_stack"] = undo_stack
+                    st.session_state["route_planner_redo_stack"] = redo_stack
+                    st.session_state["route_planner_is_dirty"] = False
+                    st.session_state["route_planner_affected_riders"] = []
+                    LOGGER.info("Route planner focus draft reset to confirmed")
+                    st.rerun()
+
+    with map_col:
+        st.caption("Loaded job routes only · blue pickup · orange drop-off · connectors hidden while editing")
+        pending_count, reused_count = render_focus_green_map(
+            draft_assignment,
+            list(st.session_state.get("route_planner_visible_riders", rider_names)),
+            confirmed_routes,
+            jobs_df,
+        )
+        if pending_count:
+            st.warning(f"{pending_count} visible job route(s) pending. They will be calculated when you apply.")
+        LOGGER.debug("Route planner focus map green_reused=%s pending=%s", reused_count, pending_count)
+
+
+def load_latest_optimiser_state(latest: dict[str, Any]) -> dict[str, Any]:
+    route_df = latest["route_df"].copy()
+    return {
+        "source_sheet": "Latest optimiser result",
+        "original_route_df": route_df.copy(),
+        "route_df": route_df,
+        "jobs_df": latest["jobs_df"].copy(),
+        "rider_df": latest["rider_df"].copy(),
+        "summary_df": latest["summary_df"].copy(),
+        "lookup_warnings": list(latest.get("lookup_warnings", [])),
+        "last_recalculated_at": "",
+    }
+
+
+def render_map_planner_focus(
+    state: dict[str, Any],
+    jobs_df: pd.DataFrame,
+    rider_df: pd.DataFrame,
+    rider_names: list[str],
+    rider_starts: dict[str, str],
+    jobs_by_id: dict[str, dict[str, Any]],
+) -> None:
+    """Render the keyed 100dvh manager workspace and its on-demand connector preview."""
+
+    st.markdown(
+        """
+        <style>
+        html, body { overflow: hidden !important; }
+        [data-testid="stSidebar"], [data-testid="stHeader"], [data-testid="stToolbar"], [data-testid="stDecoration"] { display: none !important; }
+        [data-testid="stAppViewContainer"], [data-testid="stMain"], .block-container { width: 100vw !important; max-width: none !important; height: 100dvh !important; min-height: 0 !important; overflow: hidden !important; background: #080d16; color: #e5e7eb; }
+        .block-container { padding: 0 !important; }
+        .st-key-route_planner_focus_shell { position: fixed !important; inset: 0 !important; z-index: 9990; width: 100vw !important; height: 100dvh !important; min-height: 0 !important; overflow: hidden !important; background: #080d16; }
+        .st-key-route_planner_focus_shell > div[data-testid="stVerticalBlock"] { display: grid !important; grid-template-rows: 56px minmax(0, 1fr) !important; gap: 0 !important; width: 100% !important; height: 100% !important; min-height: 0 !important; }
+        .st-key-route_planner_focus_toolbar, .st-key-route_planner_focus_toolbar > div[data-testid="stVerticalBlock"] { height: 56px !important; min-height: 0 !important; overflow: hidden !important; }
+        .st-key-route_planner_focus_toolbar { padding: 8px 10px; border-bottom: 1px solid #273244; background: #0c1320; }
+        .st-key-route_planner_focus_workspace, .st-key-route_planner_focus_workspace > div[data-testid="stVerticalBlock"], .st-key-route_planner_focus_workspace [data-testid="stHorizontalBlock"], .st-key-route_planner_focus_workspace [data-testid="stColumn"] { width: 100% !important; height: 100% !important; min-height: 0 !important; overflow: hidden !important; }
+        .st-key-route_planner_focus_workspace [data-testid="stHorizontalBlock"] { gap: 8px !important; padding: 8px; align-items: stretch !important; }
+        .st-key-route_planner_focus_map, .st-key-route_planner_focus_map > div[data-testid="stVerticalBlock"], .st-key-route_planner_focus_map [data-testid="stDeckGlJsonChart"], .st-key-route_planner_focus_map [data-testid="stDeckGlJsonChart"] > div { width: 100% !important; height: 100% !important; min-height: 0 !important; overflow: hidden !important; }
+        .st-key-route_planner_focus_panel, .st-key-route_planner_focus_panel > div[data-testid="stVerticalBlock"] { width: 100% !important; height: 100% !important; min-height: 0 !important; overflow-y: auto !important; overflow-x: hidden !important; background: #111827 !important; border-color: #374151 !important; }
+        .st-key-route_planner_focus_panel iframe { display: block !important; width: 100% !important; min-width: 100% !important; }
+        .st-key-route_planner_focus_shell p, .st-key-route_planner_focus_shell label, .st-key-route_planner_focus_shell h1, .st-key-route_planner_focus_shell h2, .st-key-route_planner_focus_shell h3, .st-key-route_planner_focus_shell h4 { color: #e5e7eb !important; }
+        .st-key-route_planner_focus_shell [data-testid="stCheckbox"] input { accent-color: #10b981; }
+        .st-key-route_planner_focus_shell [data-testid="stAlert"] { background: #422006 !important; color: #fde68a !important; border: 1px solid #a16207; }
+        .st-key-route_planner_focus_shell .stButton > button { background: #151d2b; color: #f9fafb; border-color: #4b5563; }
+        .st-key-route_planner_focus_shell .stButton > button:hover { background: #1f2937; border-color: #10b981; }
+        .st-key-route_planner_focus_shell .stButton > button:disabled { background: #111827; color: #6b7280; border-color: #273244; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    confirmed_routes = st.session_state["route_planner_confirmed_routes"]
+    confirmed_assignment = clone_assignment(st.session_state["route_planner_confirmed_assignment"])
+    draft_assignment = clone_assignment(st.session_state["route_planner_draft_assignment"])
+    dirty = bool(st.session_state.get("route_planner_is_dirty"))
+    stale_riders = list(st.session_state.get("route_planner_preview_stale_riders", rider_names))
+    preview_routes = st.session_state.get("route_planner_preview_routes", pd.DataFrame())
+    total_jobs = sum(len(job_ids) for lane, job_ids in draft_assignment.items() if lane != UNASSIGNED_LANE)
+
+    with st.container(key="route_planner_focus_shell", height="stretch", width="stretch"):
+        with st.container(key="route_planner_focus_toolbar", height=56, width="stretch"):
+            bar = st.columns([2.4, 1.2, .55, .55, .9, 1.25, 1.75, 1.45], gap="small")
+            bar[0].markdown(f"**Route Planner · {total_jobs} jobs · {len(rider_names)} riders**")
+            bar[1].caption(f"Red outdated · {len(stale_riders)} riders" if stale_riders else "Red preview current")
+            undo_clicked = bar[2].button("Undo", disabled=not st.session_state.get("route_planner_undo_stack"), width="stretch")
+            redo_clicked = bar[3].button("Redo", disabled=not st.session_state.get("route_planner_redo_stack"), width="stretch")
+            show_red = bar[4].toggle("Show Red", key="route_planner_show_red_preview")
+            refresh_clicked = bar[5].button("Refresh Red Preview", width="stretch")
+            apply_clicked = bar[6].button("Apply Routes & Return", type="primary", disabled=not dirty, width="stretch")
+            exit_clicked = bar[7].button("Exit With Draft Saved", width="stretch")
+
+        if exit_clicked:
+            st.session_state["route_planner_focus_mode"] = False
+            st.session_state["route_planner_focus_notice"] = "Map Planner closed. Your unapplied draft is still saved." if dirty else "Map Planner closed."
+            LOGGER.info("Route planner exited focus mode dirty=%s", dirty)
+            st.rerun()
+
+        if undo_clicked or redo_clicked:
+            operation = undo_draft if undo_clicked else redo_draft
+            updated, undo_stack, redo_stack, changed = operation(draft_assignment, st.session_state.get("route_planner_undo_stack", []), st.session_state.get("route_planner_redo_stack", []))
+            if changed:
+                st.session_state["route_planner_draft_assignment"] = updated
+                st.session_state["route_planner_undo_stack"] = undo_stack
+                st.session_state["route_planner_redo_stack"] = redo_stack
+                st.session_state["route_planner_is_dirty"] = updated != confirmed_assignment
+                st.session_state["route_planner_affected_riders"] = detect_affected_riders(confirmed_assignment, updated)
+                st.session_state["route_planner_preview_stale_riders"] = list(invalidate_red_preview(draft_assignment, updated, stale_riders))
+                LOGGER.info("Route planner focus %s", "undo" if undo_clicked else "redo")
+                st.rerun()
+
+        if refresh_clicked:
+            try:
+                refreshed = refresh_red_connector_preview(
+                    confirmed_routes=confirmed_routes,
+                    confirmed_assignment=confirmed_assignment,
+                    draft_assignment=draft_assignment,
+                    existing_preview_routes=preview_routes,
+                    stale_riders=stale_riders,
+                    rider_df=rider_df,
+                    jobs_df=jobs_df,
+                    use_onemap=True,
+                    token=st.session_state.get("route_planner_onemap_token") or get_onemap_token() or None,
+                    duration_multiplier=DEFAULT_EMPTY_TRAVEL_DURATION_MULTIPLIER,
+                    wait_buffer_min=DEFAULT_EMPTY_TRAVEL_WAIT_BUFFER_MIN,
+                )
+            except (ValueError, TimeoutError, OSError) as exc:
+                st.session_state["route_planner_preview_error"] = str(exc)
+                LOGGER.exception("Route planner red preview refresh failed stale_riders=%s", stale_riders)
+            else:
+                st.session_state["route_planner_preview_routes"] = refreshed.route_df
+                st.session_state["route_planner_preview_assignment_signature"] = refreshed.assignment_signature
+                st.session_state["route_planner_preview_stale_riders"] = []
+                st.session_state["route_planner_preview_stats"] = refreshed.stats
+                st.session_state["route_planner_preview_error"] = ""
+                st.session_state["route_planner_show_red_preview"] = True
+                LOGGER.info("Route planner red preview refreshed stats=%s", refreshed.stats)
+                st.rerun()
+
+        if apply_clicked:
+            validation = validate_assignment_board(draft_assignment, jobs_by_id, rider_names)
+            if not validation.is_valid:
+                st.error("Routes could not be updated because the draft contains an invalid assignment.")
+            else:
+                affected = detect_affected_riders(confirmed_assignment, draft_assignment, rider_starts, rider_starts)
+                matching_preview = matching_red_preview_routes(
+                    preview_routes,
+                    st.session_state.get("route_planner_preview_assignment_signature", ""),
+                    draft_assignment,
+                    stale_riders,
+                )
+                try:
+                    with st.spinner(f"Recalculating {len(affected)} affected rider(s)..."):
+                        result = incremental_recalculate(
+                            confirmed_routes=confirmed_routes,
+                            confirmed_assignment=confirmed_assignment,
+                            draft_assignment=draft_assignment,
+                            rider_df=rider_df,
+                            jobs_df=jobs_df,
+                            settings=recalculation_settings(True, st.session_state.get("route_planner_onemap_token") or get_onemap_token() or None, "duration"),
+                            summary_builder=build_summary_from_routes,
+                            matching_preview_routes=matching_preview,
+                        )
+                except (ValueError, TimeoutError, OSError):
+                    LOGGER.exception("Route planner focus apply failed")
+                    for key, value in focus_apply_failure_state(st.session_state).items():
+                        st.session_state[key] = value
+                    st.error("Routes could not be updated. Your changes have not been applied.")
+                else:
+                    _commit_recalculation_result(state, draft_assignment, result)
+                    st.session_state["route_planner_focus_notice"] = f"Routes updated successfully. {len(result.affected_riders)} riders recalculated. {result.stats['reused_legs']} cached legs reused. {result.stats['onemap_requests']} new OneMap routes requested."
+                    LOGGER.info("Route planner focus apply succeeded affected=%s stats=%s", result.affected_riders, result.stats)
+                    st.rerun()
+
+        with st.container(key="route_planner_focus_workspace", height="stretch", width="stretch"):
+            map_col, panel_col = st.columns([3, 1], gap="small")
+            with map_col:
+                with st.container(key="route_planner_focus_map", height="stretch", width="stretch"):
+                    if st.session_state.get("route_planner_preview_error"):
+                        st.error("Red connector preview could not be refreshed. Your draft is unchanged.")
+                    pending_count, reused_count = render_focus_green_map(
+                        draft_assignment,
+                        list(st.session_state.get("route_planner_visible_riders", rider_names)),
+                        confirmed_routes,
+                        jobs_df,
+                        preview_routes=preview_routes,
+                        stale_preview_riders=stale_riders,
+                        show_red_preview=show_red,
+                    )
+                    if pending_count:
+                        st.warning(f"{pending_count} visible job route(s) pending. They will be calculated when you apply.")
+                    LOGGER.debug("Route planner focus map green_reused=%s pending=%s", reused_count, pending_count)
+            with panel_col:
+                with st.container(key="route_planner_focus_panel", height="stretch", width="stretch", border=True):
+                    show_col, hide_col = st.columns(2)
+                    show_all = show_col.button("Show All", width="stretch")
+                    hide_all = hide_col.button("Hide All", width="stretch")
+                    if show_all or hide_all:
+                        selected = rider_names if show_all else []
+                        st.session_state["route_planner_visible_riders"] = selected
+                        for rider in rider_names:
+                            st.session_state[f"route_planner_visible_{hashlib.sha1(rider.encode()).hexdigest()[:10]}"] = rider in selected
+                        st.rerun()
+                    current_visible = set(st.session_state.get("route_planner_visible_riders", rider_names))
+                    selected_riders: list[str] = []
+                    for rider in rider_names:
+                        key = f"route_planner_visible_{hashlib.sha1(rider.encode()).hexdigest()[:10]}"
+                        if key not in st.session_state:
+                            st.session_state[key] = rider in current_visible
+                        if st.checkbox(f"{rider} · {len(draft_assignment.get(rider, []))} jobs", key=key):
+                            selected_riders.append(rider)
+                    st.session_state["route_planner_visible_riders"] = selected_riders
+                    proposed = render_route_assignment_board(draft_assignment, jobs_by_id, state["summary_df"], rider_df, dark_mode=True)
+                    if proposed is not None and proposed != draft_assignment:
+                        validation = validate_assignment_board(proposed, jobs_by_id, rider_names)
+                        if validation.is_valid and _store_draft_change(draft_assignment, proposed, confirmed_assignment, rider_starts):
+                            st.rerun()
+                        if not validation.is_valid:
+                            st.error("That move would create an invalid assignment.")
+                    if st.button("Reset Draft to Confirmed", width="stretch"):
+                        updated, undo_stack, redo_stack, changed = reset_draft(confirmed_assignment, draft_assignment)
+                        if changed:
+                            st.session_state["route_planner_draft_assignment"] = updated
+                            st.session_state["route_planner_undo_stack"] = undo_stack
+                            st.session_state["route_planner_redo_stack"] = redo_stack
+                            st.session_state["route_planner_is_dirty"] = False
+                            st.session_state["route_planner_affected_riders"] = []
+                            st.session_state["route_planner_preview_stale_riders"] = list(invalidate_red_preview(draft_assignment, updated, stale_riders))
+                            st.rerun()
+
+
+def render_route_results_summary(state: dict[str, Any]) -> None:
+    """Compact confirmed-results screen; no map or assignment editor is rendered."""
+
+    confirmed_routes = st.session_state["route_planner_confirmed_routes"]
+    confirmed_assignment = clone_assignment(st.session_state["route_planner_confirmed_assignment"])
+    draft_assignment = clone_assignment(st.session_state["route_planner_draft_assignment"])
+    dirty = bool(st.session_state.get("route_planner_is_dirty"))
+    notice = clean_text(st.session_state.pop("route_planner_focus_notice", ""))
+    st.title("Route Planner Results")
+    if notice:
+        st.success(notice)
+    header, action = st.columns([3, 1])
+    with header:
+        if dirty:
+            changed_riders = detect_affected_riders(confirmed_assignment, draft_assignment)
+            before = _assignment_positions(confirmed_assignment)
+            after = _assignment_positions(draft_assignment)
+            changed_jobs = sum(before.get(job_id) != after.get(job_id) for job_id in set(before) | set(after))
+            st.warning(
+                f"Confirmed-route summary shown. An unapplied draft is saved with "
+                f"{len(changed_riders)} changed rider(s) and {changed_jobs} changed order position(s)."
+            )
+        else:
+            st.info("Confirmed routes are up to date and ready to export.")
+    if action.button("Reopen Map Planner", type="primary", width="stretch"):
+        for key, value in enter_focus_mode_state(st.session_state, state["rider_df"]["Rider Name"].apply(clean_text).tolist()).items():
+            st.session_state[key] = value
+        LOGGER.info("Route planner reopened from results summary")
+        st.rerun()
+
+    summary = build_compact_rider_summary(
+        confirmed_routes,
+        state["rider_df"],
+        duration_limit_min=DEFAULT_MAX_ADJUSTED_DURATION_MIN,
+    )
+    if summary.empty:
+        st.info("No confirmed rider routes are available.")
+    else:
+        def workload_style(row: pd.Series) -> list[str]:
+            colour = {"Heavy": "#5f1d24", "Balanced": "#153f35", "Light": "#1e3555"}.get(clean_text(row.get("Workload")), "")
+            return [f"background-color: {colour}" if colour else "" for _ in row]
+
+        st.dataframe(summary.style.apply(workload_style, axis=1), width="stretch", hide_index=True)
+
+    export_bytes = None
+    if not dirty:
+        export_bytes = export_routes_to_excel(
+            confirmed_routes,
+            state["summary_df"],
+            jobs_df=state["jobs_df"],
+            lookup_warnings=state.get("lookup_warnings", []),
+        )
+    st.download_button(
+        "Export Updated Workbook",
+        data=export_bytes or b"",
+        file_name="vehicle_route_optimisation.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        disabled=dirty,
+        width="stretch",
+        on_click=lambda: LOGGER.info("Route planner confirmed workbook exported rows=%s", len(confirmed_routes)),
+    )
+
+
+def run_route_planner_screen_flow() -> None:
+    """State A load screen, State B focus planner, or State C confirmed summary."""
+
+    existing_state = st.session_state.get("bluesg_map_viewer_state")
+    if existing_state is None:
+        st.title("Route Planner")
+        st.caption("Load a completed optimizer workbook to begin map planning.")
+        latest = st.session_state.get("bluesg_latest_optimisation")
+        token = st.text_input(
+            "OneMap token",
+            value=get_onemap_token(),
+            type="password",
+            key="route_planner_onemap_token",
+            help="Used only when you explicitly refresh connectors or apply routes.",
+        )
+        if not token and not onemap_credentials_configured():
+            st.warning("Configure a OneMap token or credentials before refreshing route previews.")
+        uploaded = st.file_uploader("Upload vehicle_route_optimisation.xlsx", type=["xlsx", "xls"])
+        if uploaded is not None:
+            st.caption(f"Selected workbook: {uploaded.name}")
+        load_cols = st.columns(2)
+        load_uploaded = load_cols[0].button("Load uploaded workbook", disabled=uploaded is None, type="primary", width="stretch")
+        open_latest = load_cols[1].button("Open latest optimizer result", disabled=not bool(latest), width="stretch")
+        loaded_state: dict[str, Any] | None = None
+        workbook_id = ""
+        if load_uploaded and uploaded is not None:
+            file_bytes = uploaded.getvalue()
+            workbook_id = file_signature(file_bytes)
+            try:
+                loaded_state = load_route_workbook(file_bytes)
+            except (ValueError, KeyError, OSError) as exc:
+                LOGGER.exception("Route planner workbook load failed")
+                st.error(f"The workbook could not be loaded: {exc}")
+        elif open_latest and latest:
+            loaded_state = load_latest_optimiser_state(latest)
+            workbook_id = f"session-{route_source_signature(loaded_state['route_df'])}"
+        if loaded_state is None:
+            st.info("No route workbook is currently loaded.")
+            return
+        st.session_state.bluesg_map_viewer_state = loaded_state
+        st.session_state.bluesg_map_viewer_file_signature = workbook_id
+        initialise_route_planner(loaded_state, workbook_id)
+        st.session_state["route_planner_focus_mode"] = True
+        st.session_state["route_planner_preview_stale_riders"] = loaded_state["rider_df"]["Rider Name"].apply(clean_text).tolist()
+        LOGGER.info("Route planner workbook loaded and focus mode entered signature=%s", workbook_id[:12])
+        st.rerun()
+
+    state = st.session_state.bluesg_map_viewer_state
+    workbook_id = str(st.session_state.get("bluesg_map_viewer_file_signature") or "active-workbook")
+    if st.session_state.get("route_planner_workbook_id") != workbook_id:
+        initialise_route_planner(state, workbook_id)
+        st.session_state["route_planner_focus_mode"] = True
+        st.session_state["route_planner_preview_stale_riders"] = state["rider_df"]["Rider Name"].apply(clean_text).tolist()
+    jobs_df = state["jobs_df"]
+    rider_df = state["rider_df"]
+    rider_names = rider_df["Rider Name"].apply(clean_text).dropna().tolist()
+    rider_starts = {
+        clean_text(row.get("Rider Name")): clean_text(row.get("Start Location"))
+        for _, row in rider_df.iterrows()
+    }
+    if st.session_state.get("route_planner_focus_mode"):
+        render_map_planner_focus(state, jobs_df, rider_df, rider_names, rider_starts, build_jobs_by_stable_id(jobs_df))
+        st.stop()
+    render_route_results_summary(state)
+
+
+run_route_planner_screen_flow()
+st.stop()
+
+
+focus_mode_requested = bool(
+    st.session_state.get("route_planner_focus_mode")
+    and st.session_state.get("bluesg_map_viewer_state")
 )
+latest_optimisation = st.session_state.get("bluesg_latest_optimisation")
+uploaded_file = None
+load_latest_clicked = False
+if not focus_mode_requested:
+    st.title("Route Planner")
+    st.caption("Drag orders between riders, preview the change, then recalculate and export.")
+    load_cols = st.columns([2, 1])
+    with load_cols[0]:
+        uploaded_file = st.file_uploader(
+            "Upload vehicle_route_optimisation.xlsx",
+            type=["xlsx", "xls"],
+            help="Use the Excel file downloaded from the Vehicle Route Optimiser.",
+        )
+    with load_cols[1]:
+        load_latest_clicked = st.button(
+            "Open latest optimiser result",
+            disabled=not bool(latest_optimisation),
+            width="stretch",
+            help="Uses the result from this Streamlit session without downloading and uploading it again.",
+        )
 
-if uploaded_file is None:
-    st.info("Upload an exported route workbook to load the map viewer.")
+workbook_id = ""
+if uploaded_file is not None:
+    file_bytes = uploaded_file.getvalue()
+    workbook_id = file_signature(file_bytes)
+    if st.session_state.get("bluesg_map_viewer_file_signature") != workbook_id:
+        try:
+            st.session_state.bluesg_map_viewer_state = load_route_workbook(file_bytes)
+        except Exception as exc:
+            st.error(f"Could not load exported route workbook: {exc}")
+            st.stop()
+        st.session_state.bluesg_map_viewer_file_signature = workbook_id
+        LOGGER.info("Route planner workbook loaded source=upload signature=%s", workbook_id[:12])
+elif load_latest_clicked and latest_optimisation:
+    latest_signature = route_source_signature(latest_optimisation["route_df"])
+    workbook_id = f"session-{latest_signature}"
+    st.session_state.bluesg_map_viewer_state = load_latest_optimiser_state(latest_optimisation)
+    st.session_state.bluesg_map_viewer_file_signature = workbook_id
+    LOGGER.info("Route planner workbook loaded source=session signature=%s", latest_signature[:12])
+elif st.session_state.get("bluesg_map_viewer_state"):
+    workbook_id = str(st.session_state.get("bluesg_map_viewer_file_signature") or "legacy-session")
+else:
+    st.info("Upload an optimiser workbook or open the latest optimiser result.")
     st.stop()
 
-file_bytes = uploaded_file.getvalue()
-signature = file_signature(file_bytes)
-if st.session_state.get("bluesg_map_viewer_file_signature") != signature:
-    try:
-        st.session_state.bluesg_map_viewer_state = load_route_workbook(file_bytes)
-    except Exception as exc:
-        st.error(f"Could not load exported route workbook: {exc}")
-        st.stop()
-    st.session_state.bluesg_map_viewer_file_signature = signature
-    st.session_state.bluesg_map_viewer_history = []
+state = st.session_state.bluesg_map_viewer_state
+if st.session_state.get("route_planner_workbook_id") != workbook_id:
+    initialise_route_planner(state, workbook_id)
     st.session_state.bluesg_map_viewer_selected_rider = "All riders"
     st.session_state.bluesg_map_viewer_selected_sequence = "All"
 
-state = st.session_state.bluesg_map_viewer_state
-route_df = state["route_df"]
+route_df = st.session_state["route_planner_confirmed_routes"]
+state["route_df"] = route_df
 jobs_df = state["jobs_df"]
 rider_df = state["rider_df"]
 summary_df = state["summary_df"]
+
+jobs_by_id = build_jobs_by_stable_id(jobs_df)
+rider_names = rider_df["Rider Name"].apply(clean_text).dropna().tolist()
+rider_starts = {
+    clean_text(row.get("Rider Name")): clean_text(row.get("Start Location"))
+    for _, row in rider_df.iterrows()
+}
+
+if st.session_state.get("route_planner_focus_mode"):
+    render_map_planner_focus(state, jobs_df, rider_df, rider_names, rider_starts, jobs_by_id)
+    st.stop()
+
+notice = clean_text(st.session_state.pop("route_planner_focus_notice", ""))
+if notice:
+    st.success(notice)
 
 top_cols = st.columns([2, 1])
 with top_cols[0]:
@@ -687,6 +1571,7 @@ with top_cols[1]:
         "OneMap token",
         value=get_onemap_token(),
         type="password",
+        key="route_planner_onemap_token",
         help="Used for geocoding the map and for route recalculation.",
     )
     if not map_token and not onemap_credentials_configured():
@@ -694,117 +1579,218 @@ with top_cols[1]:
 
 render_summary(route_df, summary_df)
 
-editor_col, map_col = st.columns([1, 1.45], gap="large")
+draft_assignment = clone_assignment(st.session_state["route_planner_draft_assignment"])
+confirmed_assignment = clone_assignment(st.session_state["route_planner_confirmed_assignment"])
 
-with editor_col:
-    st.subheader("Move Orders")
-    st.caption("Change Rider and Sequence, then apply. Recalculation updates Start From, travel legs, and the map.")
+open_planner_col, _ = st.columns([1, 2.2])
+if open_planner_col.button("Open Map Planner", type="primary", width="stretch"):
+    for key, value in enter_focus_mode_state(st.session_state, rider_names).items():
+        st.session_state[key] = value
+    visible = set(st.session_state["route_planner_visible_riders"])
+    for rider in rider_names:
+        st.session_state[f"route_planner_visible_{hashlib.sha1(rider.encode()).hexdigest()[:10]}"] = rider in visible
+    LOGGER.info("Route planner entered focus mode visible_riders=%s", sorted(visible))
+    st.rerun()
 
-    rider_names = rider_df["Rider Name"].apply(clean_text).dropna().tolist()
-    editor_df = assignment_editor_df(route_df)
-    editor_key = f"bluesg_map_assignment_editor_{route_source_signature(route_df)[:12]}"
-    edited_assignments = st.data_editor(
-        editor_df,
-        key=editor_key,
-        hide_index=True,
-        width="stretch",
-        height=420,
-        disabled=["Job Key", "Uploaded Row", "Car Plate", "Pickup", "Drop-off"],
-        column_config={
-            "Job Key": st.column_config.TextColumn(),
-            "Rider": st.column_config.SelectboxColumn(options=rider_names, required=True),
-            "Sequence": st.column_config.NumberColumn(min_value=1, step=1, required=True),
-            "Uploaded Row": st.column_config.NumberColumn(),
-            "Car Plate": st.column_config.TextColumn(),
-            "Pickup": st.column_config.TextColumn(),
-            "Drop-off": st.column_config.TextColumn(),
-        },
-    )
+planner_col, map_col = st.columns([1, 1.85], gap="large")
 
-    settings_cols = st.columns(2)
-    with settings_cols[0]:
-        use_onemap_recalc = st.toggle("Use OneMap recalculation", value=True)
-    with settings_cols[1]:
-        optimise_by_label = st.radio("Optimise metric", ["Duration", "Distance"], horizontal=True)
-
-    action_cols = st.columns(3)
-    apply_clicked = action_cols[0].button("Apply Changes", type="primary", width="stretch")
-    undo_clicked = action_cols[1].button("Undo", width="stretch")
-    reset_clicked = action_cols[2].button("Reset", width="stretch")
-
-    if apply_clicked:
-        history = list(st.session_state.get("bluesg_map_viewer_history", []))
-        history.append(copy.deepcopy(state))
-        st.session_state.bluesg_map_viewer_history = history[-10:]
-        settings = recalculation_settings(
-            use_onemap=use_onemap_recalc,
-            token=map_token or None,
-            optimise_by=optimise_by_label.lower(),
-        )
-        try:
-            started_at = time.monotonic()
-            with st.spinner("Recalculating edited route plan..."):
-                new_route_df, new_summary_df, lookup_warnings = recalculate_routes_from_editor(
-                    edited_assignments,
-                    rider_df,
-                    jobs_df,
-                    settings,
+with planner_col:
+        st.subheader("Assign Orders")
+        st.caption("Drag cards within a rider to reorder, or between lanes to reassign. Sequence follows card position.")
+        proposed = render_route_assignment_board(draft_assignment, jobs_by_id, summary_df, rider_df)
+        if proposed is not None and proposed != draft_assignment:
+            validation = validate_assignment_board(proposed, jobs_by_id, rider_names)
+            if validation.is_valid:
+                updated, undo_stack, redo_stack, changed = update_draft_history(
+                    draft_assignment,
+                    proposed,
+                    st.session_state.get("route_planner_undo_stack", []),
+                    st.session_state.get("route_planner_redo_stack", []),
+                    HISTORY_LIMIT,
                 )
-            integrity = optimisation_integrity_report(new_route_df, jobs_df)
-            if not integrity["is_valid"]:
-                st.error(integrity["message"])
-                st.stop()
-        except Exception as exc:
-            st.error(f"Could not apply route changes: {exc}")
-        else:
-            state["route_df"] = new_route_df.copy()
-            state["summary_df"] = new_summary_df.copy()
-            state["lookup_warnings"] = lookup_warnings
-            state["last_recalculated_at"] = f"{time.monotonic() - started_at:.1f}s recalculation"
-            st.session_state.bluesg_map_viewer_state = state
-            st.success("Route plan updated.")
+                if changed:
+                    affected = detect_affected_riders(confirmed_assignment, updated, rider_starts, rider_starts)
+                    st.session_state["route_planner_draft_assignment"] = updated
+                    st.session_state["route_planner_undo_stack"] = undo_stack
+                    st.session_state["route_planner_redo_stack"] = redo_stack
+                    st.session_state["route_planner_is_dirty"] = updated != confirmed_assignment
+                    st.session_state["route_planner_affected_riders"] = affected
+                    LOGGER.info("Route planner draft changed affected_riders=%s", affected)
+                    before_positions = {
+                        job_id: (lane, position)
+                        for lane, job_ids in draft_assignment.items()
+                        for position, job_id in enumerate(job_ids, start=1)
+                    }
+                    after_positions = {
+                        job_id: (lane, position)
+                        for lane, job_ids in updated.items()
+                        for position, job_id in enumerate(job_ids, start=1)
+                    }
+                    for job_id in sorted(set(before_positions) | set(after_positions)):
+                        before = before_positions.get(job_id)
+                        after = after_positions.get(job_id)
+                        if before == after:
+                            continue
+                        if before and after and before[0] != after[0]:
+                            LOGGER.info(
+                                "Route planner job moved job_id=%s from=%s[%s] to=%s[%s]",
+                                job_id,
+                                before[0],
+                                before[1],
+                                after[0],
+                                after[1],
+                            )
+                        else:
+                            LOGGER.info(
+                                "Route planner sequence changed job_id=%s before=%s after=%s",
+                                job_id,
+                                before,
+                                after,
+                            )
+                    st.rerun()
+            else:
+                LOGGER.warning("Route planner draft validation failed errors=%s", validation.errors)
+                st.error("; ".join(validation.errors))
+
+        action_cols = st.columns(3)
+        undo_clicked = action_cols[0].button("Undo", disabled=not st.session_state.get("route_planner_undo_stack"), width="stretch")
+        redo_clicked = action_cols[1].button("Redo", disabled=not st.session_state.get("route_planner_redo_stack"), width="stretch")
+        reset_clicked = action_cols[2].button("Reset to Original", width="stretch")
+        if undo_clicked:
+            updated, undo_stack, redo_stack, changed = undo_draft(
+                draft_assignment,
+                st.session_state.get("route_planner_undo_stack", []),
+                st.session_state.get("route_planner_redo_stack", []),
+            )
+            if changed:
+                st.session_state["route_planner_draft_assignment"] = updated
+                st.session_state["route_planner_undo_stack"] = undo_stack
+                st.session_state["route_planner_redo_stack"] = redo_stack
+                st.session_state["route_planner_is_dirty"] = updated != confirmed_assignment
+                st.session_state["route_planner_affected_riders"] = detect_affected_riders(confirmed_assignment, updated)
+                LOGGER.info("Route planner undo")
+                st.rerun()
+        if redo_clicked:
+            updated, undo_stack, redo_stack, changed = redo_draft(
+                draft_assignment,
+                st.session_state.get("route_planner_undo_stack", []),
+                st.session_state.get("route_planner_redo_stack", []),
+            )
+            if changed:
+                st.session_state["route_planner_draft_assignment"] = updated
+                st.session_state["route_planner_undo_stack"] = undo_stack
+                st.session_state["route_planner_redo_stack"] = redo_stack
+                st.session_state["route_planner_is_dirty"] = updated != confirmed_assignment
+                st.session_state["route_planner_affected_riders"] = detect_affected_riders(confirmed_assignment, updated)
+                LOGGER.info("Route planner redo")
+                st.rerun()
+        if reset_clicked:
+            updated, undo_stack, redo_stack, changed = reset_draft(
+                st.session_state["route_planner_original_assignment"], draft_assignment
+            )
+            st.session_state["route_planner_draft_assignment"] = updated
+            st.session_state["route_planner_undo_stack"] = undo_stack
+            st.session_state["route_planner_redo_stack"] = redo_stack
+            st.session_state["route_planner_is_dirty"] = updated != confirmed_assignment
+            st.session_state["route_planner_affected_riders"] = detect_affected_riders(confirmed_assignment, updated)
+            LOGGER.info("Route planner reset to original changed=%s", changed)
             st.rerun()
 
-    if undo_clicked:
-        history = list(st.session_state.get("bluesg_map_viewer_history", []))
-        if history:
-            st.session_state.bluesg_map_viewer_state = history.pop()
-            st.session_state.bluesg_map_viewer_history = history
-            st.rerun()
-        else:
-            st.info("No previous map edit to undo.")
+        use_onemap_recalc = st.toggle("Use OneMap recalculation", value=True)
+        optimise_by_label = st.radio("Optimise metric", ["Duration", "Distance"], horizontal=True)
+        dirty = bool(st.session_state.get("route_planner_is_dirty"))
+        apply_clicked = st.button("Apply & Recalculate", type="primary", disabled=not dirty, width="stretch")
+        if apply_clicked:
+            draft_assignment = clone_assignment(st.session_state["route_planner_draft_assignment"])
+            validation = validate_assignment_board(draft_assignment, jobs_by_id, rider_names)
+            if not validation.is_valid:
+                LOGGER.warning("Route planner apply validation failed errors=%s", validation.errors)
+                st.error("; ".join(validation.errors))
+            else:
+                affected = detect_affected_riders(confirmed_assignment, draft_assignment, rider_starts, rider_starts)
+                LOGGER.info("Route planner recalculation started affected_riders=%s", affected)
+                started_at = time.monotonic()
+                try:
+                    with st.status(f"Recalculating {len(affected)} affected rider(s)", expanded=True) as progress:
+                        st.write("Reusing confirmed loaded journeys and unchanged connectors...")
+                        result = incremental_recalculate(
+                            confirmed_routes=route_df,
+                            confirmed_assignment=confirmed_assignment,
+                            draft_assignment=draft_assignment,
+                            rider_df=rider_df,
+                            jobs_df=jobs_df,
+                            settings=recalculation_settings(use_onemap_recalc, map_token or None, optimise_by_label.lower()),
+                            summary_builder=build_summary_from_routes,
+                        )
+                        st.write(f"Reused {result.stats['reused_legs']} confirmed route legs")
+                        st.write(f"Used {result.stats['cache_hits']} cached route lookups")
+                        st.write(f"Requested {result.stats['onemap_requests']} new OneMap routes")
+                        st.write("Validation passed")
+                        progress.update(label="Route plan recalculated", state="complete")
+                except Exception as exc:
+                    LOGGER.exception("Route planner apply failed")
+                    st.error(f"Could not apply route changes: {exc}")
+                else:
+                    st.session_state["route_planner_confirmed_routes"] = result.route_df.copy()
+                    st.session_state["route_planner_confirmed_assignment"] = clone_assignment(draft_assignment)
+                    st.session_state["route_planner_draft_assignment"] = clone_assignment(draft_assignment)
+                    st.session_state["route_planner_is_dirty"] = False
+                    st.session_state["route_planner_redo_stack"] = []
+                    st.session_state["route_planner_affected_riders"] = []
+                    st.session_state["route_planner_last_apply_stats"] = result.stats
+                    state["route_df"] = result.route_df.copy()
+                    state["summary_df"] = result.summary_df.copy()
+                    state["lookup_warnings"] = result.warnings
+                    state["last_recalculated_at"] = f"{time.monotonic() - started_at:.1f}s recalculation"
+                    st.session_state.bluesg_map_viewer_state = state
+                    LOGGER.info("Route planner apply succeeded affected_riders=%s stats=%s", result.affected_riders, result.stats)
+                    st.success("Route plan updated and validated.")
+                    st.rerun()
 
-    if reset_clicked:
-        state["route_df"] = state["original_route_df"].copy()
-        state["summary_df"] = build_summary_from_routes(state["route_df"])
-        state["lookup_warnings"] = []
-        state["last_recalculated_at"] = ""
-        st.session_state.bluesg_map_viewer_state = state
-        st.session_state.bluesg_map_viewer_history = []
-        st.rerun()
+        if st.session_state.get("route_planner_is_dirty"):
+            st.warning("Draft changes are not yet recalculated. Apply & Recalculate before exporting.")
+        export_bytes = None
+        if not st.session_state.get("route_planner_is_dirty"):
+            export_bytes = export_routes_to_excel(
+                state["route_df"], state["summary_df"], jobs_df=jobs_df, lookup_warnings=state.get("lookup_warnings", [])
+            )
+        st.download_button(
+            "Export Updated Workbook",
+            data=export_bytes or b"",
+            file_name="vehicle_route_optimisation.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            disabled=export_bytes is None,
+            width="stretch",
+            on_click=lambda: LOGGER.info(
+                "Route planner export downloaded rows=%s", len(state["route_df"])
+            ),
+        )
+        if export_bytes is not None:
+            LOGGER.debug("Route planner export prepared rows=%s", len(state["route_df"]))
 
-    if state.get("lookup_warnings"):
-        with st.expander("Recalculation warnings", expanded=False):
-            for warning in state["lookup_warnings"][:80]:
-                st.warning(warning)
-            if len(state["lookup_warnings"]) > 80:
-                st.info(f"Showing first 80 of {len(state['lookup_warnings'])} warning(s).")
-
-    st.download_button(
-        "Download Current Route Workbook",
-        data=export_routes_to_excel(
-            state["route_df"],
-            state["summary_df"],
-            jobs_df=state["jobs_df"],
-            lookup_warnings=state.get("lookup_warnings", []),
-        ),
-        file_name="vehicle_route_map_viewer_output.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+draft_assignment = clone_assignment(st.session_state["route_planner_draft_assignment"])
+if st.session_state.get("route_planner_is_dirty"):
+    preview_routes, preview_stats = build_draft_preview_routes(
+        route_df, confirmed_assignment, draft_assignment, jobs_df, rider_starts
     )
+    confirmed_signatures = build_route_leg_signatures(confirmed_assignment, jobs_by_id, rider_starts)
+    draft_signatures = build_route_leg_signatures(draft_assignment, jobs_by_id, rider_starts)
+    changed_legs = detect_changed_route_legs(confirmed_signatures, draft_signatures)["changed"]
+else:
+    preview_routes = route_df
+    preview_stats = {"known_duration_min": round(numeric_sum(route_df, "Total Duration Min"), 1), "pending_route_legs": 0}
+    changed_legs = []
 
 with map_col:
-    st.subheader("Map")
-    render_map(state["route_df"], state["rider_df"], map_token or None)
+    control_cols = st.columns([2, 1, 1])
+    control_cols[0].subheader("Map")
+    if st.session_state.get("route_planner_is_dirty"):
+        control_cols[1].metric("Known duration", f"{preview_stats['known_duration_min']:.1f} min")
+        control_cols[2].metric("Pending legs", preview_stats["pending_route_legs"])
+        st.warning("Draft preview — accurate routing has not been recalculated. Straight pending connectors are not OneMap routes.")
+        if changed_legs:
+            st.caption(f"{len(changed_legs)} route-leg signature(s) changed. Confirmed loaded paths are reused in this preview.")
+    render_map(preview_routes, state["rider_df"], map_token or None)
 
 with st.expander("Current route rows", expanded=False):
     visible_columns = [

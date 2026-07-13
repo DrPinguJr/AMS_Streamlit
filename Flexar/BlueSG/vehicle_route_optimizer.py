@@ -936,6 +936,19 @@ def get_cached_geocode(address: str, token: str | None = None, use_onemap: bool 
     return result
 
 
+def get_stored_geocode(address: str) -> GeocodeResult:
+    """Read a geocode from the existing memory/disk cache without any network fallback."""
+
+    normalised = clean_text(address)
+    if not normalised:
+        return GeocodeResult(normalised, None, None, "cache only", "Missing address")
+    _load_geocode_disk_cache_once()
+    cached = GEOCODE_MEMORY_CACHE.get(normalised.casefold())
+    if cached is None or not cached.is_available:
+        return GeocodeResult(normalised, None, None, "cache only", "No cached coordinates")
+    return GeocodeResult(normalised, cached.latitude, cached.longitude, "OneMap cache", cached.error)
+
+
 def _parse_onemap_route(payload: dict[str, Any]) -> tuple[float | None, float | None]:
     summary = payload.get("route_summary") or payload.get("routeSummary") or {}
     distance_m = (
@@ -1681,7 +1694,14 @@ def adjust_empty_travel_for_public_transport(
     source = empty_cost.source
     if "public transport adjusted" not in source.lower():
         source = f"{source}, public transport adjusted"
-    return TravelCost(empty_cost.distance_km, adjusted_duration, source, empty_cost.error)
+    return TravelCost(
+        empty_cost.distance_km,
+        adjusted_duration,
+        source,
+        empty_cost.error,
+        route_text=empty_cost.route_text,
+        route_path=empty_cost.route_path,
+    )
 
 
 def _job_uploaded_row(job: dict[str, Any]) -> int:
@@ -1837,6 +1857,9 @@ def evaluate_explicit_rider_sequence(
     duration_buffer_multiplier: float = DEFAULT_DURATION_BUFFER_MULTIPLIER,
     empty_travel_duration_multiplier: float = DEFAULT_EMPTY_TRAVEL_DURATION_MULTIPLIER,
     empty_travel_wait_buffer_min: float = DEFAULT_EMPTY_TRAVEL_WAIT_BUFFER_MIN,
+    precomputed_loaded_costs: dict[str, TravelCost] | None = None,
+    precomputed_empty_costs: dict[tuple[str, str], TravelCost] | None = None,
+    route_lookup_stats: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     current_location = rider.start_location
     current_zone = rider.start_zone
@@ -1862,34 +1885,53 @@ def evaluate_explicit_rider_sequence(
     cluster_counts = {cluster_name: cluster_names.count(cluster_name) for cluster_name in set(cluster_names)}
 
     for sequence_index, job in enumerate(sequence, start=1):
+        job_id = stable_job_id_from_job(job)
         pickup_address = clean_text(job["Pickup Address"])
         dropoff_address = clean_text(job["Drop-off Address"])
         pickup_zone = _route_zone_for_job(job, "Pickup Address")
         dropoff_zone = _route_zone_for_job(job, "Drop-off Address")
         cluster_name = pickup_zone or dropoff_zone or "Unknown"
 
-        empty_cost = get_empty_travel_cost(
-            current_location,
-            pickup_address,
-            current_zone,
-            pickup_zone,
-            use_onemap=use_onemap,
-            token=token,
-            allow_walk=sequence_index > 1,
-        )
-        empty_cost = adjust_empty_travel_for_public_transport(
-            empty_cost,
-            duration_multiplier=empty_travel_duration_multiplier,
-            wait_buffer_min=empty_travel_wait_buffer_min,
-        )
-        loaded_cost = get_travel_cost(
-            pickup_address,
-            dropoff_address,
-            pickup_zone,
-            dropoff_zone,
-            use_onemap=use_onemap,
-            token=token,
-        )
+        precomputed_empty = (precomputed_empty_costs or {}).get((rider.name, job_id))
+        if precomputed_empty is not None:
+            empty_cost = precomputed_empty
+            if route_lookup_stats is not None:
+                route_lookup_stats["reused_empty"] = route_lookup_stats.get("reused_empty", 0) + 1
+        else:
+            empty_cost = get_empty_travel_cost(
+                current_location,
+                pickup_address,
+                current_zone,
+                pickup_zone,
+                use_onemap=use_onemap,
+                token=token,
+                allow_walk=sequence_index > 1,
+            )
+            empty_cost = adjust_empty_travel_for_public_transport(
+                empty_cost,
+                duration_multiplier=empty_travel_duration_multiplier,
+                wait_buffer_min=empty_travel_wait_buffer_min,
+            )
+            if route_lookup_stats is not None:
+                bucket = "cache_hits" if "cache" in empty_cost.source.casefold() else "onemap_requests" if "onemap" in empty_cost.source.casefold() else "fallback_routes"
+                route_lookup_stats[bucket] = route_lookup_stats.get(bucket, 0) + 1
+        precomputed_loaded = (precomputed_loaded_costs or {}).get(job_id)
+        if precomputed_loaded is not None:
+            loaded_cost = precomputed_loaded
+            if route_lookup_stats is not None:
+                route_lookup_stats["reused_loaded"] = route_lookup_stats.get("reused_loaded", 0) + 1
+        else:
+            loaded_cost = get_travel_cost(
+                pickup_address,
+                dropoff_address,
+                pickup_zone,
+                dropoff_zone,
+                use_onemap=use_onemap,
+                token=token,
+            )
+            if route_lookup_stats is not None:
+                bucket = "cache_hits" if "cache" in loaded_cost.source.casefold() else "onemap_requests" if "onemap" in loaded_cost.source.casefold() else "fallback_routes"
+                route_lookup_stats[bucket] = route_lookup_stats.get(bucket, 0) + 1
         route_zone_priority, same_zone_pickup, route_stays_current_zone = calculate_route_zone_priority(
             current_zone,
             pickup_zone,

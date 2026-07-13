@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import timezone
+from datetime import datetime, timezone
+import logging
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Query
@@ -19,15 +20,21 @@ settings = get_settings()
 db = Database(settings)
 engine = RequestEngine(db=db, settings=settings)
 worker = DueRequestWorker(engine)
+LOGGER = logging.getLogger(__name__)
+APPLICATION_STARTED_AT: datetime | None = None
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    global APPLICATION_STARTED_AT
+    APPLICATION_STARTED_AT = utc_now()
     worker.start()
+    LOGGER.info("AMS_COMPONENT=API FastAPI application is ready")
     try:
         yield
     finally:
         worker.stop()
+        LOGGER.info("AMS_COMPONENT=API FastAPI application stopped")
 
 
 app = FastAPI(title="Flexar WhatsApp Request Processor", version="0.3.0", lifespan=lifespan)
@@ -41,6 +48,11 @@ def _process(body: dict[str, Any]) -> dict[str, Any]:
     if len(results) == 1:
         result = results[0].model_dump()
         result.setdefault("display_state", display_state(result.get("container_state")))
+        LOGGER.info(
+            "AMS_COMPONENT=API Simulator event accepted; request=%s state=%s",
+            str(result.get("container_uuid") or "-")[:8],
+            result.get("container_state") or result.get("status") or "unknown",
+        )
         return result
     return {
         "status": "processed",
@@ -53,10 +65,29 @@ def _process(body: dict[str, Any]) -> dict[str, Any]:
 @app.get("/health")
 def health() -> dict[str, Any]:
     checks = engine.health()
+    pending_requests = db.fetch_one(
+        "SELECT COUNT(*) AS count FROM request_containers WHERE state IN ('COLLECTING', 'READY_WAITING_QUIET', 'DISPATCHING', 'PAUSED', 'NEEDS_REVIEW', 'MANUAL_REVIEW') AND deleted_at IS NULL"
+    )
+    failed_actions = db.fetch_one("SELECT COUNT(*) AS count FROM outbound_actions WHERE status = 'FAILED'")
+    last_simulator = db.fetch_one("SELECT MAX(received_at) AS received_at FROM incoming_events WHERE source = 'SIMULATOR'")
+    worker_online = worker.is_alive
     return {
+        "service": "ams-whatsapp-request-processor",
         "status": "ok" if checks["ok"] else "error",
         "database": checks["sqlite"],
+        "worker": {"status": "online" if worker_online else "offline", "running": worker_online},
+        "application_started_at": APPLICATION_STARTED_AT.isoformat() if APPLICATION_STARTED_AT else None,
+        "simulation_mode": settings.simulation_mode,
+        "waapi": {
+            "status": "disabled" if not settings.waapi_enabled else "configured",
+            "outbound_enabled": bool(settings.waapi_enabled and settings.waapi_outbound_enabled and not settings.simulation_mode),
+            "rider_reply_enabled": settings.waapi_rider_reply_enabled,
+            "ops_update_enabled": settings.waapi_ops_update_enabled,
+        },
         "mode": "simulation" if settings.simulation_mode or not settings.waapi_enabled else "waapi-enabled",
+        "pending_request_count": int((pending_requests or {}).get("count") or 0),
+        "failed_action_count": int((failed_actions or {}).get("count") or 0),
+        "last_inbound_simulator_event_at": (last_simulator or {}).get("received_at"),
         "timestamp": utc_now().isoformat(),
         "checks": checks,
     }
