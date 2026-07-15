@@ -32,7 +32,7 @@ def test_end_of_month(selected: datetime.date, expected: datetime.date) -> None:
     assert cfs_generator.end_of_month(selected) == expected
 
 
-def test_contract_context_always_formats_end_date_as_month_end() -> None:
+def test_contract_context_preserves_a_manually_selected_end_date() -> None:
     context = cfs_generator.build_contract_context(
         agreement_date=datetime.date(2026, 7, 30),
         contractor_name="Example Person",
@@ -45,7 +45,7 @@ def test_contract_context_always_formats_end_date_as_month_end() -> None:
         service_fee=20,
     )
 
-    assert context["end_date"] == "31 July 2026"
+    assert context["end_date"] == "30 July 2026"
 
 
 def test_bulk_generation_keeps_successes_after_a_row_failure_and_cleans_temp_dirs(

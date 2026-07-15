@@ -1,6 +1,5 @@
 import datetime
 import os
-from collections.abc import Callable
 
 import pandas as pd
 import streamlit as st
@@ -37,25 +36,6 @@ def clear_bulk_contracts():
     st.session_state.pop("bulk_contract_gen_failures", None)
     st.session_state.pop("bulk_contract_gen_success_count", None)
 
-
-def normalize_end_date_state(key: str, clear_output: Callable[[], None]) -> None:
-    """Move a selected CFS end date to its month's final calendar day."""
-    selected_date = st.session_state.get(key)
-    if isinstance(selected_date, datetime.date):
-        st.session_state[key] = end_of_month(selected_date)
-    clear_output()
-
-
-def sync_end_date_to_start(
-    start_key: str,
-    end_key: str,
-    clear_output: Callable[[], None],
-) -> None:
-    """Keep the default CFS end date at month-end when the start date changes."""
-    start_date = st.session_state.get(start_key)
-    if isinstance(start_date, datetime.date):
-        st.session_state[end_key] = end_of_month(start_date)
-    clear_output()
 
 def initial_bulk_contractors() -> pd.DataFrame:
     return pd.DataFrame(
@@ -124,8 +104,7 @@ def validate_bulk_shared_terms(
         errors.append("Service Start Time is required.")
     if not service_end_time:
         errors.append("Service End Time is required.")
-    normalized_end_date = end_of_month(end_date) if end_date else None
-    if start_date and normalized_end_date and normalized_end_date < start_date:
+    if start_date and end_date and end_date < start_date:
         errors.append("Service End Date cannot be earlier than Service Start Date.")
     if service_fee is None or service_fee <= 0:
         errors.append("Service Fee Per Completed Job must be greater than zero.")
@@ -233,21 +212,19 @@ def render_individual_contract_generator() -> None:
                 "Service Start Date",
                 value=datetime.date.today(),
                 key="c_start_date",
-                on_change=sync_end_date_to_start,
-                args=("c_start_date", "c_end_date", clear_generated_contract),
+                on_change=clear_generated_contract,
             )
             
             individual_end_date_options = {}
             if "c_end_date" not in st.session_state:
-                individual_end_date_options["value"] = end_of_month(start_date)
+                individual_end_date_options["value"] = end_of_month(datetime.date.today())
             end_date = st.date_input(
                 "Service End Date",
                 key="c_end_date",
-                on_change=normalize_end_date_state,
-                args=("c_end_date", clear_generated_contract),
+                on_change=clear_generated_contract,
                 **individual_end_date_options,
             )
-            st.caption("The service end date is always adjusted to the last day of its month.")
+            st.caption("Defaults to the end of this month; you can select any other date.")
             
             st.markdown('<div class="section-title">Actions & Verification</div>', unsafe_allow_html=True)
             st.write("Ensure all details are correct. Generating a contract will render a printable Word (.docx) document instantly in memory.")
@@ -260,7 +237,7 @@ def render_individual_contract_generator() -> None:
                 validation_error = "NRIC cannot be blank."
             elif not residential_address.strip():
                 validation_error = "Residential Address cannot be blank."
-            elif end_of_month(end_date) < start_date:
+            elif end_date < start_date:
                 validation_error = "Service End Date cannot be earlier than Service Start Date."
             elif service_fee < 0.0:
                 validation_error = "Service Fee must be a positive number."
@@ -361,25 +338,19 @@ def render_bulk_contract_generator() -> None:
                 "Service Start Date",
                 value=datetime.date.today(),
                 key="bulk_contract_gen_start_date",
-                on_change=sync_end_date_to_start,
-                args=(
-                    "bulk_contract_gen_start_date",
-                    "bulk_contract_gen_end_date",
-                    clear_bulk_contracts,
-                ),
+                on_change=clear_bulk_contracts,
             )
         with date_cols[2]:
             bulk_end_date_options = {}
             if "bulk_contract_gen_end_date" not in st.session_state:
-                bulk_end_date_options["value"] = end_of_month(bulk_start_date)
+                bulk_end_date_options["value"] = end_of_month(datetime.date.today())
             bulk_end_date = st.date_input(
                 "Service End Date",
                 key="bulk_contract_gen_end_date",
-                on_change=normalize_end_date_state,
-                args=("bulk_contract_gen_end_date", clear_bulk_contracts),
+                on_change=clear_bulk_contracts,
                 **bulk_end_date_options,
             )
-            st.caption("Automatically adjusted to the month's final day.")
+            st.caption("Defaults to the end of this month; you can select any other date.")
 
         term_cols = st.columns(3)
         with term_cols[0]:

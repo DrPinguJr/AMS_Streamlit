@@ -107,7 +107,7 @@ def build_contract_context(
         "nric": nric.strip().upper(),
         "residential_address": residential_address.strip(),
         "start_date": format_contract_date(start_date),
-        "end_date": format_contract_date(end_of_month(end_date)),
+        "end_date": format_contract_date(end_date),
         "service_start_time": format_contract_time(service_start_time),
         "service_end_time": format_contract_time(service_end_time),
         "service_fee": f"{service_fee:.2f}",
