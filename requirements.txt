@@ -9,7 +9,6 @@ openpyxl>=3.1
 python-docx>=1.1
 pdf2docx>=0.5.8
 docxtpl>=0.20.0
-pywin32>=306; platform_system == "Windows"
 
 # Flexar WhatsApp Request Processor module dependencies.
 fastapi

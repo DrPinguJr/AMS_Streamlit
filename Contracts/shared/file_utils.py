@@ -29,3 +29,12 @@ def create_zip_from_paths(files: list[tuple[Path, str]]) -> bytes:
             zip_file.write(path, arcname=archive_name)
     zip_buffer.seek(0)
     return zip_buffer.getvalue()
+
+
+def create_zip_from_bytes(files: list[tuple[str, bytes]]) -> bytes:
+    """Create an in-memory ZIP after generated files have left temporary storage."""
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+        for archive_name, content in files:
+            zip_file.writestr(archive_name, content)
+    return zip_buffer.getvalue()

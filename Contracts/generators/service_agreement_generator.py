@@ -177,7 +177,6 @@ def generate_service_agreement_pdf(data: dict) -> tuple[bytes, str]:
     with TemporaryDirectory(prefix="service_agreement_") as temp_dir_name:
         temp_dir = Path(temp_dir_name)
         docx_path = temp_dir / docx_filename
-        pdf_path = temp_dir / pdf_filename
         docx_path.write_bytes(docx_bytes)
-        convert_docx_to_pdf(docx_path, pdf_path)
+        pdf_path = convert_docx_to_pdf(docx_path, temp_dir)
         return pdf_path.read_bytes(), pdf_filename

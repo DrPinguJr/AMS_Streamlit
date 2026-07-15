@@ -49,6 +49,12 @@ Contract generators live under `Contracts/`.
 - Letter of Appointment template path: `Contracts/templates/LOA/gbh_loa_template.docx`
 - Permanent Placement Service Agreement template path: `Contracts/templates/Service_Agreement/permanent_placement_service_agreement_template.docx`
 
+## Streamlit Community Cloud Deployment
+
+Streamlit Community Cloud installs Python packages from `requirements.txt` and Linux system packages from `packages.txt`. Reboot the Streamlit app after adding or changing `packages.txt` so the system packages are installed.
+
+Contract PDF generation uses headless LibreOffice rather than Microsoft Word. The Liberation and DejaVu font packages provide Linux-compatible fallbacks for fonts referenced by the existing DOCX templates; the source templates are left unchanged.
+
 ## Useful Commands
 
 Run with hot reload:
