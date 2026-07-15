@@ -19,3 +19,5 @@ Flexar/BlueSG/cache/runtime/
 tools/_downloads/
 tools/LibreOfficePortable/
 tools/PortableApps/
+HR/RDL_Parsed/
+Lance/HRIQ_Report_Tool/logs/*.log*

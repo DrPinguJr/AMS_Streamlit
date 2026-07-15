@@ -1,0 +1,12 @@
+{
+  "search.exclude": {
+    "HR/RDL": true,
+    "HR/RDL_Parsed": true,
+    "C:\\Users\\HRteam\\Desktop\\Lance\\HR\\RDL": true,
+    "C:\\Users\\HRteam\\Desktop\\Lance\\HR\\RDL_Parsed": true
+  },
+  "files.watcherExclude": {
+    "**/HR/RDL/**": true,
+    "**/HR/RDL_Parsed/**": true
+  }
+}

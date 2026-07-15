@@ -20,6 +20,22 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CFS_TEMPLATE_PATH = PROJECT_ROOT / "Contracts" / "templates" / "CFS" / "AMS - CFS - REB - Template.docx"
 LOGGER = logging.getLogger(__name__)
 
+# Printable writing lines used when producing an unfilled copy of the contract.
+# Underscore characters are intentional: they remain visible in both Word and
+# printed copies, unlike underlined whitespace which Word may collapse.
+BLANK_CFS_CONTEXT = {
+    "agreement_date": "____________________",
+    "contractor_name": "________________________________________",
+    "nric": "____________________",
+    "residential_address": "____________________________________________________________",
+    "start_date": "____________________",
+    "end_date": "____________________",
+    "service_start_time": "____________",
+    "service_end_time": "____________",
+    "service_fee": "____________",
+}
+
+
 @dataclass(frozen=True)
 class BulkContractFailure:
     """One row that could not be rendered or converted during bulk generation."""
@@ -109,6 +125,11 @@ def generate_cfs_docx(context: dict, template_path: Path = CFS_TEMPLATE_PATH) ->
     template.save(output)
     output.seek(0)
     return output
+
+
+def generate_blank_cfs_docx(template_path: Path = CFS_TEMPLATE_PATH) -> BytesIO:
+    """Return a printable CFS form with writing lines in every fill-in field."""
+    return generate_cfs_docx(BLANK_CFS_CONTEXT, template_path)
 
 
 def ensure_no_unresolved_placeholders(docx_bytes: bytes) -> None:

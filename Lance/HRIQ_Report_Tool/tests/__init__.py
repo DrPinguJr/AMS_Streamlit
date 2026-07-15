@@ -1,0 +1,1 @@
+"""HRIQ Report Tool tests."""

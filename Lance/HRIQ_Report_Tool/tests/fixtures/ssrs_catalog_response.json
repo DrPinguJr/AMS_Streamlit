@@ -1,0 +1,7 @@
+{
+  "@odata.context": "https://example.invalid/Reports/api/v2.0/$metadata#CatalogItems",
+  "value": [
+    {"Id": "11111111-1111-1111-1111-111111111111", "Name": "CLAIMS", "Path": "/GOLDBELL/CLAIMS", "Type": "Folder", "Hidden": false},
+    {"Id": "22222222-2222-2222-2222-222222222222", "Name": "PreClaimForm", "Path": "/GOLDBELL/CLAIMS/PreClaimForm", "Type": "Report", "Hidden": false, "ModifiedDate": "2026-07-14T08:00:00Z", "ParentFolderId": "11111111-1111-1111-1111-111111111111"}
+  ]
+}

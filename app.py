@@ -49,6 +49,12 @@ rdl_management_studio = st.Page(
     title="RDL Management Studio",
     icon=":material/edit_document:",
 )
+hriq_report_tool = st.Page(
+    "Lance/HRIQ_Report_Tool/app.py",
+    title="HRIQ Report Tool",
+    icon=":material/analytics:",
+    url_path="hriq-report-tool",
+)
 
 pg = st.navigation(
     {
@@ -56,7 +62,7 @@ pg = st.navigation(
         "Lance": [tender, sesami, recruitment, converter, whatsapp],
         "Flexar": [bluesg, bluesg_map, whatsapp_request_processor],
         "Contracts": [cfs_generator, loa_generator, service_agreement_generator],
-        "HR": [rdl_management_studio],
+        "HR": [hriq_report_tool, rdl_management_studio],
     }
 )
 

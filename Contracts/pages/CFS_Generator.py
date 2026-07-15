@@ -9,6 +9,7 @@ from Contracts.generators.cfs_generator import (
     build_bulk_contract_batch,
     build_contract_context,
     end_of_month,
+    generate_blank_cfs_docx,
     generate_cfs_docx,
 )
 from Contracts.shared.batch_utils import normalize_dataframe
@@ -309,6 +310,23 @@ def render_individual_contract_generator() -> None:
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     width="stretch"
                 )
+
+            st.divider()
+            st.caption(
+                "Need a paper copy to complete by hand? Download the same CFS "
+                "template with writing lines in every fill-in field."
+            )
+            try:
+                blank_contract = generate_blank_cfs_docx().getvalue()
+                st.download_button(
+                    label="Download Empty CFS Form",
+                    data=blank_contract,
+                    file_name="AMS - CFS - REB - Empty Form.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    width="stretch",
+                )
+            except Exception as exc:
+                st.error(f"The empty CFS form could not be prepared: {exc}")
 
 def render_bulk_contract_generator() -> None:
     with st.container(border=True):
