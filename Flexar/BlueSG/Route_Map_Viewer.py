@@ -12,17 +12,13 @@ from typing import Any
 import pandas as pd
 import pydeck as pdk
 import streamlit as st
-import streamlit.components.v1 as components
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-ROUTE_BOARD_COMPONENT = components.declare_component(
-    "route_planner_assignment_board",
-    path=str(BASE_DIR / "route_board_component"),
-)
+from Flexar.BlueSG.route_board_registry import ROUTE_BOARD_COMPONENT
 
 from Flexar.BlueSG.vehicle_route_optimizer import (
     DEFAULT_DURATION_BUFFER_MULTIPLIER,
