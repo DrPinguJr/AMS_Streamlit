@@ -738,6 +738,10 @@ def build_sortable_board(
         clean_text(row.get("Rider Name")): pd.to_numeric(pd.Series([row.get("Max Jobs")]), errors="coerce").iloc[0]
         for _, row in rider_df.iterrows()
     }
+    starts_by_rider = {
+        clean_text(row.get("Rider Name")): clean_text(row.get("Start Location"))
+        for _, row in rider_df.iterrows()
+    }
     board: list[dict[str, Any]] = []
     header_to_lane: dict[str, str] = {}
     card_to_job_id: dict[str, str] = {}
@@ -752,6 +756,7 @@ def build_sortable_board(
         duration_label = "drop orders here" if lane == RESHUFFLE_POOL_LANE else ("not routed" if lane == UNASSIGNED_LANE else f"{duration:.0f} confirmed min")
         lock_icon = " 🔒" if lane in locked else (" 🔓" if lane not in {UNASSIGNED_LANE, RESHUFFLE_POOL_LANE} else "")
         header = f"{display_name} · {len(jobs)} orders · {duration_label}{warning} · lane-{lane_index:02d}{lock_icon}"
+        start_line = f"\nStart: {starts_by_rider.get(lane) or 'Address unavailable'}" if lane not in {UNASSIGNED_LANE, RESHUFFLE_POOL_LANE} else ""
         header_to_lane[header] = lane
         cards: list[str] = []
         for job_id in jobs:
@@ -765,7 +770,7 @@ def build_sortable_board(
         board.append(
             {
                 "header": header,
-                "display_header": f"{display_name} · {len(jobs)} orders · {duration_label}{warning}",
+                "display_header": f"{display_name} · {len(jobs)} orders · {duration_label}{warning}{start_line}",
                 "lane_id": lane,
                 "is_pool": lane == RESHUFFLE_POOL_LANE,
                 "items": cards,
@@ -785,27 +790,30 @@ def render_route_assignment_board(
     reshuffle_pool_job_ids: list[str] | None = None,
     board_revision: int = 0,
     return_metadata: bool = False,
-) -> dict[str, list[str]] | tuple[dict[str, list[str]] | None, list[str] | None] | None:
+    can_reshuffle_from_pool: bool = False,
+) -> dict[str, list[str]] | tuple[dict[str, list[str]] | None, list[str] | None, str] | None:
     board, header_to_lane, card_to_job_id, lane_order = build_sortable_board(
         assignment, jobs_by_id, summary_df, rider_df, locked_rider_ids, reshuffle_pool_job_ids
     )
     component_value = ROUTE_BOARD_COMPONENT(
         board=board,
         locked_rider_ids=sorted(locked_rider_ids or []),
+        can_reshuffle=bool(can_reshuffle_from_pool),
         key=f"route_planner_board_{assignment_signature(assignment)}_{assignment_signature({'locked': sorted(locked_rider_ids or []), 'pool': sorted(reshuffle_pool_job_ids or [])})}_{board_revision}",
         default=None,
     )
     if not isinstance(component_value, dict):
-        return (None, None) if return_metadata else None
+        return (None, None, "") if return_metadata else None
     raw_board = component_value.get("board")
     returned_locks = [clean_text(rider) for rider in component_value.get("locked_rider_ids", []) if clean_text(rider)]
+    component_event = clean_text(component_value.get("event"))
     try:
         normalised = normalise_assignment_board(raw_board, header_to_lane, card_to_job_id, lane_order)
-        return (normalised, returned_locks) if return_metadata else normalised
+        return (normalised, returned_locks, component_event) if return_metadata else normalised
     except ValueError as exc:
         LOGGER.warning("Route planner component validation failed: %s", exc)
         st.error(str(exc))
-        return (None, returned_locks) if return_metadata else None
+        return (None, returned_locks, component_event) if return_metadata else None
 
 
 def _assignment_positions(assignment: dict[str, list[str]]) -> dict[str, tuple[str, int]]:
@@ -1288,6 +1296,7 @@ def render_map_planner_focus(
             )
             apply_clicked = bar[6].button("Apply Routes & Return", type="primary", disabled=not dirty, width="stretch")
             exit_clicked = bar[7].button("Exit With Draft Saved", width="stretch")
+        reshuffle_requested = bool(st.session_state.pop("route_planner_reshuffle_requested", False))
 
         if exit_clicked:
             st.session_state["route_planner_focus_mode"] = False
@@ -1315,7 +1324,7 @@ def render_map_planner_focus(
                 LOGGER.info("Route planner focus %s", "undo" if undo_clicked else "redo")
                 st.rerun()
 
-        if reshuffle_clicked:
+        if reshuffle_clicked or reshuffle_requested:
             with st.spinner("Searching bounded unlocked-rider alternatives..."):
                 reshuffle = reshuffle_unlocked_assignments(
                     draft_assignment,
@@ -1324,18 +1333,23 @@ def render_map_planner_focus(
                     rider_df,
                     jobs_df,
                     eligible_job_ids=pool_job_ids,
+            )
+            if reshuffle.changed:
+                _store_draft_change(
+                    draft_assignment,
+                    reshuffle.assignment,
+                    confirmed_assignment,
+                    rider_starts,
+                    record_manual=False,
                 )
-            st.session_state["route_planner_reshuffle_notice"] = reshuffle.message
-            if reshuffle.changed and _store_draft_change(
-                draft_assignment,
-                reshuffle.assignment,
-                confirmed_assignment,
-                rider_starts,
-                record_manual=False,
-            ):
-                st.session_state["route_planner_reshuffle_pool_job_ids"] = []
+                st.session_state["route_planner_reshuffle_notice"] = reshuffle.message
                 LOGGER.info("Route planner reshuffle stats=%s", reshuffle.stats)
-                st.rerun()
+            else:
+                st.session_state["route_planner_reshuffle_notice"] = f"{reshuffle.message} Pool cleared; orders returned unchanged."
+                st.session_state["route_planner_board_revision"] = int(st.session_state.get("route_planner_board_revision", 0)) + 1
+                LOGGER.info("Route planner reshuffle unchanged stats=%s message=%s", reshuffle.stats, reshuffle.message)
+            st.session_state["route_planner_reshuffle_pool_job_ids"] = []
+            st.rerun()
 
         if refresh_clicked:
             try:
@@ -1402,7 +1416,7 @@ def render_map_planner_focus(
                     st.rerun()
 
         with st.container(key="route_planner_focus_workspace", height="stretch", width="stretch"):
-            map_col, panel_col = st.columns([1.7, 1], gap="small")
+            map_col, panel_col = st.columns([1.2, 1], gap="small")
             with map_col:
                 with st.container(key="route_planner_focus_map", height="stretch", width="stretch"):
                     pending_count, reused_count, map_warnings = render_focus_green_map(
@@ -1448,7 +1462,7 @@ def render_map_planner_focus(
                             if st.checkbox(rider, key=key):
                                 selected_riders.append(rider)
                         st.session_state["route_planner_visible_riders"] = selected_riders
-                    proposed, component_locks = render_route_assignment_board(
+                    proposed, component_locks, component_event = render_route_assignment_board(
                         draft_assignment,
                         jobs_by_id,
                         state["summary_df"],
@@ -1458,7 +1472,12 @@ def render_map_planner_focus(
                         reshuffle_pool_job_ids=pool_job_ids,
                         board_revision=int(st.session_state.get("route_planner_board_revision", 0)),
                         return_metadata=True,
+                        can_reshuffle_from_pool=can_reshuffle,
                     )
+                    if component_event == "reshuffle":
+                        st.session_state["route_planner_reshuffle_requested"] = True
+                        st.session_state["route_planner_board_revision"] = int(st.session_state.get("route_planner_board_revision", 0)) + 1
+                        st.rerun()
                     if component_locks is not None and set(component_locks) != set(locked_riders):
                         next_locks, next_baselines = normalise_rider_locks(
                             component_locks,

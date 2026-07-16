@@ -77,6 +77,25 @@ def test_focus_layout_exposes_locking_reshuffle_and_three_route_colours() -> Non
     assert "RESHUFFLE_POOL_LANE" in viewer
 
 
+def test_rider_panel_is_wide_and_pool_has_local_reshuffle_action() -> None:
+    source = current_focus_source()
+    component = (VIEWER.parent / "route_board_component" / "index.html").read_text(encoding="utf-8")
+    assert "st.columns([1.2, 1]" in source
+    assert "Reshuffle into unlocked riders" in component
+    assert 'emit("reshuffle")' in component
+    assert "Pool cleared; orders returned unchanged." in source
+    assert 'route_planner_reshuffle_pool_job_ids"] = []' in source
+    assert "font-size: .88rem" in component
+    assert "font-size: .82rem" in component
+
+
+def test_rider_headers_include_exact_start_location() -> None:
+    viewer = VIEWER.read_text(encoding="utf-8")
+    board_builder = viewer.split("def build_sortable_board", 1)[1].split("def render_route_assignment_board", 1)[0]
+    assert 'row.get("Start Location")' in board_builder
+    assert 'Start: {starts_by_rider.get(lane)' in board_builder
+
+
 def test_loaded_workbook_enters_focus_and_reruns_before_summary() -> None:
     viewer = VIEWER.read_text(encoding="utf-8")
     flow = viewer.split("def run_route_planner_screen_flow()", 1)[1].split("run_route_planner_screen_flow()", 1)[0]
