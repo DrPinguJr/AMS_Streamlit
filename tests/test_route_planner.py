@@ -11,9 +11,12 @@ from Flexar.BlueSG.route_planner import (
     UNASSIGNED_LANE,
     assignment_from_routes,
     build_planner_session_state,
+    build_draft_connector_lines,
+    build_rider_access_paths,
     build_focus_map_data,
     build_compact_rider_summary,
     build_route_leg_signatures,
+    clone_assignment,
     derive_sequences_from_assignment,
     detect_affected_riders,
     detect_changed_route_legs,
@@ -25,14 +28,18 @@ from Flexar.BlueSG.route_planner import (
     draft_assignment_signature,
     invalidate_red_preview,
     matching_red_preview_routes,
+    normalise_rider_locks,
     normalise_assignment_board,
     refresh_red_connector_preview,
+    record_manual_job_moves,
     renderable_red_preview_routes,
     redo_draft,
     reset_draft,
+    reshuffle_unlocked_assignments,
     undo_draft,
     update_draft_history,
     validate_assignment_board,
+    validate_locked_rider_change,
 )
 from Flexar.BlueSG.vehicle_route_optimizer import (
     GeocodeResult,
@@ -155,6 +162,197 @@ def test_undo_redo_and_reset_transitions(planner_data) -> None:
     assert changed and current == original and redo == []
 
 
+def test_locked_rider_sequence_is_strictly_immutable(planner_data) -> None:
+    _, _, ids, original, _ = planner_data
+    proposed = {
+        "Lester": [ids["SPE1001A"]],
+        "Syed": [ids["SPE1003C"], ids["SPE1002B"]],
+        UNASSIGNED_LANE: [],
+    }
+    validation = validate_locked_rider_change(original, proposed, ["Lester"])
+    assert not validation.is_valid
+    assert "Lester" in validation.errors[0]
+    assert validate_locked_rider_change(original, proposed, ["Syed"]).is_valid is False
+
+
+def test_lock_state_removes_stale_riders_and_captures_baseline(planner_data) -> None:
+    _, _, _, original, _ = planner_data
+    locked, baselines = normalise_rider_locks(
+        ["Missing", "Lester"], ["Lester", "Syed"], original, {"Missing": ["old"]}
+    )
+    assert locked == ["Lester"]
+    assert baselines == {"Lester": original["Lester"]}
+
+
+def test_manual_move_history_preserves_first_origin(planner_data) -> None:
+    _, _, ids, original, _ = planner_data
+    moved = {
+        "Lester": [ids["SPE1001A"]],
+        "Syed": [ids["SPE1003C"], ids["SPE1002B"]],
+        UNASSIGNED_LANE: [],
+    }
+    history = record_manual_job_moves(original, moved)
+    returned = record_manual_job_moves(moved, original, history)
+    assert returned[ids["SPE1002B"]]["origin_rider_id"] == "Lester"
+    assert returned[ids["SPE1002B"]]["last_to_rider_id"] == "Lester"
+
+
+def test_purple_draft_connector_appears_immediately_for_changed_legs(planner_data) -> None:
+    jobs_df, rider_df, ids, original, _ = planner_data
+    starts = dict(zip(rider_df["Rider Name"], rider_df["Start Location"]))
+    coordinates = {
+        "Tampines": [103.94, 1.35], "Bedok": [103.93, 1.32], "Simei": [103.95, 1.34],
+        "Pasir Ris": [103.95, 1.37], "Yishun": [103.84, 1.43], "Woodlands": [103.79, 1.44],
+    }
+    unchanged = build_draft_connector_lines(
+        original, original, jobs_df, starts, coordinate_lookup=coordinates.get
+    )
+    assert unchanged.route_df.empty
+    draft = {
+        "Lester": [ids["SPE1001A"]],
+        "Syed": [ids["SPE1003C"], ids["SPE1002B"]],
+        UNASSIGNED_LANE: [],
+    }
+    changed = build_draft_connector_lines(
+        original, draft, jobs_df, starts, coordinate_lookup=coordinates.get
+    )
+    assert not changed.route_df.empty
+    assert set(changed.route_df["geometry_source"]) == {"draft_straight_line"}
+    assert changed.route_df.iloc[0]["color"] == [168, 85, 247, 235]
+
+
+def test_purple_connectors_cover_middle_insert_and_removed_gap(planner_data) -> None:
+    jobs_df, rider_df, ids, _, _ = planner_data
+    starts = dict(zip(rider_df["Rider Name"], rider_df["Start Location"]))
+    coordinates = {
+        "Tampines": [103.94, 1.35], "Bedok": [103.93, 1.32], "Simei": [103.95, 1.34],
+        "Pasir Ris": [103.95, 1.37], "Yishun": [103.84, 1.43], "Woodlands": [103.79, 1.44],
+    }
+    a, b, c = ids["SPE1001A"], ids["SPE1002B"], ids["SPE1003C"]
+    before_insert = {"Lester": [a, c], "Syed": [b], UNASSIGNED_LANE: []}
+    after_insert = {"Lester": [a, b, c], "Syed": [], UNASSIGNED_LANE: []}
+    inserted = build_draft_connector_lines(
+        before_insert, after_insert, jobs_df, starts, coordinate_lookup=coordinates.get
+    )
+    assert {(row["Rider"], row["Job ID"]) for _, row in inserted.route_df.iterrows()} >= {
+        ("Lester", b), ("Lester", c)
+    }
+    removed = build_draft_connector_lines(
+        after_insert, before_insert, jobs_df, starts, coordinate_lookup=coordinates.get
+    )
+    closed_gap = removed.route_df[(removed.route_df["Rider"] == "Lester") & (removed.route_df["Job ID"] == c)]
+    assert len(closed_gap) == 1
+    assert closed_gap.iloc[0]["path"] == [coordinates["Bedok"], coordinates["Yishun"]]
+
+
+def test_red_rider_access_uses_confirmed_public_transport_then_cache(planner_data) -> None:
+    jobs_df, rider_df, ids, original, routes = planner_data
+    starts = dict(zip(rider_df["Rider Name"], rider_df["Start Location"]))
+    first = routes[routes["Car Plate"] == "SPE1001A"].index[0]
+    routes.loc[first, "Start From"] = "Tampines"
+    routes.loc[first, "Empty Route Path"] = json.dumps([[103.94, 1.35], [103.941, 1.351]])
+    coordinates = {"Tampines": [103.94, 1.35], "Yishun": [103.84, 1.43], "SPE": [0, 0]}
+    for address in jobs_df["Pickup Address"]:
+        coordinates.setdefault(address, [103.9 + len(coordinates) / 1000, 1.3])
+    result = build_rider_access_paths(
+        original, ["Lester"], routes, pd.DataFrame(), jobs_df, starts, {}, coordinate_lookup=coordinates.get
+    )
+    assert result.route_df.iloc[0]["geometry_source"] == "cached_public_transport"
+    assert result.route_df.iloc[0]["color"] == [239, 68, 68, 235]
+    cached = build_rider_access_paths(
+        original, ["Lester"], pd.DataFrame(), pd.DataFrame(), jobs_df, starts, result.cache,
+        coordinate_lookup=coordinates.get,
+    )
+    assert cached.route_df.iloc[0]["geometry_source"] == "cached_public_transport"
+
+
+def test_red_rider_access_falls_back_without_network_and_changes_with_first_job(planner_data) -> None:
+    jobs_df, rider_df, ids, original, _ = planner_data
+    starts = dict(zip(rider_df["Rider Name"], rider_df["Start Location"]))
+    coordinates = {address: [103.8 + index / 100, 1.3 + index / 100] for index, address in enumerate(
+        ["Tampines", "Yishun", *jobs_df["Pickup Address"].tolist()]
+    )}
+    initial = build_rider_access_paths(
+        original, ["Lester"], pd.DataFrame(), pd.DataFrame(), jobs_df, starts, {},
+        coordinate_lookup=coordinates.get,
+    )
+    reordered = {**original, "Lester": list(reversed(original["Lester"]))}
+    changed = build_rider_access_paths(
+        reordered, ["Lester"], pd.DataFrame(), pd.DataFrame(), jobs_df, starts, initial.cache,
+        coordinate_lookup=coordinates.get,
+    )
+    assert initial.route_df.iloc[0]["geometry_source"] == "fallback_straight_line"
+    assert changed.route_df.iloc[0]["Job ID"] == ids["SPE1002B"]
+    assert changed.route_df.iloc[0]["path"] != initial.route_df.iloc[0]["path"]
+
+
+def test_missing_access_coordinates_fail_safely_without_mutating_assignment(planner_data) -> None:
+    jobs_df, rider_df, _, original, _ = planner_data
+    starts = dict(zip(rider_df["Rider Name"], rider_df["Start Location"]))
+    before = clone_assignment(original)
+    result = build_rider_access_paths(
+        original, ["Lester", "Syed"], pd.DataFrame(), pd.DataFrame(), jobs_df, starts, {},
+        coordinate_lookup=lambda _address: None,
+    )
+    assert result.route_df.empty
+    assert len(result.warnings) == 2
+    assert original == before
+
+
+def test_reshuffle_wrapper_preserves_locks_and_assignment_integrity(planner_data) -> None:
+    jobs_df, rider_df, ids, original, _ = planner_data
+    rider_df = pd.concat([
+        rider_df,
+        pd.DataFrame([{"Rider Name": "Alex", "Start Location": "Bedok", "Start Zone": "East", "Max Jobs": 5, "Rider Load": "Medium"}]),
+    ], ignore_index=True)
+    draft = {**original, "Alex": []}
+
+    def fake_search(sequences, *args, **kwargs):
+        assert kwargs["locked_riders"] == {"Lester"}
+        assert kwargs["origin_rider_by_job"][ids["SPE1003C"]] == "Syed"
+        proposed = {rider: list(jobs) for rider, jobs in sequences.items()}
+        proposed["Syed"] = []
+        proposed["Alex"] = [ids["SPE1003C"]]
+        return {"success": True, "proposed_sequences": proposed, "candidate_count": 4, "plan_score": 10}
+
+    result = reshuffle_unlocked_assignments(
+        draft,
+        ["Lester"],
+        {ids["SPE1003C"]: {"origin_rider_id": "Syed"}},
+        rider_df,
+        jobs_df,
+        search_fn=fake_search,
+    )
+    assert result.changed
+    assert result.assignment["Lester"] == draft["Lester"]
+    assert sorted(job for jobs in result.assignment.values() for job in jobs) == sorted(
+        job for jobs in draft.values() for job in jobs
+    )
+    current, undo, redo, changed = update_draft_history(draft, result.assignment, [], [])
+    assert changed
+    current, undo, redo, _ = undo_draft(current, undo, redo)
+    assert current == draft
+    current, undo, redo, _ = redo_draft(current, undo, redo)
+    assert current == result.assignment
+
+
+def test_origin_return_penalty_is_soft_but_material_and_origin_remains_feasible() -> None:
+    summary = pd.DataFrame([{"Adjusted Route Duration Min": 100.0}])
+    original = {"A": ["job"], "B": []}
+    origin = optimizer._selective_plan_result(
+        original, original, pd.DataFrame(), summary, 100.0, {"job"}, 1,
+        changed_rider_penalty=0, moved_job_penalty=0, sequence_change_penalty=0,
+        origin_rider_by_job={"job": "A"}, origin_return_penalty=20,
+    )
+    away = optimizer._selective_plan_result(
+        original, {"A": [], "B": ["job"]}, pd.DataFrame(), summary, 100.0, {"job"}, 2,
+        changed_rider_penalty=0, moved_job_penalty=0, sequence_change_penalty=0,
+        origin_rider_by_job={"job": "A"}, origin_return_penalty=20,
+    )
+    assert origin["success"] and origin["origin_return_count"] == 1
+    assert origin["plan_score"] == away["plan_score"] + 20
+
+
 def test_route_leg_signatures_only_change_necessary_connector(planner_data) -> None:
     jobs_df, rider_df, ids, original, _ = planner_data
     jobs = build_jobs_by_stable_id(jobs_df)
@@ -251,6 +449,9 @@ def test_new_workbook_session_payload_clears_stale_history(planner_data) -> None
     assert payload["route_planner_undo_stack"] == []
     assert payload["route_planner_redo_stack"] == []
     assert payload["route_planner_is_dirty"] is False
+    assert payload["route_planner_locked_rider_ids"] == []
+    assert payload["route_planner_manual_move_history"] == {}
+    assert payload["route_planner_rider_access_cache"] == {}
 
 
 def test_unapplied_draft_is_distinct_from_confirmed_for_export_guard(planner_data) -> None:
@@ -379,6 +580,8 @@ def test_focus_success_failure_and_exit_state_are_atomic(planner_data) -> None:
     success = focus_apply_success_state(assignment, result)
     assert success["route_planner_focus_mode"] is False
     assert success["route_planner_is_dirty"] is False
+    assert success["route_planner_manual_move_history"] == {}
+    assert success["route_planner_draft_connectors"].empty
     failed = focus_apply_failure_state(payload)
     assert failed["route_planner_focus_mode"] is True
     assert failed["route_planner_draft_assignment"] == payload["route_planner_draft_assignment"]

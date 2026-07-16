@@ -50,6 +50,8 @@ from Flexar.BlueSG.route_planner import (
     UNASSIGNED_LANE,
     assignment_from_routes,
     build_focus_map_data,
+    build_draft_connector_lines,
+    build_rider_access_paths,
     build_compact_rider_summary,
     build_planner_session_state,
     build_draft_preview_routes,
@@ -65,13 +67,16 @@ from Flexar.BlueSG.route_planner import (
     invalidate_red_preview,
     matching_red_preview_routes,
     normalise_assignment_board,
+    normalise_rider_locks,
+    record_manual_job_moves,
     refresh_red_connector_preview,
-    renderable_red_preview_routes,
     redo_draft,
     reset_draft,
+    reshuffle_unlocked_assignments,
     undo_draft,
     update_draft_history,
     validate_assignment_board,
+    validate_locked_rider_change,
 )
 
 try:
@@ -716,6 +721,7 @@ def build_sortable_board(
     jobs_by_id: dict[str, dict[str, Any]],
     summary_df: pd.DataFrame,
     rider_df: pd.DataFrame,
+    locked_rider_ids: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, str], dict[str, str], list[str]]:
     """Build display-only strings with exact reversible mappings to stable IDs."""
 
@@ -728,6 +734,7 @@ def build_sortable_board(
     board: list[dict[str, Any]] = []
     header_to_lane: dict[str, str] = {}
     card_to_job_id: dict[str, str] = {}
+    locked = set(locked_rider_ids or [])
     for lane_index, lane in enumerate(lane_order, start=1):
         jobs = assignment.get(lane, [])
         display_name = "Unassigned" if lane == UNASSIGNED_LANE else lane
@@ -736,17 +743,14 @@ def build_sortable_board(
         over_jobs = lane != UNASSIGNED_LANE and pd.notna(max_jobs) and float(max_jobs) > 0 and len(jobs) > int(max_jobs)
         warning = " ⚠" if over_jobs or duration > 180 or lane == UNASSIGNED_LANE and jobs else ""
         duration_label = "not routed" if lane == UNASSIGNED_LANE else f"{duration:.0f} confirmed min"
-        header = f"{display_name} · {len(jobs)} jobs · {duration_label}{warning} · lane-{lane_index:02d}"
+        lock_icon = " 🔒" if lane in locked else (" 🔓" if lane != UNASSIGNED_LANE else "")
+        header = f"{display_name} · {len(jobs)} jobs · {duration_label}{warning} · lane-{lane_index:02d}{lock_icon}"
         header_to_lane[header] = lane
         cards: list[str] = []
         for job_id in jobs:
             job = jobs_by_id[job_id]
             token = hashlib.sha1(job_id.encode("utf-8")).hexdigest()[:7]
-            card = (
-                f"{clean_text(job.get('Car Plate')) or 'No plate'}  · {token}\n"
-                f"{short_location(job.get('Pickup Address'))}\n"
-                f"→ {short_location(job.get('Drop-off Address'))}"
-            )
+            card = f"{clean_text(job.get('Car Plate')) or 'No plate'} · {token}\n{short_location(job.get('Pickup Address'), 27)} → {short_location(job.get('Drop-off Address'), 27)}"
             while card in card_to_job_id:
                 card += "·"
             card_to_job_id[card] = job_id
@@ -762,13 +766,15 @@ def render_route_assignment_board(
     rider_df: pd.DataFrame,
     *,
     dark_mode: bool = False,
+    locked_rider_ids: list[str] | None = None,
+    board_revision: int = 0,
 ) -> dict[str, list[str]] | None:
     if sort_items is None:
         st.error("Drag-and-drop planner dependency is missing. Install project requirements and restart Streamlit.")
         st.code(r".\.venv\Scripts\python.exe -m pip install -r requirements.txt")
         return None
     board, header_to_lane, card_to_job_id, lane_order = build_sortable_board(
-        assignment, jobs_by_id, summary_df, rider_df
+        assignment, jobs_by_id, summary_df, rider_df, locked_rider_ids
     )
     custom_style = """
     .sortable-component { padding: 0; }
@@ -781,11 +787,12 @@ def render_route_assignment_board(
     """
     if dark_mode:
         custom_style = """
-        .sortable-component { display: flex !important; flex-direction: column !important; flex-wrap: nowrap !important; align-items: stretch !important; width: 100% !important; padding: 0; background: #111827; color: #e5e7eb; }
+        html, body { height: 100%; margin: 0; overflow: hidden; background: #111827; }
+        .sortable-component { display: flex !important; flex-direction: column !important; flex-wrap: nowrap !important; align-items: stretch !important; width: 100% !important; height: calc(100dvh - 238px) !important; min-height: 210px; overflow-y: auto !important; overflow-x: hidden !important; overscroll-behavior: contain; scrollbar-gutter: stable; padding: 0 .2rem .8rem 0; background: #111827; color: #e5e7eb; }
         .sortable-container { display: block !important; flex: 0 0 auto !important; width: 100% !important; min-width: 100% !important; max-width: 100% !important; box-sizing: border-box !important; border: 1px solid #374151; border-radius: 9px; margin: 0 0 .55rem 0 !important; background: #111827; overflow: hidden; }
         .sortable-container-header { padding: .48rem .6rem; background: #1f2937; color: #f9fafb; font-weight: 700; font-size: .78rem; line-height: 1.2; }
         .sortable-container-body { display: flex !important; flex-direction: column !important; flex-wrap: nowrap !important; width: 100% !important; min-height: 38px; padding: .3rem; box-sizing: border-box !important; background: #111827; counter-reset: item; }
-        .sortable-item, .sortable-item:hover { display: block !important; flex: 0 0 auto !important; width: 100% !important; max-width: 100% !important; box-sizing: border-box !important; white-space: pre-line; border: 1px solid #4b5563; border-radius: 7px; background: #182235; color: #e5e7eb; padding: .42rem .5rem; margin: .25rem 0; font-size: .74rem; line-height: 1.25; cursor: grab; counter-increment: item; box-shadow: none; }
+        .sortable-item, .sortable-item:hover { display: block !important; flex: 0 0 auto !important; width: 100% !important; max-width: 100% !important; box-sizing: border-box !important; white-space: pre-line; border: 1px solid #4b5563; border-radius: 7px; background: #182235; color: #e5e7eb; padding: .34rem .45rem; margin: .2rem 0; font-size: .72rem; line-height: 1.2; cursor: grab; counter-increment: item; box-shadow: none; touch-action: none; }
         .sortable-item:hover { border-color: #10b981; background: #1d2b3f; }
         .sortable-item::before { content: counter(item) ". "; font-weight: 800; color: #34d399; }
         """
@@ -794,7 +801,7 @@ def render_route_assignment_board(
         multi_containers=True,
         direction="vertical",
         custom_style=custom_style,
-        key=f"route_planner_board_{assignment_signature(assignment)}",
+        key=f"route_planner_board_{assignment_signature(assignment)}_{assignment_signature({'locked': sorted(locked_rider_ids or [])})}_{board_revision}",
     )
     try:
         return normalise_assignment_board(raw_board, header_to_lane, card_to_job_id, lane_order)
@@ -817,6 +824,8 @@ def _store_draft_change(
     proposed: dict[str, list[str]],
     confirmed: dict[str, list[str]],
     rider_starts: dict[str, str],
+    *,
+    record_manual: bool = True,
 ) -> bool:
     updated, undo_stack, redo_stack, changed = update_draft_history(
         before,
@@ -841,6 +850,15 @@ def _store_draft_change(
         )
     )
     st.session_state["route_planner_preview_error"] = ""
+    if record_manual:
+        st.session_state["route_planner_manual_move_history"] = record_manual_job_moves(
+            before,
+            updated,
+            st.session_state.get("route_planner_manual_move_history", {}),
+        )
+    st.session_state["route_planner_board_revision"] = int(
+        st.session_state.get("route_planner_board_revision", 0)
+    ) + 1
     before_positions = _assignment_positions(before)
     after_positions = _assignment_positions(updated)
     for job_id in sorted(set(before_positions) | set(after_positions)):
@@ -859,13 +877,26 @@ def render_focus_green_map(
     visible_riders: list[str],
     confirmed_routes: pd.DataFrame,
     jobs_df: pd.DataFrame,
+    confirmed_assignment: dict[str, list[str]] | None = None,
+    rider_starts: dict[str, str] | None = None,
     preview_routes: pd.DataFrame | None = None,
-    stale_preview_riders: list[str] | None = None,
-    show_red_preview: bool = False,
-) -> tuple[int, int]:
-    """Render cached loaded legs only. No geocoding or routing is performed here."""
+    rider_access_cache: dict[str, dict[str, Any]] | None = None,
+) -> tuple[int, int, tuple[str, ...]]:
+    """Render green jobs, red rider access, and immediate purple draft connectors."""
 
     focus_data = build_focus_map_data(draft_assignment, visible_riders, confirmed_routes, jobs_df)
+    starts = rider_starts or {}
+    access = build_rider_access_paths(
+        draft_assignment, visible_riders, confirmed_routes, preview_routes, jobs_df, starts, rider_access_cache
+    )
+    connectors = build_draft_connector_lines(
+        confirmed_assignment or draft_assignment, draft_assignment, jobs_df, starts
+    )
+    st.session_state["route_planner_rider_access_cache"] = access.cache
+    connector_df = connectors.route_df
+    if not connector_df.empty:
+        connector_df = connector_df[connector_df["Rider"].isin(set(visible_riders))].copy()
+    st.session_state["route_planner_draft_connectors"] = connector_df
     layers: list[pdk.Layer] = []
     if not focus_data.route_df.empty:
         layers.append(
@@ -879,31 +910,30 @@ def render_focus_green_map(
                 pickable=True,
             )
         )
-    if show_red_preview and preview_routes is not None and not preview_routes.empty:
-        red_df = renderable_red_preview_routes(preview_routes, visible_riders, stale_preview_riders or [])
-        if not red_df.empty:
-            red_df["path"] = red_df["Route Path"].apply(parse_route_path)
-            red_df = red_df[red_df["path"].apply(lambda path: len(path) >= 2)]
-            red_df["color"] = [[239, 68, 68, 220]] * len(red_df)
-            red_df["tooltip"] = red_df.apply(
-                lambda row: (
-                    f"{row['Rider']}<br/>Connector to job {row['Sequence']}<br/>"
-                    f"{row['Start Label']} → {row['End Label']}<br/>"
-                    f"{row['Distance KM']} km, {row['Duration Min']} min<br/>{row['Source']}"
-                ),
-                axis=1,
+    if not access.route_df.empty:
+        layers.append(
+            pdk.Layer(
+                "PathLayer",
+                access.route_df,
+                id="focus-red-rider-access",
+                get_path="path",
+                get_color="color",
+                width_min_pixels=4,
+                pickable=True,
             )
-            layers.append(
-                pdk.Layer(
-                    "PathLayer",
-                    red_df,
-                    id="focus-red-connector-preview",
-                    get_path="path",
-                    get_color="color",
-                    width_min_pixels=4,
-                    pickable=True,
-                )
+        )
+    if not connector_df.empty:
+        layers.append(
+            pdk.Layer(
+                "PathLayer",
+                connector_df,
+                id="focus-purple-draft-connectors",
+                get_path="path",
+                get_color="color",
+                width_min_pixels=3,
+                pickable=True,
             )
+        )
     if not focus_data.marker_df.empty:
         layers.append(
             pdk.Layer(
@@ -936,7 +966,8 @@ def render_focus_green_map(
             width="stretch",
             key="route_planner_focus_map_chart",
         )
-    return len(focus_data.pending_job_ids), len(focus_data.route_df)
+    warnings = tuple(dict.fromkeys([*access.warnings, *connectors.warnings]))
+    return len(focus_data.pending_job_ids), len(focus_data.route_df), warnings
 
 
 def _commit_recalculation_result(state: dict[str, Any], draft_assignment: dict[str, list[str]], result: Any) -> None:
@@ -1132,7 +1163,7 @@ def _render_map_planner_focus_legacy(
 
     with map_col:
         st.caption("Loaded job routes only · blue pickup · orange drop-off · connectors hidden while editing")
-        pending_count, reused_count = render_focus_green_map(
+        pending_count, reused_count, _ = render_focus_green_map(
             draft_assignment,
             list(st.session_state.get("route_planner_visible_riders", rider_names)),
             confirmed_routes,
@@ -1181,8 +1212,9 @@ def render_map_planner_focus(
         .st-key-route_planner_focus_workspace, .st-key-route_planner_focus_workspace > div[data-testid="stVerticalBlock"], .st-key-route_planner_focus_workspace [data-testid="stHorizontalBlock"], .st-key-route_planner_focus_workspace [data-testid="stColumn"] { width: 100% !important; height: 100% !important; min-height: 0 !important; overflow: hidden !important; }
         .st-key-route_planner_focus_workspace [data-testid="stHorizontalBlock"] { gap: 8px !important; padding: 8px; align-items: stretch !important; }
         .st-key-route_planner_focus_map, .st-key-route_planner_focus_map > div[data-testid="stVerticalBlock"], .st-key-route_planner_focus_map [data-testid="stDeckGlJsonChart"], .st-key-route_planner_focus_map [data-testid="stDeckGlJsonChart"] > div { width: 100% !important; height: 100% !important; min-height: 0 !important; overflow: hidden !important; }
-        .st-key-route_planner_focus_panel, .st-key-route_planner_focus_panel > div[data-testid="stVerticalBlock"] { width: 100% !important; height: 100% !important; min-height: 0 !important; overflow-y: auto !important; overflow-x: hidden !important; background: #111827 !important; border-color: #374151 !important; }
-        .st-key-route_planner_focus_panel iframe { display: block !important; width: 100% !important; min-width: 100% !important; }
+        .st-key-route_planner_focus_panel { width: 100% !important; height: 100% !important; min-height: 0 !important; overflow: hidden !important; background: #111827 !important; border-color: #374151 !important; }
+        .st-key-route_planner_focus_panel > div[data-testid="stVerticalBlock"] { width: 100% !important; height: 100% !important; min-height: 0 !important; overflow-y: auto !important; overflow-x: hidden !important; overscroll-behavior: contain; scrollbar-gutter: stable; padding-bottom: .5rem; }
+        .st-key-route_planner_focus_panel iframe { display: block !important; width: 100% !important; min-width: 100% !important; overflow: visible !important; }
         .st-key-route_planner_focus_shell p, .st-key-route_planner_focus_shell label, .st-key-route_planner_focus_shell h1, .st-key-route_planner_focus_shell h2, .st-key-route_planner_focus_shell h3, .st-key-route_planner_focus_shell h4 { color: #e5e7eb !important; }
         .st-key-route_planner_focus_shell [data-testid="stCheckbox"] input { accent-color: #10b981; }
         .st-key-route_planner_focus_shell [data-testid="stAlert"] { background: #422006 !important; color: #fde68a !important; border: 1px solid #a16207; }
@@ -1198,18 +1230,38 @@ def render_map_planner_focus(
     draft_assignment = clone_assignment(st.session_state["route_planner_draft_assignment"])
     dirty = bool(st.session_state.get("route_planner_is_dirty"))
     stale_riders = list(st.session_state.get("route_planner_preview_stale_riders", rider_names))
+    locked_riders, locked_baselines = normalise_rider_locks(
+        st.session_state.get("route_planner_locked_rider_ids", []),
+        rider_names,
+        draft_assignment,
+        st.session_state.get("route_planner_locked_rider_baselines", {}),
+    )
+    st.session_state["route_planner_locked_rider_ids"] = locked_riders
+    st.session_state["route_planner_locked_rider_baselines"] = locked_baselines
     preview_routes = st.session_state.get("route_planner_preview_routes", pd.DataFrame())
     total_jobs = sum(len(job_ids) for lane, job_ids in draft_assignment.items() if lane != UNASSIGNED_LANE)
+    unlocked_riders = [rider for rider in rider_names if rider not in set(locked_riders)]
+    can_reshuffle = len(unlocked_riders) >= 2 and any(draft_assignment.get(rider) for rider in unlocked_riders)
 
     with st.container(key="route_planner_focus_shell", height="stretch", width="stretch"):
         with st.container(key="route_planner_focus_toolbar", height=56, width="stretch"):
-            bar = st.columns([2.4, 1.2, .55, .55, .9, 1.25, 1.75, 1.45], gap="small")
+            bar = st.columns([1.95, 2.45, .5, .5, 1.1, 1.25, 1.55, 1.25], gap="small")
             bar[0].markdown(f"**Route Planner · {total_jobs} jobs · {len(rider_names)} riders**")
-            bar[1].caption(f"Red outdated · {len(stale_riders)} riders" if stale_riders else "Red preview current")
+            bar[1].markdown(
+                '<span style="font-size:.72rem"><b style="color:#22a34a">●</b> job '
+                '<b style="color:#ef4444">●</b> access <b style="color:#a855f7">●</b> draft '
+                '<b style="color:#0ea5e9">●</b> pickup <b style="color:#f97316">●</b> drop</span>',
+                unsafe_allow_html=True,
+            )
             undo_clicked = bar[2].button("Undo", disabled=not st.session_state.get("route_planner_undo_stack"), width="stretch")
             redo_clicked = bar[3].button("Redo", disabled=not st.session_state.get("route_planner_redo_stack"), width="stretch")
-            show_red = bar[4].toggle("Show Red", key="route_planner_show_red_preview")
-            refresh_clicked = bar[5].button("Refresh Red Preview", width="stretch")
+            refresh_clicked = bar[4].button("Refresh Exact", width="stretch", help="Refresh cached public-transport connector routes.")
+            reshuffle_clicked = bar[5].button(
+                f"Reshuffle · {len(locked_riders)} 🔒",
+                disabled=not can_reshuffle,
+                width="stretch",
+                help="Bounded search across unlocked riders only.",
+            )
             apply_clicked = bar[6].button("Apply Routes & Return", type="primary", disabled=not dirty, width="stretch")
             exit_clicked = bar[7].button("Exit With Draft Saved", width="stretch")
 
@@ -1223,13 +1275,40 @@ def render_map_planner_focus(
             operation = undo_draft if undo_clicked else redo_draft
             updated, undo_stack, redo_stack, changed = operation(draft_assignment, st.session_state.get("route_planner_undo_stack", []), st.session_state.get("route_planner_redo_stack", []))
             if changed:
+                lock_validation = validate_locked_rider_change(locked_baselines, updated, locked_riders)
+                if not lock_validation.is_valid:
+                    st.warning("Undo/redo was skipped because it would change a locked rider route.")
+                    updated = draft_assignment
+                    changed = False
+            if changed:
                 st.session_state["route_planner_draft_assignment"] = updated
                 st.session_state["route_planner_undo_stack"] = undo_stack
                 st.session_state["route_planner_redo_stack"] = redo_stack
                 st.session_state["route_planner_is_dirty"] = updated != confirmed_assignment
                 st.session_state["route_planner_affected_riders"] = detect_affected_riders(confirmed_assignment, updated)
                 st.session_state["route_planner_preview_stale_riders"] = list(invalidate_red_preview(draft_assignment, updated, stale_riders))
+                st.session_state["route_planner_board_revision"] = int(st.session_state.get("route_planner_board_revision", 0)) + 1
                 LOGGER.info("Route planner focus %s", "undo" if undo_clicked else "redo")
+                st.rerun()
+
+        if reshuffle_clicked:
+            with st.spinner("Searching bounded unlocked-rider alternatives..."):
+                reshuffle = reshuffle_unlocked_assignments(
+                    draft_assignment,
+                    locked_riders,
+                    st.session_state.get("route_planner_manual_move_history", {}),
+                    rider_df,
+                    jobs_df,
+                )
+            st.session_state["route_planner_reshuffle_notice"] = reshuffle.message
+            if reshuffle.changed and _store_draft_change(
+                draft_assignment,
+                reshuffle.assignment,
+                confirmed_assignment,
+                rider_starts,
+                record_manual=False,
+            ):
+                LOGGER.info("Route planner reshuffle stats=%s", reshuffle.stats)
                 st.rerun()
 
         if refresh_clicked:
@@ -1262,7 +1341,8 @@ def render_map_planner_focus(
 
         if apply_clicked:
             validation = validate_assignment_board(draft_assignment, jobs_by_id, rider_names)
-            if not validation.is_valid:
+            lock_validation = validate_locked_rider_change(locked_baselines, draft_assignment, locked_riders)
+            if not validation.is_valid or not lock_validation.is_valid:
                 st.error("Routes could not be updated because the draft contains an invalid assignment.")
             else:
                 affected = detect_affected_riders(confirmed_assignment, draft_assignment, rider_starts, rider_starts)
@@ -1301,20 +1381,34 @@ def render_map_planner_focus(
                 with st.container(key="route_planner_focus_map", height="stretch", width="stretch"):
                     if st.session_state.get("route_planner_preview_error"):
                         st.error("Red connector preview could not be refreshed. Your draft is unchanged.")
-                    pending_count, reused_count = render_focus_green_map(
+                    pending_count, reused_count, map_warnings = render_focus_green_map(
                         draft_assignment,
                         list(st.session_state.get("route_planner_visible_riders", rider_names)),
                         confirmed_routes,
                         jobs_df,
+                        confirmed_assignment=confirmed_assignment,
+                        rider_starts=rider_starts,
                         preview_routes=preview_routes,
-                        stale_preview_riders=stale_riders,
-                        show_red_preview=show_red,
+                        rider_access_cache=st.session_state.get("route_planner_rider_access_cache", {}),
                     )
                     if pending_count:
                         st.warning(f"{pending_count} visible job route(s) pending. They will be calculated when you apply.")
+                    if map_warnings:
+                        st.warning(map_warnings[0] + (f" (+{len(map_warnings) - 1} more)" if len(map_warnings) > 1 else ""))
                     LOGGER.debug("Route planner focus map green_reused=%s pending=%s", reused_count, pending_count)
             with panel_col:
                 with st.container(key="route_planner_focus_panel", height="stretch", width="stretch", border=True):
+                    if st.session_state.get("route_planner_lock_warning"):
+                        st.warning(st.session_state.pop("route_planner_lock_warning"))
+                    notice = clean_text(st.session_state.get("route_planner_reshuffle_notice"))
+                    if notice:
+                        st.caption(notice)
+                    st.multiselect(
+                        "Locked riders",
+                        options=rider_names,
+                        key="route_planner_locked_rider_ids",
+                        help="Locked rider sequences cannot be changed by drag, undo/redo, reset, reshuffle, or apply.",
+                    )
                     show_col, hide_col = st.columns(2)
                     show_all = show_col.button("Show All", width="stretch")
                     hide_all = hide_col.button("Hide All", width="stretch")
@@ -1333,21 +1427,41 @@ def render_map_planner_focus(
                         if st.checkbox(f"{rider} · {len(draft_assignment.get(rider, []))} jobs", key=key):
                             selected_riders.append(rider)
                     st.session_state["route_planner_visible_riders"] = selected_riders
-                    proposed = render_route_assignment_board(draft_assignment, jobs_by_id, state["summary_df"], rider_df, dark_mode=True)
+                    proposed = render_route_assignment_board(
+                        draft_assignment,
+                        jobs_by_id,
+                        state["summary_df"],
+                        rider_df,
+                        dark_mode=True,
+                        locked_rider_ids=locked_riders,
+                        board_revision=int(st.session_state.get("route_planner_board_revision", 0)),
+                    )
                     if proposed is not None and proposed != draft_assignment:
                         validation = validate_assignment_board(proposed, jobs_by_id, rider_names)
-                        if validation.is_valid and _store_draft_change(draft_assignment, proposed, confirmed_assignment, rider_starts):
+                        lock_validation = validate_locked_rider_change(locked_baselines, proposed, locked_riders)
+                        if validation.is_valid and lock_validation.is_valid and _store_draft_change(draft_assignment, proposed, confirmed_assignment, rider_starts):
                             st.rerun()
                         if not validation.is_valid:
                             st.error("That move would create an invalid assignment.")
+                        elif not lock_validation.is_valid:
+                            st.session_state["route_planner_lock_warning"] = "That move was rejected because a locked rider route must stay unchanged."
+                            st.session_state["route_planner_board_revision"] = int(st.session_state.get("route_planner_board_revision", 0)) + 1
+                            LOGGER.warning("Route planner rejected locked drag errors=%s", lock_validation.errors)
+                            st.rerun()
                     if st.button("Reset Draft to Confirmed", width="stretch"):
                         updated, undo_stack, redo_stack, changed = reset_draft(confirmed_assignment, draft_assignment)
+                        if changed and not validate_locked_rider_change(locked_baselines, updated, locked_riders).is_valid:
+                            st.warning("Reset was skipped because it would change a locked rider route.")
+                            changed = False
                         if changed:
                             st.session_state["route_planner_draft_assignment"] = updated
                             st.session_state["route_planner_undo_stack"] = undo_stack
                             st.session_state["route_planner_redo_stack"] = redo_stack
                             st.session_state["route_planner_is_dirty"] = False
                             st.session_state["route_planner_affected_riders"] = []
+                            st.session_state["route_planner_manual_move_history"] = {}
+                            st.session_state["route_planner_draft_connectors"] = pd.DataFrame()
+                            st.session_state["route_planner_board_revision"] = int(st.session_state.get("route_planner_board_revision", 0)) + 1
                             st.session_state["route_planner_preview_stale_riders"] = list(invalidate_red_preview(draft_assignment, updated, stale_riders))
                             st.rerun()
 

@@ -2228,6 +2228,8 @@ def _selective_plan_result(
     changed_rider_penalty: float,
     moved_job_penalty: float,
     sequence_change_penalty: float,
+    origin_rider_by_job: dict[str, str] | None = None,
+    origin_return_penalty: float = 0.0,
 ) -> dict[str, Any]:
     changed = _changed_riders(original_sequences, proposed_sequences)
     moved = _moved_jobs(original_sequences, proposed_sequences, movable_job_ids)
@@ -2235,11 +2237,18 @@ def _selective_plan_result(
     sequence_changes = len(moved) - changed_rider_moves
     score_after = _route_score(summary_df)
     duration_delta = score_after - baseline_score
+    proposed_positions = _job_positions(proposed_sequences)
+    origin_return_count = sum(
+        1
+        for job_id, origin_rider in (origin_rider_by_job or {}).items()
+        if proposed_positions.get(job_id, ("", 0))[0] == clean_text(origin_rider)
+    )
     disruption_penalty = (
         len(changed) * changed_rider_penalty
         + len(moved) * moved_job_penalty
         + sequence_changes * sequence_change_penalty
         + max(0.0, duration_delta)
+        + origin_return_count * max(0.0, origin_return_penalty)
     )
     plan_score = score_after + disruption_penalty
     return {
@@ -2256,6 +2265,7 @@ def _selective_plan_result(
         "plan_score": round(float(plan_score), 3),
         "disruption_penalty": round(float(disruption_penalty), 3),
         "candidate_count": candidate_count,
+        "origin_return_count": origin_return_count,
         "latest_completion_after": _latest_completion(route_df, changed or None),
         "reason": "Beneficial reshuffle found." if duration_delta < -0.1 else "Best feasible alternative found; it does not improve adjusted duration.",
     }
@@ -2307,6 +2317,8 @@ def find_best_selective_reshuffle(
     changed_rider_penalty: float = DEFAULT_SELECTIVE_CHANGED_RIDER_PENALTY,
     moved_job_penalty: float = DEFAULT_SELECTIVE_MOVED_JOB_PENALTY,
     sequence_change_penalty: float = DEFAULT_SELECTIVE_SEQUENCE_CHANGE_PENALTY,
+    origin_rider_by_job: dict[str, str] | None = None,
+    origin_return_penalty: float = 0.0,
     **settings: Any,
 ) -> dict[str, Any]:
     locked_riders = {clean_text(rider) for rider in (locked_riders or set()) if clean_text(rider)}
@@ -2415,6 +2427,8 @@ def find_best_selective_reshuffle(
                 changed_rider_penalty=changed_rider_penalty,
                 moved_job_penalty=moved_job_penalty,
                 sequence_change_penalty=sequence_change_penalty,
+                origin_rider_by_job=origin_rider_by_job,
+                origin_return_penalty=origin_return_penalty,
             )
         )
         alternatives.sort(key=lambda item: (float(item["plan_score"]), float(item["score_after"])))
@@ -2467,6 +2481,13 @@ def find_best_selective_reshuffle(
                         moved_so_far = len(_moved_jobs(original_sequences, candidate, set(movable_jobs)))
                         changed_so_far = len(_changed_riders(original_sequences, candidate))
                         heuristic = moved_so_far * moved_job_penalty + changed_so_far * changed_rider_penalty
+                        candidate_positions = _job_positions(candidate)
+                        origin_returns = sum(
+                            1
+                            for moved_job_id, origin_rider in (origin_rider_by_job or {}).items()
+                            if candidate_positions.get(moved_job_id, ("", 0))[0] == clean_text(origin_rider)
+                        )
+                        heuristic += origin_returns * max(0.0, origin_return_penalty)
                         next_partials.append((candidate, heuristic))
                         if len(next_partials) >= max_candidates:
                             search_limited = True

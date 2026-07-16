@@ -18,6 +18,7 @@ from .vehicle_route_optimizer import (
     clean_text,
     get_stored_geocode,
     get_empty_travel_cost,
+    find_best_selective_reshuffle,
     optimisation_integrity_report,
     rebuild_outputs_from_sequences,
     stable_job_id_from_route_row,
@@ -62,6 +63,27 @@ class RedPreviewResult:
     assignment_signature: str
     stale_riders: tuple[str, ...]
     stats: dict[str, int]
+
+
+@dataclass(frozen=True)
+class DraftConnectorResult:
+    route_df: pd.DataFrame
+    warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RiderAccessResult:
+    route_df: pd.DataFrame
+    cache: dict[str, dict[str, Any]]
+    warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ReshuffleResult:
+    assignment: Assignment
+    changed: bool
+    message: str
+    stats: dict[str, Any]
 
 
 def clone_assignment(assignment: Assignment) -> Assignment:
@@ -118,6 +140,13 @@ def build_planner_session_state(
         "route_planner_preview_stale_riders": [clean_text(rider) for rider in rider_names if clean_text(rider)],
         "route_planner_preview_error": "",
         "route_planner_preview_stats": {},
+        "route_planner_locked_rider_ids": [],
+        "route_planner_locked_rider_baselines": {},
+        "route_planner_manual_move_history": {},
+        "route_planner_rider_access_cache": {},
+        "route_planner_draft_connectors": pd.DataFrame(),
+        "route_planner_reshuffle_notice": "",
+        "route_planner_board_revision": 0,
     }
 
 
@@ -155,6 +184,9 @@ def focus_apply_success_state(draft_assignment: Assignment, result: Recalculatio
         "route_planner_preview_stale_riders": [],
         "route_planner_preview_error": "",
         "route_planner_preview_stats": {},
+        "route_planner_manual_move_history": {},
+        "route_planner_draft_connectors": pd.DataFrame(),
+        "route_planner_reshuffle_notice": "",
     }
 
 
@@ -245,6 +277,77 @@ def validate_assignment_board(
         tuple(duplicates),
         tuple(sorted(unknown)),
     )
+
+
+def validate_locked_rider_change(
+    baseline_assignment: Assignment,
+    proposed_assignment: Assignment,
+    locked_rider_ids: Iterable[str],
+) -> AssignmentValidation:
+    """Reject any sequence or ownership change to a locked rider lane."""
+
+    changed = sorted(
+        rider
+        for rider in {clean_text(value) for value in locked_rider_ids if clean_text(value)}
+        if list(baseline_assignment.get(rider, [])) != list(proposed_assignment.get(rider, []))
+    )
+    errors = () if not changed else (f"Locked rider routes changed: {', '.join(changed)}",)
+    return AssignmentValidation(not changed, errors)
+
+
+def record_manual_job_moves(
+    previous_assignment: Assignment,
+    proposed_assignment: Assignment,
+    existing_history: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Record rider-to-rider manual moves while preserving the first origin rider."""
+
+    history = copy.deepcopy(existing_history or {})
+
+    def positions(assignment: Assignment) -> dict[str, tuple[str, int]]:
+        return {
+            job_id: (rider, index)
+            for rider, job_ids in assignment.items()
+            for index, job_id in enumerate(job_ids)
+        }
+
+    before = positions(previous_assignment)
+    after = positions(proposed_assignment)
+    for job_id in sorted(set(before) & set(after)):
+        from_rider, from_index = before[job_id]
+        to_rider, to_index = after[job_id]
+        if from_rider == to_rider:
+            continue
+        entry = dict(history.get(job_id, {}))
+        entry.setdefault("origin_rider_id", from_rider)
+        entry.update(
+            {
+                "last_from_rider_id": from_rider,
+                "last_to_rider_id": to_rider,
+                "last_from_index": from_index,
+                "last_to_index": to_index,
+            }
+        )
+        history[job_id] = entry
+    return history
+
+
+def normalise_rider_locks(
+    locked_rider_ids: Iterable[str],
+    rider_names: Iterable[str],
+    draft_assignment: Assignment,
+    existing_baselines: dict[str, list[str]] | None = None,
+) -> tuple[list[str], dict[str, list[str]]]:
+    """Remove stale locks and capture the exact draft sequence when a rider is locked."""
+
+    valid = {clean_text(rider) for rider in rider_names if clean_text(rider)}
+    locked = sorted({clean_text(rider) for rider in locked_rider_ids if clean_text(rider) in valid})
+    old = existing_baselines or {}
+    baselines = {
+        rider: list(old[rider]) if rider in old else list(draft_assignment.get(rider, []))
+        for rider in locked
+    }
+    return locked, baselines
 
 
 def detect_affected_riders(
@@ -363,6 +466,81 @@ def reset_draft(original: Assignment, current: Assignment) -> tuple[Assignment, 
     return clone_assignment(original), [clone_assignment(current)], [], True
 
 
+def reshuffle_unlocked_assignments(
+    draft_assignment: Assignment,
+    locked_rider_ids: Iterable[str],
+    manual_move_history: dict[str, dict[str, Any]],
+    rider_df: pd.DataFrame,
+    jobs_df: pd.DataFrame,
+    *,
+    max_candidates: int = 600,
+    beam_width: int = 40,
+    origin_return_penalty: float = 15.0,
+    search_fn: Callable[..., dict[str, Any]] = find_best_selective_reshuffle,
+) -> ReshuffleResult:
+    """Run a bounded, cache-friendly reshuffle while treating locked routes as immutable."""
+
+    riders, rider_errors = validate_riders(rider_df)
+    if rider_errors:
+        return ReshuffleResult(clone_assignment(draft_assignment), False, "; ".join(rider_errors), {})
+    rider_names = [rider.name for rider in riders]
+    jobs_by_id = build_jobs_by_stable_id(jobs_df)
+    validation = validate_assignment_board(draft_assignment, jobs_by_id, rider_names)
+    if not validation.is_valid:
+        return ReshuffleResult(clone_assignment(draft_assignment), False, "; ".join(validation.errors), {})
+    locked = {clean_text(rider) for rider in locked_rider_ids if clean_text(rider) in rider_names}
+    unlocked = [rider for rider in rider_names if rider not in locked]
+    movable = {job_id for rider in unlocked for job_id in draft_assignment.get(rider, [])}
+    if len(unlocked) < 2:
+        return ReshuffleResult(clone_assignment(draft_assignment), False, "Unlock at least two riders before reshuffling.", {})
+    if not movable:
+        return ReshuffleResult(clone_assignment(draft_assignment), False, "There are no unlocked assigned jobs to reshuffle.", {})
+    sequences = {rider: list(draft_assignment.get(rider, [])) for rider in rider_names}
+    origins = {
+        job_id: clean_text(entry.get("origin_rider_id"))
+        for job_id, entry in (manual_move_history or {}).items()
+        if job_id in movable and clean_text(entry.get("origin_rider_id"))
+    }
+    result = search_fn(
+        sequences,
+        jobs_by_id,
+        riders,
+        jobs_df=jobs_df,
+        locked_riders=locked,
+        reshuffle_job_ids=movable,
+        eligible_receiver_riders=set(unlocked),
+        top_n=3,
+        beam_width=max(1, int(beam_width)),
+        max_candidates=max(1, int(max_candidates)),
+        changed_rider_penalty=2.0,
+        moved_job_penalty=1.0,
+        sequence_change_penalty=0.5,
+        origin_rider_by_job=origins,
+        origin_return_penalty=max(0.0, float(origin_return_penalty)),
+        use_onemap=False,
+    )
+    stats = {
+        "candidate_count": int(result.get("candidate_count", 0)),
+        "search_limited": bool(result.get("search_limited", False)),
+        "origin_return_count": int(result.get("origin_return_count", 0)),
+    }
+    if not result.get("success"):
+        return ReshuffleResult(clone_assignment(draft_assignment), False, clean_text(result.get("reason")) or "No feasible reshuffle was found.", stats)
+    proposed = clone_assignment(draft_assignment)
+    for rider in rider_names:
+        proposed[rider] = list(result.get("proposed_sequences", {}).get(rider, []))
+    post_validation = validate_assignment_board(proposed, jobs_by_id, rider_names)
+    lock_validation = validate_locked_rider_change(draft_assignment, proposed, locked)
+    if not post_validation.is_valid or not lock_validation.is_valid:
+        errors = post_validation.errors + lock_validation.errors
+        return ReshuffleResult(clone_assignment(draft_assignment), False, "; ".join(errors), stats)
+    if proposed == draft_assignment:
+        return ReshuffleResult(proposed, False, "The current unlocked routes are already the best bounded result.", stats)
+    changed_count = len(detect_affected_riders(draft_assignment, proposed))
+    stats.update({"changed_riders": changed_count, "plan_score": result.get("plan_score")})
+    return ReshuffleResult(proposed, True, f"Reshuffled {changed_count} unlocked rider route(s).", stats)
+
+
 def _travel_cost_from_row(row: pd.Series, prefix: str) -> TravelCost:
     path_value = row.get(f"{prefix} Route Path")
     try:
@@ -396,6 +574,214 @@ def _parsed_route_path(value: object) -> list[list[float]]:
         except (TypeError, ValueError):
             continue
     return path
+
+
+def _stored_coordinate(address: str) -> list[float] | None:
+    geocode = get_stored_geocode(clean_text(address))
+    if not geocode.is_available:
+        return None
+    return [float(geocode.longitude), float(geocode.latitude)]
+
+
+def _coordinate(
+    address: str,
+    coordinate_lookup: Callable[[str], object] | None,
+) -> list[float] | None:
+    value = (coordinate_lookup or _stored_coordinate)(clean_text(address))
+    if value is None:
+        return None
+    if hasattr(value, "is_available"):
+        if not bool(getattr(value, "is_available")):
+            return None
+        return [float(getattr(value, "longitude")), float(getattr(value, "latitude"))]
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        try:
+            return [float(value[0]), float(value[1])]
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _draft_connector_specs(
+    assignment: Assignment,
+    jobs_by_id: dict[str, dict[str, Any]],
+    rider_starts: dict[str, str],
+) -> dict[tuple[str, str], tuple[str, str, int]]:
+    specs: dict[tuple[str, str], tuple[str, str, int]] = {}
+    for rider, job_ids in assignment.items():
+        if rider == UNASSIGNED_LANE:
+            continue
+        origin = clean_text(rider_starts.get(rider))
+        for sequence, job_id in enumerate(job_ids, start=1):
+            pickup = clean_text(jobs_by_id.get(job_id, {}).get("Pickup Address"))
+            specs[(rider, job_id)] = (origin, pickup, sequence)
+            origin = clean_text(jobs_by_id.get(job_id, {}).get("Drop-off Address"))
+    return specs
+
+
+def build_draft_connector_lines(
+    confirmed_assignment: Assignment,
+    draft_assignment: Assignment,
+    jobs_df: pd.DataFrame,
+    rider_starts: dict[str, str],
+    *,
+    coordinate_lookup: Callable[[str], object] | None = None,
+) -> DraftConnectorResult:
+    """Build immediate straight purple lines only for changed draft connector legs."""
+
+    jobs_by_id = build_jobs_by_stable_id(jobs_df)
+    before = _draft_connector_specs(confirmed_assignment, jobs_by_id, rider_starts)
+    after = _draft_connector_specs(draft_assignment, jobs_by_id, rider_starts)
+    rows: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for (rider, job_id), (start, end, sequence) in after.items():
+        prior = before.get((rider, job_id))
+        if prior and prior[:2] == (start, end):
+            continue
+        start_point = _coordinate(start, coordinate_lookup)
+        end_point = _coordinate(end, coordinate_lookup)
+        if start_point is None or end_point is None:
+            warnings.append(f"Draft connector unavailable for {rider} job {sequence}: cached coordinates are missing.")
+            continue
+        rows.append(
+            {
+                "Rider": rider,
+                "Sequence": sequence,
+                "Job ID": job_id,
+                "path": [start_point, end_point],
+                "color": [168, 85, 247, 235],
+                "geometry_source": "draft_straight_line",
+                "tooltip": f"{rider}<br/>Draft connector to job {sequence}<br/>{start} → {end}",
+            }
+        )
+    return DraftConnectorResult(pd.DataFrame(rows), tuple(dict.fromkeys(warnings)))
+
+
+def _matching_access_path(
+    routes: pd.DataFrame | None,
+    rider: str,
+    job_id: str,
+    start: str,
+    end: str,
+    *,
+    preview: bool,
+) -> tuple[list[list[float]], str] | None:
+    if routes is None or routes.empty:
+        return None
+    for _, row in routes.iterrows():
+        row_rider = clean_text(row.get("Rider"))
+        if row_rider != rider:
+            continue
+        try:
+            row_job_id = clean_text(row.get("Job ID")) if preview else stable_job_id_from_route_row(row)
+        except (KeyError, TypeError, ValueError):
+            continue
+        start_column = "Start Label" if preview else "Start From"
+        end_column = "End Label" if preview else "Pickup Address"
+        path_column = "Route Path" if preview else "Empty Route Path"
+        if (
+            row_job_id != job_id
+            or clean_text(row.get(start_column)).casefold() != start.casefold()
+            or clean_text(row.get(end_column)).casefold() != end.casefold()
+        ):
+            continue
+        path = _parsed_route_path(row.get(path_column))
+        if len(path) < 2:
+            continue
+        source = clean_text(row.get("Source")) if preview else "reused confirmed public transport"
+        geometry_source = "cached_public_transport" if "cache" in source.casefold() or not preview else "calculated_public_transport"
+        return path, geometry_source
+    return None
+
+
+def rider_access_cache_key(
+    rider: str,
+    job_id: str,
+    start_point: list[float],
+    end_point: list[float],
+) -> str:
+    payload = [rider, job_id, [round(value, 6) for value in start_point], [round(value, 6) for value in end_point], "public_transport"]
+    return hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _access_path_matches_coordinates(
+    path: list[list[float]],
+    start_point: list[float],
+    end_point: list[float],
+    tolerance_degrees: float = 0.03,
+) -> bool:
+    if len(path) < 2:
+        return False
+    return all(abs(path[0][index] - start_point[index]) <= tolerance_degrees for index in (0, 1)) and all(
+        abs(path[-1][index] - end_point[index]) <= tolerance_degrees for index in (0, 1)
+    )
+
+
+def build_rider_access_paths(
+    draft_assignment: Assignment,
+    visible_riders: Iterable[str],
+    confirmed_routes: pd.DataFrame,
+    preview_routes: pd.DataFrame | None,
+    jobs_df: pd.DataFrame,
+    rider_starts: dict[str, str],
+    route_cache: dict[str, dict[str, Any]] | None,
+    *,
+    coordinate_lookup: Callable[[str], object] | None = None,
+) -> RiderAccessResult:
+    """Build red rider-start access routes without initiating routing or geocoding."""
+
+    visible = set(visible_riders)
+    jobs_by_id = build_jobs_by_stable_id(jobs_df)
+    cache = copy.deepcopy(route_cache or {})
+    rows: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for rider, job_ids in draft_assignment.items():
+        if rider == UNASSIGNED_LANE or rider not in visible or not job_ids:
+            continue
+        job_id = job_ids[0]
+        start = clean_text(rider_starts.get(rider))
+        end = clean_text(jobs_by_id.get(job_id, {}).get("Pickup Address"))
+        start_point = _coordinate(start, coordinate_lookup)
+        end_point = _coordinate(end, coordinate_lookup)
+        candidate = _matching_access_path(preview_routes, rider, job_id, start, end, preview=True)
+        if candidate is None:
+            candidate = _matching_access_path(confirmed_routes, rider, job_id, start, end, preview=False)
+        if start_point is None and candidate:
+            start_point = candidate[0][0]
+        if end_point is None and candidate:
+            end_point = candidate[0][-1]
+        if start_point is None or end_point is None:
+            warnings.append(f"Rider access unavailable for {rider}: cached coordinates are missing.")
+            continue
+        cache_key = rider_access_cache_key(rider, job_id, start_point, end_point)
+        cached = cache.get(cache_key, {})
+        cached_path = _parsed_route_path(cached.get("path"))
+        if _access_path_matches_coordinates(cached_path, start_point, end_point):
+            path = cached_path
+            geometry_source = clean_text(cached.get("geometry_source")) or "cached_public_transport"
+        elif candidate:
+            if cached:
+                warnings.append(f"Stale rider-access geometry was ignored for {rider}.")
+            path, geometry_source = candidate
+            cache[cache_key] = {"path": path, "geometry_source": geometry_source}
+        else:
+            if cached:
+                warnings.append(f"Stale rider-access geometry was ignored for {rider}.")
+            path = [start_point, end_point]
+            geometry_source = "fallback_straight_line"
+            cache[cache_key] = {"path": path, "geometry_source": geometry_source}
+        rows.append(
+            {
+                "Rider": rider,
+                "Sequence": 0,
+                "Job ID": job_id,
+                "path": path,
+                "color": [239, 68, 68, 235],
+                "geometry_source": geometry_source,
+                "tooltip": f"{rider}<br/>Start → first pickup<br/>{geometry_source.replace('_', ' ')}",
+            }
+        )
+    return RiderAccessResult(pd.DataFrame(rows), cache, tuple(dict.fromkeys(warnings)))
 
 
 def confirmed_loaded_route_is_valid(row: pd.Series | dict[str, Any], job: dict[str, Any]) -> bool:

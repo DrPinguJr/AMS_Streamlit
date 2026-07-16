@@ -50,6 +50,25 @@ def test_sortable_focus_styles_force_one_full_width_vertical_stack() -> None:
     assert "max-width: 100% !important" in viewer
 
 
+def test_sortable_panel_has_internal_viewport_scroll_for_cross_lane_dragging() -> None:
+    viewer = VIEWER.read_text(encoding="utf-8")
+    assert "height: calc(100dvh - 238px)" in viewer
+    assert "overflow-y: auto !important" in viewer
+    assert "overscroll-behavior: contain" in viewer
+    assert "scrollbar-gutter: stable" in viewer
+
+
+def test_focus_layout_exposes_locking_reshuffle_and_three_route_colours() -> None:
+    source = current_focus_source()
+    assert '"Locked riders"' in source
+    assert "reshuffle_unlocked_assignments" in source
+    assert "Reshuffle ·" in source
+    viewer = VIEWER.read_text(encoding="utf-8")
+    assert "focus-green-loaded-routes" in viewer
+    assert "focus-red-rider-access" in viewer
+    assert "focus-purple-draft-connectors" in viewer
+
+
 def test_loaded_workbook_enters_focus_and_reruns_before_summary() -> None:
     viewer = VIEWER.read_text(encoding="utf-8")
     flow = viewer.split("def run_route_planner_screen_flow()", 1)[1].split("run_route_planner_screen_flow()", 1)[0]
