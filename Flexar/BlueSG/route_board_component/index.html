@@ -14,6 +14,9 @@
     .pool .header { background: #075985; color: #e0f2fe; }
     .lock { display: inline-flex; align-items: center; gap: .25rem; flex: 0 0 auto; font-weight: 700; cursor: pointer; user-select: none; }
     .lock input { width: 15px; height: 15px; margin: 0; accent-color: #f43f5e; cursor: pointer; }
+    .header-actions { display: inline-flex; align-items: center; gap: .42rem; flex: 0 0 auto; }
+    .focus { display: inline-flex; align-items: center; gap: .2rem; color: #f8fafc; font-size: .72rem; cursor: pointer; user-select: none; }
+    .focus input { width: 15px; height: 15px; margin: 0; accent-color: #f8fafc; cursor: pointer; }
     .reshuffle-action { flex: 0 0 auto; border: 1px solid #7dd3fc; border-radius: 6px; background: #0c4a6e; color: #f0f9ff; padding: .38rem .58rem; font-weight: 800; font-size: .76rem; cursor: pointer; }
     .reshuffle-action:hover { background: #0369a1; }
     .reshuffle-action:disabled { cursor: not-allowed; opacity: .45; background: #164e63; }
@@ -44,9 +47,11 @@
     const boardElement = document.getElementById("board");
     let lanes = [];
     let locked = new Set();
+    let highlighted = new Set();
     let dragging = null;
     let canReshuffle = false;
     let lastArgsKey = "";
+    let suppressCardClickUntil = 0;
 
     function cloneLanes(value) {
       return (value || []).map(lane => ({
@@ -62,6 +67,7 @@
       STREAMLIT.value({
         event: eventName,
         locked_rider_ids: Array.from(locked),
+        highlighted_rider_ids: Array.from(highlighted),
         board: lanes.map(lane => ({ header: lane.header, items: lane.items.slice() }))
       });
     }
@@ -114,6 +120,23 @@
           action.addEventListener("click", () => emit("reshuffle"));
           header.appendChild(action);
         } else if (lane.lane_id !== "__UNASSIGNED__") {
+          const actions = document.createElement("div");
+          actions.className = "header-actions";
+          const focusLabel = document.createElement("label");
+          focusLabel.className = "focus";
+          focusLabel.title = "Highlight only this rider's routes on the map";
+          const focusCheckbox = document.createElement("input");
+          focusCheckbox.type = "checkbox";
+          focusCheckbox.checked = highlighted.has(lane.lane_id);
+          const focusIcon = document.createElement("span");
+          focusIcon.textContent = "View";
+          focusCheckbox.addEventListener("change", () => {
+            if (focusCheckbox.checked) highlighted.add(lane.lane_id); else highlighted.delete(lane.lane_id);
+            render();
+            emit("highlight");
+          });
+          focusLabel.append(focusCheckbox, focusIcon);
+          actions.appendChild(focusLabel);
           const label = document.createElement("label");
           label.className = "lock";
           label.title = "Checked: rider and order sequence are frozen";
@@ -129,7 +152,8 @@
             emit("locks");
           });
           label.append(checkbox, icon);
-          header.appendChild(label);
+          actions.appendChild(label);
+          header.appendChild(actions);
         }
         laneElement.appendChild(header);
 
@@ -163,6 +187,17 @@
           card.textContent = item;
           card.dataset.index = String(index);
           card.draggable = !locked.has(lane.lane_id);
+          card.title = lane.is_pool ? "Selected for reshuffle" : (lane.lane_id === "__UNASSIGNED__" ? "Assign this order to a rider before reshuffling" : (locked.has(lane.lane_id) ? "Unlock this rider to select the order" : "Click to add this order to the reshuffle pool"));
+          card.addEventListener("click", () => {
+            if (Date.now() < suppressCardClickUntil || lane.is_pool || lane.lane_id === "__UNASSIGNED__" || locked.has(lane.lane_id)) return;
+            const poolLane = lanes.find(candidate => candidate.is_pool);
+            if (!poolLane) return;
+            const [selected] = lane.items.splice(index, 1);
+            if (selected === undefined || poolLane.items.includes(selected)) return;
+            poolLane.items.push(selected);
+            render();
+            emit("board");
+          });
           card.addEventListener("dragstart", event => {
             if (locked.has(lane.lane_id)) { event.preventDefault(); return; }
             dragging = { laneId: lane.lane_id, index };
@@ -171,6 +206,7 @@
             event.dataTransfer.setData("text/plain", item);
           });
           card.addEventListener("dragend", () => {
+            suppressCardClickUntil = Date.now() + 250;
             dragging = null;
             card.classList.remove("dragging");
             document.querySelectorAll(".drag-over").forEach(node => node.classList.remove("drag-over"));
@@ -192,11 +228,12 @@
     window.addEventListener("message", event => {
       if (!event.data || event.data.type !== "streamlit:render") return;
       const args = event.data.args || {};
-      const argsKey = JSON.stringify([args.board, args.locked_rider_ids, args.can_reshuffle]);
+      const argsKey = JSON.stringify([args.board, args.locked_rider_ids, args.highlighted_rider_ids, args.can_reshuffle]);
       if (argsKey !== lastArgsKey) {
         lastArgsKey = argsKey;
         lanes = cloneLanes(args.board);
         locked = new Set((args.locked_rider_ids || []).map(String));
+        highlighted = new Set((args.highlighted_rider_ids || []).map(String));
         canReshuffle = Boolean(args.can_reshuffle);
         render();
       } else {

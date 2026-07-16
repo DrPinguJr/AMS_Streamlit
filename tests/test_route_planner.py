@@ -488,6 +488,7 @@ def test_new_workbook_session_payload_clears_stale_history(planner_data) -> None
     assert payload["route_planner_manual_move_history"] == {}
     assert payload["route_planner_rider_access_cache"] == {}
     assert payload["route_planner_reshuffle_pool_job_ids"] == []
+    assert payload["route_planner_highlighted_rider_ids"] == []
 
 
 def test_unapplied_draft_is_distinct_from_confirmed_for_export_guard(planner_data) -> None:
@@ -619,6 +620,7 @@ def test_focus_success_failure_and_exit_state_are_atomic(planner_data) -> None:
     assert success["route_planner_manual_move_history"] == {}
     assert success["route_planner_draft_connectors"].empty
     assert success["route_planner_reshuffle_pool_job_ids"] == []
+    assert success["route_planner_highlighted_rider_ids"] == []
     failed = focus_apply_failure_state(payload)
     assert failed["route_planner_focus_mode"] is True
     assert failed["route_planner_draft_assignment"] == payload["route_planner_draft_assignment"]

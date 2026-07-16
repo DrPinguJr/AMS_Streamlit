@@ -96,6 +96,31 @@ def test_rider_headers_include_exact_start_location() -> None:
     assert 'Start: {starts_by_rider.get(lane)' in board_builder
 
 
+def test_clicking_unlocked_order_adds_it_to_pool_without_scrolling() -> None:
+    component = (VIEWER.parent / "route_board_component" / "index.html").read_text(encoding="utf-8")
+    assert 'card.addEventListener("click"' in component
+    assert "poolLane.items.push(selected)" in component
+    assert 'locked.has(lane.lane_id)' in component
+    assert 'emit("board")' in component
+
+
+def test_rider_header_has_default_off_view_highlight_control() -> None:
+    component = (VIEWER.parent / "route_board_component" / "index.html").read_text(encoding="utf-8")
+    assert 'focusCheckbox.type = "checkbox"' in component
+    assert "focusCheckbox.checked = highlighted.has(lane.lane_id)" in component
+    assert 'emit("highlight")' in component
+    assert 'focusIcon.textContent = "View"' in component
+
+
+def test_focused_routes_have_glow_start_arrow_and_animated_direction_arrows() -> None:
+    viewer = VIEWER.read_text(encoding="utf-8")
+    assert 'id="focus-highlight-route-glow"' in viewer
+    assert 'id="focus-rider-start-arrows"' in viewer
+    assert 'id="focus-moving-direction-arrows"' in viewer
+    assert '@st.fragment(run_every=0.8)' in viewer
+    assert 'geometry_source": "highlight_straight_line_fallback"' in viewer
+
+
 def test_loaded_workbook_enters_focus_and_reruns_before_summary() -> None:
     viewer = VIEWER.read_text(encoding="utf-8")
     flow = viewer.split("def run_route_planner_screen_flow()", 1)[1].split("run_route_planner_screen_flow()", 1)[0]

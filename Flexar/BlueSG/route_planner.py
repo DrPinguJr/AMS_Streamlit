@@ -152,6 +152,7 @@ def build_planner_session_state(
         "route_planner_draft_connectors": pd.DataFrame(),
         "route_planner_reshuffle_notice": "",
         "route_planner_reshuffle_pool_job_ids": [],
+        "route_planner_highlighted_rider_ids": [],
         "route_planner_board_revision": 0,
     }
 
@@ -194,6 +195,7 @@ def focus_apply_success_state(draft_assignment: Assignment, result: Recalculatio
         "route_planner_draft_connectors": pd.DataFrame(),
         "route_planner_reshuffle_notice": "",
         "route_planner_reshuffle_pool_job_ids": [],
+        "route_planner_highlighted_rider_ids": [],
     }
 
 

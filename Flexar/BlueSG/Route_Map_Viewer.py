@@ -791,29 +791,32 @@ def render_route_assignment_board(
     board_revision: int = 0,
     return_metadata: bool = False,
     can_reshuffle_from_pool: bool = False,
-) -> dict[str, list[str]] | tuple[dict[str, list[str]] | None, list[str] | None, str] | None:
+    highlighted_rider_ids: list[str] | None = None,
+) -> dict[str, list[str]] | tuple[dict[str, list[str]] | None, list[str] | None, list[str] | None, str] | None:
     board, header_to_lane, card_to_job_id, lane_order = build_sortable_board(
         assignment, jobs_by_id, summary_df, rider_df, locked_rider_ids, reshuffle_pool_job_ids
     )
     component_value = ROUTE_BOARD_COMPONENT(
         board=board,
         locked_rider_ids=sorted(locked_rider_ids or []),
+        highlighted_rider_ids=sorted(highlighted_rider_ids or []),
         can_reshuffle=bool(can_reshuffle_from_pool),
         key=f"route_planner_board_{assignment_signature(assignment)}_{assignment_signature({'locked': sorted(locked_rider_ids or []), 'pool': sorted(reshuffle_pool_job_ids or [])})}_{board_revision}",
         default=None,
     )
     if not isinstance(component_value, dict):
-        return (None, None, "") if return_metadata else None
+        return (None, None, None, "") if return_metadata else None
     raw_board = component_value.get("board")
     returned_locks = [clean_text(rider) for rider in component_value.get("locked_rider_ids", []) if clean_text(rider)]
+    returned_highlights = [clean_text(rider) for rider in component_value.get("highlighted_rider_ids", []) if clean_text(rider)]
     component_event = clean_text(component_value.get("event"))
     try:
         normalised = normalise_assignment_board(raw_board, header_to_lane, card_to_job_id, lane_order)
-        return (normalised, returned_locks, component_event) if return_metadata else normalised
+        return (normalised, returned_locks, returned_highlights, component_event) if return_metadata else normalised
     except ValueError as exc:
         LOGGER.warning("Route planner component validation failed: %s", exc)
         st.error(str(exc))
-        return (None, returned_locks, component_event) if return_metadata else None
+        return (None, returned_locks, returned_highlights, component_event) if return_metadata else None
 
 
 def _assignment_positions(assignment: dict[str, list[str]]) -> dict[str, tuple[str, int]]:
@@ -877,6 +880,54 @@ def _store_draft_change(
     return True
 
 
+def _path_position_and_angle(path: object, fraction: float) -> tuple[list[float], float] | None:
+    points = parse_route_path(path)
+    if len(points) < 2:
+        return None
+    progress = max(0.0, min(0.999, float(fraction))) * (len(points) - 1)
+    index = min(int(progress), len(points) - 2)
+    local = progress - index
+    start, end = points[index], points[index + 1]
+    position = [
+        float(start[0]) + (float(end[0]) - float(start[0])) * local,
+        float(start[1]) + (float(end[1]) - float(start[1])) * local,
+    ]
+    angle = -math.degrees(math.atan2(float(end[1]) - float(start[1]), float(end[0]) - float(start[0])))
+    return position, angle
+
+
+def build_focus_direction_arrows(
+    route_frames: list[pd.DataFrame],
+    highlighted_riders: list[str],
+    animation_phase: float,
+) -> pd.DataFrame:
+    """Build browser-refreshable directional markers without routing or geocoding."""
+
+    highlighted = set(highlighted_riders)
+    rows: list[dict[str, Any]] = []
+    route_index = 0
+    for frame in route_frames:
+        if frame is None or frame.empty or "Rider" not in frame.columns:
+            continue
+        for _, row in frame[frame["Rider"].isin(highlighted)].iterrows():
+            fraction = 0.08 + ((animation_phase * 0.16 + route_index * 0.23) % 0.84)
+            marker = _path_position_and_angle(row.get("path"), fraction)
+            route_index += 1
+            if marker is None:
+                continue
+            position, angle = marker
+            rows.append(
+                {
+                    "Rider": clean_text(row.get("Rider")),
+                    "position": position,
+                    "angle": angle,
+                    "arrow": "➤",
+                    "color": [255, 255, 255, 250],
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def render_focus_green_map(
     draft_assignment: dict[str, list[str]],
     visible_riders: list[str],
@@ -886,6 +937,8 @@ def render_focus_green_map(
     rider_starts: dict[str, str] | None = None,
     preview_routes: pd.DataFrame | None = None,
     rider_access_cache: dict[str, dict[str, Any]] | None = None,
+    highlighted_riders: list[str] | None = None,
+    animation_phase: float = 0.0,
 ) -> tuple[int, int, tuple[str, ...]]:
     """Render green jobs, red rider access, and immediate purple draft connectors."""
 
@@ -898,17 +951,101 @@ def render_focus_green_map(
         confirmed_assignment or draft_assignment, draft_assignment, jobs_df, starts
     )
     start_markers = build_rider_start_markers(visible_riders, starts)
+    highlighted = set(highlighted_riders or []) & set(visible_riders)
+    green_df = focus_data.route_df.copy()
+    access_df = access.route_df.copy()
+    marker_df = focus_data.marker_df.copy()
+    if highlighted:
+        missing_access_riders = highlighted - set(access_df.get("Rider", pd.Series(dtype=str)).tolist())
+        fallback_rows: list[dict[str, Any]] = []
+        for rider in sorted(missing_access_riders):
+            start_rows = start_markers[start_markers["Rider"] == rider] if not start_markers.empty else pd.DataFrame()
+            green_rows = green_df[green_df["Rider"] == rider].sort_values("Sequence") if not green_df.empty else pd.DataFrame()
+            if start_rows.empty or green_rows.empty:
+                continue
+            first_path = parse_route_path(green_rows.iloc[0].get("path"))
+            if not first_path:
+                continue
+            fallback_rows.append(
+                {
+                    "Rider": rider,
+                    "Sequence": 0,
+                    "Job ID": clean_text(green_rows.iloc[0].get("Job ID")),
+                    "path": [[float(start_rows.iloc[0]["lon"]), float(start_rows.iloc[0]["lat"])], first_path[0]],
+                    "color": [239, 68, 68, 235],
+                    "geometry_source": "highlight_straight_line_fallback",
+                    "tooltip": f"{rider}<br/>Start → first pickup<br/>straight-line highlight fallback",
+                }
+            )
+        if fallback_rows:
+            access_df = pd.concat([access_df, pd.DataFrame(fallback_rows)], ignore_index=True, sort=False)
     st.session_state["route_planner_rider_access_cache"] = access.cache
-    connector_df = connectors.route_df
+    connector_df = connectors.route_df.copy()
     if not connector_df.empty:
         connector_df = connector_df[connector_df["Rider"].isin(set(visible_riders))].copy()
     st.session_state["route_planner_draft_connectors"] = connector_df
+    route_frames = [green_df, access_df, connector_df]
+    glow_frames: list[pd.DataFrame] = []
+    if highlighted:
+        selected_colours = ([34, 255, 128, 255], [255, 72, 72, 255], [196, 112, 255, 255])
+        for frame, selected_colour in zip(route_frames, selected_colours):
+            if frame.empty:
+                continue
+            selected_mask = frame["Rider"].isin(highlighted)
+            glow_frames.append(frame[selected_mask].copy())
+            frame["color"] = [
+                selected_colour if is_selected else [*list(colour)[:3], 35]
+                for is_selected, colour in zip(selected_mask.tolist(), frame["color"].tolist())
+            ]
+        if not marker_df.empty:
+            marker_df["fill_color"] = [
+                colour if rider in highlighted else [*list(colour)[:3], 45]
+                for rider, colour in zip(marker_df["Rider"].tolist(), marker_df["fill_color"].tolist())
+            ]
+        if not start_markers.empty:
+            start_markers["fill_color"] = [
+                colour if rider in highlighted else [255, 255, 255, 45]
+                for rider, colour in zip(start_markers["Rider"].tolist(), start_markers["fill_color"].tolist())
+            ]
+    direction_arrows = build_focus_direction_arrows(route_frames, list(highlighted), animation_phase)
+    start_arrow_rows: list[dict[str, Any]] = []
+    for rider in sorted(highlighted):
+        rider_start = start_markers[start_markers["Rider"] == rider] if not start_markers.empty else pd.DataFrame()
+        rider_access = access_df[access_df["Rider"] == rider] if not access_df.empty else pd.DataFrame()
+        if rider_start.empty:
+            continue
+        marker = _path_position_and_angle(rider_access.iloc[0].get("path"), 0.001) if not rider_access.empty else None
+        start_arrow_rows.append(
+            {
+                "Rider": rider,
+                "position": [float(rider_start.iloc[0]["lon"]), float(rider_start.iloc[0]["lat"])],
+                "angle": marker[1] if marker else 0.0,
+                "arrow": "➤",
+                "color": [255, 255, 255, 255],
+            }
+        )
+    start_arrow_df = pd.DataFrame(start_arrow_rows)
+    visible_start_markers = start_markers[~start_markers["Rider"].isin(highlighted)].copy() if highlighted and not start_markers.empty else start_markers
     layers: list[pdk.Layer] = []
-    if not focus_data.route_df.empty:
+    if glow_frames:
+        glow_df = pd.concat(glow_frames, ignore_index=True, sort=False)
+        if not glow_df.empty:
+            layers.append(
+                pdk.Layer(
+                    "PathLayer",
+                    glow_df,
+                    id="focus-highlight-route-glow",
+                    get_path="path",
+                    get_color=[255, 255, 255, 90],
+                    width_min_pixels=13,
+                    pickable=False,
+                )
+            )
+    if not green_df.empty:
         layers.append(
             pdk.Layer(
                 "PathLayer",
-                focus_data.route_df,
+                green_df,
                 id="focus-green-loaded-routes",
                 get_path="path",
                 get_color="color",
@@ -916,11 +1053,11 @@ def render_focus_green_map(
                 pickable=True,
             )
         )
-    if not access.route_df.empty:
+    if not access_df.empty:
         layers.append(
             pdk.Layer(
                 "PathLayer",
-                access.route_df,
+                access_df,
                 id="focus-red-rider-access",
                 get_path="path",
                 get_color="color",
@@ -940,11 +1077,11 @@ def render_focus_green_map(
                 pickable=True,
             )
         )
-    if not start_markers.empty:
+    if not visible_start_markers.empty:
         layers.append(
             pdk.Layer(
                 "ScatterplotLayer",
-                start_markers,
+                visible_start_markers,
                 id="focus-rider-start-markers",
                 get_position="[lon, lat]",
                 get_fill_color="fill_color",
@@ -957,11 +1094,11 @@ def render_focus_green_map(
                 pickable=True,
             )
         )
-    if not focus_data.marker_df.empty:
+    if not marker_df.empty:
         layers.append(
             pdk.Layer(
                 "ScatterplotLayer",
-                focus_data.marker_df,
+                marker_df,
                 id="focus-job-markers",
                 get_position="[lon, lat]",
                 get_fill_color="fill_color",
@@ -974,10 +1111,44 @@ def render_focus_green_map(
                 pickable=True,
             )
         )
+    if not start_arrow_df.empty:
+        layers.append(
+            pdk.Layer(
+                "TextLayer",
+                start_arrow_df,
+                id="focus-rider-start-arrows",
+                get_position="position",
+                get_text="arrow",
+                get_color="color",
+                get_size=34,
+                get_angle="angle",
+                get_text_anchor="'middle'",
+                get_alignment_baseline="'center'",
+                pickable=True,
+            )
+        )
+    if not direction_arrows.empty:
+        layers.append(
+            pdk.Layer(
+                "TextLayer",
+                direction_arrows,
+                id="focus-moving-direction-arrows",
+                get_position="position",
+                get_text="arrow",
+                get_color="color",
+                get_size=17,
+                get_angle="angle",
+                get_text_anchor="'middle'",
+                get_alignment_baseline="'center'",
+                pickable=False,
+            )
+        )
     if not layers:
         st.info("No cached loaded routes are available for the visible riders.")
     else:
-        view_markers = pd.concat([focus_data.marker_df, start_markers], ignore_index=True, sort=False)
+        view_markers = pd.concat([marker_df, start_markers], ignore_index=True, sort=False)
+        if highlighted and not view_markers.empty:
+            view_markers = view_markers[view_markers["Rider"].isin(highlighted)].copy()
         deck = pdk.Deck(
             map_style="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
             initial_view_state=map_view_state(view_markers),
@@ -992,6 +1163,35 @@ def render_focus_green_map(
         )
     warnings = tuple(dict.fromkeys([*access.warnings, *connectors.warnings]))
     return len(focus_data.pending_job_ids), len(focus_data.route_df), warnings
+
+
+@st.fragment(run_every=0.8)
+def render_focus_green_map_animated(
+    draft_assignment: dict[str, list[str]],
+    visible_riders: list[str],
+    confirmed_routes: pd.DataFrame,
+    jobs_df: pd.DataFrame,
+    *,
+    confirmed_assignment: dict[str, list[str]],
+    rider_starts: dict[str, str],
+    preview_routes: pd.DataFrame | None,
+    rider_access_cache: dict[str, dict[str, Any]],
+    highlighted_riders: list[str],
+) -> tuple[int, int, tuple[str, ...]]:
+    """Animate directional arrows in an isolated fragment, leaving the board frozen."""
+
+    return render_focus_green_map(
+        draft_assignment,
+        visible_riders,
+        confirmed_routes,
+        jobs_df,
+        confirmed_assignment=confirmed_assignment,
+        rider_starts=rider_starts,
+        preview_routes=preview_routes,
+        rider_access_cache=rider_access_cache,
+        highlighted_riders=highlighted_riders,
+        animation_phase=time.time(),
+    )
 
 
 def _commit_recalculation_result(state: dict[str, Any], draft_assignment: dict[str, list[str]], result: Any) -> None:
@@ -1263,6 +1463,12 @@ def render_map_planner_focus(
     )
     st.session_state["route_planner_locked_rider_ids"] = locked_riders
     st.session_state["route_planner_locked_rider_baselines"] = locked_baselines
+    highlighted_riders = [
+        rider
+        for rider in st.session_state.get("route_planner_highlighted_rider_ids", [])
+        if rider in set(rider_names)
+    ]
+    st.session_state["route_planner_highlighted_rider_ids"] = highlighted_riders
     preview_routes = st.session_state.get("route_planner_preview_routes", pd.DataFrame())
     positions = _assignment_positions(draft_assignment)
     pool_job_ids = [
@@ -1419,7 +1625,8 @@ def render_map_planner_focus(
             map_col, panel_col = st.columns([1.2, 1], gap="small")
             with map_col:
                 with st.container(key="route_planner_focus_map", height="stretch", width="stretch"):
-                    pending_count, reused_count, map_warnings = render_focus_green_map(
+                    map_renderer = render_focus_green_map_animated if highlighted_riders else render_focus_green_map
+                    pending_count, reused_count, map_warnings = map_renderer(
                         draft_assignment,
                         list(st.session_state.get("route_planner_visible_riders", rider_names)),
                         confirmed_routes,
@@ -1428,6 +1635,7 @@ def render_map_planner_focus(
                         rider_starts=rider_starts,
                         preview_routes=preview_routes,
                         rider_access_cache=st.session_state.get("route_planner_rider_access_cache", {}),
+                        highlighted_riders=highlighted_riders,
                     )
                     LOGGER.debug("Route planner focus map green_reused=%s pending=%s", reused_count, pending_count)
             with panel_col:
@@ -1462,7 +1670,7 @@ def render_map_planner_focus(
                             if st.checkbox(rider, key=key):
                                 selected_riders.append(rider)
                         st.session_state["route_planner_visible_riders"] = selected_riders
-                    proposed, component_locks, component_event = render_route_assignment_board(
+                    proposed, component_locks, component_highlights, component_event = render_route_assignment_board(
                         draft_assignment,
                         jobs_by_id,
                         state["summary_df"],
@@ -1473,9 +1681,16 @@ def render_map_planner_focus(
                         board_revision=int(st.session_state.get("route_planner_board_revision", 0)),
                         return_metadata=True,
                         can_reshuffle_from_pool=can_reshuffle,
+                        highlighted_rider_ids=highlighted_riders,
                     )
                     if component_event == "reshuffle":
                         st.session_state["route_planner_reshuffle_requested"] = True
+                        st.session_state["route_planner_board_revision"] = int(st.session_state.get("route_planner_board_revision", 0)) + 1
+                        st.rerun()
+                    if component_highlights is not None and set(component_highlights) != set(highlighted_riders):
+                        st.session_state["route_planner_highlighted_rider_ids"] = [
+                            rider for rider in component_highlights if rider in set(rider_names)
+                        ]
                         st.session_state["route_planner_board_revision"] = int(st.session_state.get("route_planner_board_revision", 0)) + 1
                         st.rerun()
                     if component_locks is not None and set(component_locks) != set(locked_riders):
