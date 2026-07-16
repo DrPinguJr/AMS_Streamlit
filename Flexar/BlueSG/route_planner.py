@@ -27,6 +27,7 @@ from .vehicle_route_optimizer import (
 
 
 UNASSIGNED_LANE = "__UNASSIGNED__"
+RESHUFFLE_POOL_LANE = "__RESHUFFLE_POOL__"
 HISTORY_LIMIT = 15
 Assignment = dict[str, list[str]]
 
@@ -119,7 +120,8 @@ def build_planner_session_state(
 ) -> dict[str, Any]:
     """Return a fresh planner session payload with no stale history."""
 
-    assignment = assignment_from_routes(route_df, jobs_df, rider_names)
+    rider_list = [clean_text(rider) for rider in rider_names if clean_text(rider)]
+    assignment = assignment_from_routes(route_df, jobs_df, rider_list)
     return {
         "route_planner_workbook_id": workbook_id,
         "route_planner_confirmed_routes": route_df.copy(),
@@ -132,20 +134,24 @@ def build_planner_session_state(
         "route_planner_affected_riders": [],
         "route_planner_selected_job_id": None,
         "route_planner_focus_mode": False,
-        "route_planner_visible_riders": [clean_text(rider) for rider in rider_names if clean_text(rider)],
+        "route_planner_visible_riders": list(rider_list),
         "route_planner_focus_notice": "",
         "route_planner_show_red_preview": False,
         "route_planner_preview_routes": pd.DataFrame(),
         "route_planner_preview_assignment_signature": "",
-        "route_planner_preview_stale_riders": [clean_text(rider) for rider in rider_names if clean_text(rider)],
+        "route_planner_preview_stale_riders": list(rider_list),
         "route_planner_preview_error": "",
         "route_planner_preview_stats": {},
-        "route_planner_locked_rider_ids": [],
-        "route_planner_locked_rider_baselines": {},
+        "route_planner_locked_rider_ids": list(rider_list),
+        "route_planner_locked_rider_baselines": {
+            clean_text(rider): list(assignment.get(clean_text(rider), []))
+            for rider in rider_list
+        },
         "route_planner_manual_move_history": {},
         "route_planner_rider_access_cache": {},
         "route_planner_draft_connectors": pd.DataFrame(),
         "route_planner_reshuffle_notice": "",
+        "route_planner_reshuffle_pool_job_ids": [],
         "route_planner_board_revision": 0,
     }
 
@@ -187,6 +193,7 @@ def focus_apply_success_state(draft_assignment: Assignment, result: Recalculatio
         "route_planner_manual_move_history": {},
         "route_planner_draft_connectors": pd.DataFrame(),
         "route_planner_reshuffle_notice": "",
+        "route_planner_reshuffle_pool_job_ids": [],
     }
 
 
@@ -350,6 +357,39 @@ def normalise_rider_locks(
     return locked, baselines
 
 
+def reconcile_reshuffle_pool_board(
+    current_assignment: Assignment,
+    board_assignment: Assignment,
+) -> tuple[Assignment, list[str]]:
+    """Keep pooled jobs frozen in their current routes while exposing a UI-only drop lane."""
+
+    pool = list(board_assignment.get(RESHUFFLE_POOL_LANE, []))
+    proposed = {
+        lane: list(job_ids)
+        for lane, job_ids in board_assignment.items()
+        if lane != RESHUFFLE_POOL_LANE
+    }
+    positions = {
+        job_id: (lane, index)
+        for lane, job_ids in current_assignment.items()
+        for index, job_id in enumerate(job_ids)
+    }
+    by_lane: dict[str, list[tuple[int, str]]] = {}
+    for job_id in pool:
+        if job_id not in positions:
+            continue
+        lane, index = positions[job_id]
+        by_lane.setdefault(lane, []).append((index, job_id))
+    for lane, entries in by_lane.items():
+        jobs = proposed.setdefault(lane, [])
+        for index, job_id in sorted(entries):
+            if job_id not in jobs:
+                jobs.insert(min(index, len(jobs)), job_id)
+    for lane in current_assignment:
+        proposed.setdefault(lane, [])
+    return proposed, pool
+
+
 def detect_affected_riders(
     confirmed: Assignment,
     draft: Assignment,
@@ -473,6 +513,7 @@ def reshuffle_unlocked_assignments(
     rider_df: pd.DataFrame,
     jobs_df: pd.DataFrame,
     *,
+    eligible_job_ids: Iterable[str] | None = None,
     max_candidates: int = 600,
     beam_width: int = 40,
     origin_return_penalty: float = 15.0,
@@ -490,11 +531,13 @@ def reshuffle_unlocked_assignments(
         return ReshuffleResult(clone_assignment(draft_assignment), False, "; ".join(validation.errors), {})
     locked = {clean_text(rider) for rider in locked_rider_ids if clean_text(rider) in rider_names}
     unlocked = [rider for rider in rider_names if rider not in locked]
-    movable = {job_id for rider in unlocked for job_id in draft_assignment.get(rider, [])}
+    unlocked_jobs = {job_id for rider in unlocked for job_id in draft_assignment.get(rider, [])}
+    requested_jobs = {clean_text(job_id) for job_id in eligible_job_ids or [] if clean_text(job_id)}
+    movable = unlocked_jobs & requested_jobs if eligible_job_ids is not None else unlocked_jobs
     if len(unlocked) < 2:
         return ReshuffleResult(clone_assignment(draft_assignment), False, "Unlock at least two riders before reshuffling.", {})
     if not movable:
-        return ReshuffleResult(clone_assignment(draft_assignment), False, "There are no unlocked assigned jobs to reshuffle.", {})
+        return ReshuffleResult(clone_assignment(draft_assignment), False, "Drop at least one unlocked order into the reshuffle pool.", {})
     sequences = {rider: list(draft_assignment.get(rider, [])) for rider in rider_names}
     origins = {
         job_id: clean_text(entry.get("origin_rider_id"))
@@ -600,6 +643,32 @@ def _coordinate(
         except (TypeError, ValueError):
             return None
     return None
+
+
+def build_rider_start_markers(
+    visible_riders: Iterable[str],
+    rider_starts: dict[str, str],
+    *,
+    coordinate_lookup: Callable[[str], object] | None = None,
+) -> pd.DataFrame:
+    """Return bright white start markers using stored coordinates only."""
+
+    rows: list[dict[str, Any]] = []
+    for rider in visible_riders:
+        address = clean_text(rider_starts.get(rider))
+        point = _coordinate(address, coordinate_lookup)
+        if point is None:
+            continue
+        rows.append(
+            {
+                "Rider": rider,
+                "lon": point[0],
+                "lat": point[1],
+                "fill_color": [255, 255, 255, 255],
+                "tooltip": f"{rider}<br/>Starting location<br/>{address}",
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _draft_connector_specs(

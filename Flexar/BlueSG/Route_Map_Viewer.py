@@ -12,11 +12,17 @@ from typing import Any
 import pandas as pd
 import pydeck as pdk
 import streamlit as st
+import streamlit.components.v1 as components
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+ROUTE_BOARD_COMPONENT = components.declare_component(
+    "route_planner_assignment_board",
+    path=str(BASE_DIR / "route_board_component"),
+)
 
 from Flexar.BlueSG.vehicle_route_optimizer import (
     DEFAULT_DURATION_BUFFER_MULTIPLIER,
@@ -47,11 +53,13 @@ from Flexar.BlueSG.vehicle_route_optimizer import (
 )
 from Flexar.BlueSG.route_planner import (
     HISTORY_LIMIT,
+    RESHUFFLE_POOL_LANE,
     UNASSIGNED_LANE,
     assignment_from_routes,
     build_focus_map_data,
     build_draft_connector_lines,
     build_rider_access_paths,
+    build_rider_start_markers,
     build_compact_rider_summary,
     build_planner_session_state,
     build_draft_preview_routes,
@@ -69,6 +77,7 @@ from Flexar.BlueSG.route_planner import (
     normalise_assignment_board,
     normalise_rider_locks,
     record_manual_job_moves,
+    reconcile_reshuffle_pool_board,
     refresh_red_connector_preview,
     redo_draft,
     reset_draft,
@@ -78,12 +87,6 @@ from Flexar.BlueSG.route_planner import (
     validate_assignment_board,
     validate_locked_rider_change,
 )
-
-try:
-    from streamlit_sortables import sort_items
-except ImportError:  # Displayed as an actionable page error below.
-    sort_items = None
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -722,11 +725,19 @@ def build_sortable_board(
     summary_df: pd.DataFrame,
     rider_df: pd.DataFrame,
     locked_rider_ids: list[str] | None = None,
+    reshuffle_pool_job_ids: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, str], dict[str, str], list[str]]:
     """Build display-only strings with exact reversible mappings to stable IDs."""
 
     rider_names = rider_df["Rider Name"].apply(clean_text).dropna().tolist()
-    lane_order = [*rider_names, UNASSIGNED_LANE]
+    pool = [job_id for job_id in reshuffle_pool_job_ids or [] if job_id in jobs_by_id]
+    display_assignment = clone_assignment(assignment)
+    if pool:
+        pool_set = set(pool)
+        for lane in display_assignment:
+            display_assignment[lane] = [job_id for job_id in display_assignment[lane] if job_id not in pool_set]
+    display_assignment[RESHUFFLE_POOL_LANE] = pool
+    lane_order = [RESHUFFLE_POOL_LANE, *rider_names, UNASSIGNED_LANE]
     max_jobs_by_rider = {
         clean_text(row.get("Rider Name")): pd.to_numeric(pd.Series([row.get("Max Jobs")]), errors="coerce").iloc[0]
         for _, row in rider_df.iterrows()
@@ -736,15 +747,15 @@ def build_sortable_board(
     card_to_job_id: dict[str, str] = {}
     locked = set(locked_rider_ids or [])
     for lane_index, lane in enumerate(lane_order, start=1):
-        jobs = assignment.get(lane, [])
-        display_name = "Unassigned" if lane == UNASSIGNED_LANE else lane
-        duration = 0.0 if lane == UNASSIGNED_LANE else lane_duration(summary_df, lane)
+        jobs = display_assignment.get(lane, [])
+        display_name = "Reshuffle Pool" if lane == RESHUFFLE_POOL_LANE else ("Unassigned" if lane == UNASSIGNED_LANE else lane)
+        duration = 0.0 if lane in {UNASSIGNED_LANE, RESHUFFLE_POOL_LANE} else lane_duration(summary_df, lane)
         max_jobs = max_jobs_by_rider.get(lane)
         over_jobs = lane != UNASSIGNED_LANE and pd.notna(max_jobs) and float(max_jobs) > 0 and len(jobs) > int(max_jobs)
         warning = " ⚠" if over_jobs or duration > 180 or lane == UNASSIGNED_LANE and jobs else ""
-        duration_label = "not routed" if lane == UNASSIGNED_LANE else f"{duration:.0f} confirmed min"
-        lock_icon = " 🔒" if lane in locked else (" 🔓" if lane != UNASSIGNED_LANE else "")
-        header = f"{display_name} · {len(jobs)} jobs · {duration_label}{warning} · lane-{lane_index:02d}{lock_icon}"
+        duration_label = "drop orders here" if lane == RESHUFFLE_POOL_LANE else ("not routed" if lane == UNASSIGNED_LANE else f"{duration:.0f} confirmed min")
+        lock_icon = " 🔒" if lane in locked else (" 🔓" if lane not in {UNASSIGNED_LANE, RESHUFFLE_POOL_LANE} else "")
+        header = f"{display_name} · {len(jobs)} orders · {duration_label}{warning} · lane-{lane_index:02d}{lock_icon}"
         header_to_lane[header] = lane
         cards: list[str] = []
         for job_id in jobs:
@@ -755,7 +766,15 @@ def build_sortable_board(
                 card += "·"
             card_to_job_id[card] = job_id
             cards.append(card)
-        board.append({"header": header, "items": cards})
+        board.append(
+            {
+                "header": header,
+                "display_header": f"{display_name} · {len(jobs)} orders · {duration_label}{warning}",
+                "lane_id": lane,
+                "is_pool": lane == RESHUFFLE_POOL_LANE,
+                "items": cards,
+            }
+        )
     return board, header_to_lane, card_to_job_id, lane_order
 
 
@@ -767,48 +786,30 @@ def render_route_assignment_board(
     *,
     dark_mode: bool = False,
     locked_rider_ids: list[str] | None = None,
+    reshuffle_pool_job_ids: list[str] | None = None,
     board_revision: int = 0,
-) -> dict[str, list[str]] | None:
-    if sort_items is None:
-        st.error("Drag-and-drop planner dependency is missing. Install project requirements and restart Streamlit.")
-        st.code(r".\.venv\Scripts\python.exe -m pip install -r requirements.txt")
-        return None
+    return_metadata: bool = False,
+) -> dict[str, list[str]] | tuple[dict[str, list[str]] | None, list[str] | None] | None:
     board, header_to_lane, card_to_job_id, lane_order = build_sortable_board(
-        assignment, jobs_by_id, summary_df, rider_df, locked_rider_ids
+        assignment, jobs_by_id, summary_df, rider_df, locked_rider_ids, reshuffle_pool_job_ids
     )
-    custom_style = """
-    .sortable-component { padding: 0; }
-    .sortable-container { border: 1px solid #d8dee9; border-radius: 9px; margin-bottom: .55rem; background: #f8fafc; }
-    .sortable-container-header { padding: .48rem .65rem; background: #e8eef7; color: #172033; font-weight: 700; font-size: .85rem; }
-    .sortable-container-body { min-height: 38px; padding: .35rem; }
-    .sortable-item, .sortable-item:hover { white-space: pre-line; border: 1px solid #cbd5e1; border-radius: 7px; background: white; color: #172033; padding: .45rem .55rem; margin: .28rem 0; font-size: .78rem; line-height: 1.25; cursor: grab; counter-increment: item; }
-    .sortable-container-body { counter-reset: item; }
-    .sortable-item::before { content: counter(item) ". "; font-weight: 800; color: #2563eb; }
-    """
-    if dark_mode:
-        custom_style = """
-        html, body { height: 100%; margin: 0; overflow: hidden; background: #111827; }
-        .sortable-component { display: flex !important; flex-direction: column !important; flex-wrap: nowrap !important; align-items: stretch !important; width: 100% !important; height: calc(100dvh - 238px) !important; min-height: 210px; overflow-y: auto !important; overflow-x: hidden !important; overscroll-behavior: contain; scrollbar-gutter: stable; padding: 0 .2rem .8rem 0; background: #111827; color: #e5e7eb; }
-        .sortable-container { display: block !important; flex: 0 0 auto !important; width: 100% !important; min-width: 100% !important; max-width: 100% !important; box-sizing: border-box !important; border: 1px solid #374151; border-radius: 9px; margin: 0 0 .55rem 0 !important; background: #111827; overflow: hidden; }
-        .sortable-container-header { padding: .48rem .6rem; background: #1f2937; color: #f9fafb; font-weight: 700; font-size: .78rem; line-height: 1.2; }
-        .sortable-container-body { display: flex !important; flex-direction: column !important; flex-wrap: nowrap !important; width: 100% !important; min-height: 38px; padding: .3rem; box-sizing: border-box !important; background: #111827; counter-reset: item; }
-        .sortable-item, .sortable-item:hover { display: block !important; flex: 0 0 auto !important; width: 100% !important; max-width: 100% !important; box-sizing: border-box !important; white-space: pre-line; border: 1px solid #4b5563; border-radius: 7px; background: #182235; color: #e5e7eb; padding: .34rem .45rem; margin: .2rem 0; font-size: .72rem; line-height: 1.2; cursor: grab; counter-increment: item; box-shadow: none; touch-action: none; }
-        .sortable-item:hover { border-color: #10b981; background: #1d2b3f; }
-        .sortable-item::before { content: counter(item) ". "; font-weight: 800; color: #34d399; }
-        """
-    raw_board = sort_items(
-        board,
-        multi_containers=True,
-        direction="vertical",
-        custom_style=custom_style,
-        key=f"route_planner_board_{assignment_signature(assignment)}_{assignment_signature({'locked': sorted(locked_rider_ids or [])})}_{board_revision}",
+    component_value = ROUTE_BOARD_COMPONENT(
+        board=board,
+        locked_rider_ids=sorted(locked_rider_ids or []),
+        key=f"route_planner_board_{assignment_signature(assignment)}_{assignment_signature({'locked': sorted(locked_rider_ids or []), 'pool': sorted(reshuffle_pool_job_ids or [])})}_{board_revision}",
+        default=None,
     )
+    if not isinstance(component_value, dict):
+        return (None, None) if return_metadata else None
+    raw_board = component_value.get("board")
+    returned_locks = [clean_text(rider) for rider in component_value.get("locked_rider_ids", []) if clean_text(rider)]
     try:
-        return normalise_assignment_board(raw_board, header_to_lane, card_to_job_id, lane_order)
+        normalised = normalise_assignment_board(raw_board, header_to_lane, card_to_job_id, lane_order)
+        return (normalised, returned_locks) if return_metadata else normalised
     except ValueError as exc:
         LOGGER.warning("Route planner component validation failed: %s", exc)
         st.error(str(exc))
-        return None
+        return (None, returned_locks) if return_metadata else None
 
 
 def _assignment_positions(assignment: dict[str, list[str]]) -> dict[str, tuple[str, int]]:
@@ -892,6 +893,7 @@ def render_focus_green_map(
     connectors = build_draft_connector_lines(
         confirmed_assignment or draft_assignment, draft_assignment, jobs_df, starts
     )
+    start_markers = build_rider_start_markers(visible_riders, starts)
     st.session_state["route_planner_rider_access_cache"] = access.cache
     connector_df = connectors.route_df
     if not connector_df.empty:
@@ -934,6 +936,23 @@ def render_focus_green_map(
                 pickable=True,
             )
         )
+    if not start_markers.empty:
+        layers.append(
+            pdk.Layer(
+                "ScatterplotLayer",
+                start_markers,
+                id="focus-rider-start-markers",
+                get_position="[lon, lat]",
+                get_fill_color="fill_color",
+                get_radius=82,
+                radius_min_pixels=7,
+                radius_max_pixels=14,
+                stroked=True,
+                get_line_color=[17, 24, 39, 255],
+                line_width_min_pixels=2,
+                pickable=True,
+            )
+        )
     if not focus_data.marker_df.empty:
         layers.append(
             pdk.Layer(
@@ -954,9 +973,10 @@ def render_focus_green_map(
     if not layers:
         st.info("No cached loaded routes are available for the visible riders.")
     else:
+        view_markers = pd.concat([focus_data.marker_df, start_markers], ignore_index=True, sort=False)
         deck = pdk.Deck(
             map_style="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
-            initial_view_state=map_view_state(focus_data.marker_df),
+            initial_view_state=map_view_state(view_markers),
             layers=layers,
             tooltip={"html": "{tooltip}", "style": {"backgroundColor": "#111827", "color": "white"}},
         )
@@ -1211,6 +1231,7 @@ def render_map_planner_focus(
         .st-key-route_planner_focus_toolbar { padding: 8px 10px; border-bottom: 1px solid #273244; background: #0c1320; }
         .st-key-route_planner_focus_workspace, .st-key-route_planner_focus_workspace > div[data-testid="stVerticalBlock"], .st-key-route_planner_focus_workspace [data-testid="stHorizontalBlock"], .st-key-route_planner_focus_workspace [data-testid="stColumn"] { width: 100% !important; height: 100% !important; min-height: 0 !important; overflow: hidden !important; }
         .st-key-route_planner_focus_workspace [data-testid="stHorizontalBlock"] { gap: 8px !important; padding: 8px; align-items: stretch !important; }
+        .st-key-route_planner_focus_workspace [data-testid="stVerticalBlockBorderWrapper"] { height: 100% !important; min-height: 0 !important; overflow: hidden !important; }
         .st-key-route_planner_focus_map, .st-key-route_planner_focus_map > div[data-testid="stVerticalBlock"], .st-key-route_planner_focus_map [data-testid="stDeckGlJsonChart"], .st-key-route_planner_focus_map [data-testid="stDeckGlJsonChart"] > div { width: 100% !important; height: 100% !important; min-height: 0 !important; overflow: hidden !important; }
         .st-key-route_planner_focus_panel { width: 100% !important; height: 100% !important; min-height: 0 !important; overflow: hidden !important; background: #111827 !important; border-color: #374151 !important; }
         .st-key-route_planner_focus_panel > div[data-testid="stVerticalBlock"] { width: 100% !important; height: 100% !important; min-height: 0 !important; overflow-y: auto !important; overflow-x: hidden !important; overscroll-behavior: contain; scrollbar-gutter: stable; padding-bottom: .5rem; }
@@ -1231,7 +1252,7 @@ def render_map_planner_focus(
     dirty = bool(st.session_state.get("route_planner_is_dirty"))
     stale_riders = list(st.session_state.get("route_planner_preview_stale_riders", rider_names))
     locked_riders, locked_baselines = normalise_rider_locks(
-        st.session_state.get("route_planner_locked_rider_ids", []),
+        st.session_state.get("route_planner_locked_rider_ids", rider_names),
         rider_names,
         draft_assignment,
         st.session_state.get("route_planner_locked_rider_baselines", {}),
@@ -1239,9 +1260,16 @@ def render_map_planner_focus(
     st.session_state["route_planner_locked_rider_ids"] = locked_riders
     st.session_state["route_planner_locked_rider_baselines"] = locked_baselines
     preview_routes = st.session_state.get("route_planner_preview_routes", pd.DataFrame())
+    positions = _assignment_positions(draft_assignment)
+    pool_job_ids = [
+        job_id
+        for job_id in st.session_state.get("route_planner_reshuffle_pool_job_ids", [])
+        if job_id in positions and positions[job_id][0] not in set(locked_riders)
+    ]
+    st.session_state["route_planner_reshuffle_pool_job_ids"] = pool_job_ids
     total_jobs = sum(len(job_ids) for lane, job_ids in draft_assignment.items() if lane != UNASSIGNED_LANE)
     unlocked_riders = [rider for rider in rider_names if rider not in set(locked_riders)]
-    can_reshuffle = len(unlocked_riders) >= 2 and any(draft_assignment.get(rider) for rider in unlocked_riders)
+    can_reshuffle = len(unlocked_riders) >= 2 and bool(pool_job_ids)
 
     with st.container(key="route_planner_focus_shell", height="stretch", width="stretch"):
         with st.container(key="route_planner_focus_toolbar", height=56, width="stretch"):
@@ -1257,7 +1285,7 @@ def render_map_planner_focus(
             redo_clicked = bar[3].button("Redo", disabled=not st.session_state.get("route_planner_redo_stack"), width="stretch")
             refresh_clicked = bar[4].button("Refresh Exact", width="stretch", help="Refresh cached public-transport connector routes.")
             reshuffle_clicked = bar[5].button(
-                f"Reshuffle · {len(locked_riders)} 🔒",
+                f"Reshuffle {len(pool_job_ids)} · {len(locked_riders)} 🔒",
                 disabled=not can_reshuffle,
                 width="stretch",
                 help="Bounded search across unlocked riders only.",
@@ -1299,6 +1327,7 @@ def render_map_planner_focus(
                     st.session_state.get("route_planner_manual_move_history", {}),
                     rider_df,
                     jobs_df,
+                    eligible_job_ids=pool_job_ids,
                 )
             st.session_state["route_planner_reshuffle_notice"] = reshuffle.message
             if reshuffle.changed and _store_draft_change(
@@ -1308,6 +1337,7 @@ def render_map_planner_focus(
                 rider_starts,
                 record_manual=False,
             ):
+                st.session_state["route_planner_reshuffle_pool_job_ids"] = []
                 LOGGER.info("Route planner reshuffle stats=%s", reshuffle.stats)
                 st.rerun()
 
@@ -1376,11 +1406,9 @@ def render_map_planner_focus(
                     st.rerun()
 
         with st.container(key="route_planner_focus_workspace", height="stretch", width="stretch"):
-            map_col, panel_col = st.columns([3, 1], gap="small")
+            map_col, panel_col = st.columns([1.7, 1], gap="small")
             with map_col:
                 with st.container(key="route_planner_focus_map", height="stretch", width="stretch"):
-                    if st.session_state.get("route_planner_preview_error"):
-                        st.error("Red connector preview could not be refreshed. Your draft is unchanged.")
                     pending_count, reused_count, map_warnings = render_focus_green_map(
                         draft_assignment,
                         list(st.session_state.get("route_planner_visible_riders", rider_names)),
@@ -1391,55 +1419,82 @@ def render_map_planner_focus(
                         preview_routes=preview_routes,
                         rider_access_cache=st.session_state.get("route_planner_rider_access_cache", {}),
                     )
-                    if pending_count:
-                        st.warning(f"{pending_count} visible job route(s) pending. They will be calculated when you apply.")
-                    if map_warnings:
-                        st.warning(map_warnings[0] + (f" (+{len(map_warnings) - 1} more)" if len(map_warnings) > 1 else ""))
                     LOGGER.debug("Route planner focus map green_reused=%s pending=%s", reused_count, pending_count)
             with panel_col:
                 with st.container(key="route_planner_focus_panel", height="stretch", width="stretch", border=True):
+                    if st.session_state.get("route_planner_preview_error"):
+                        st.warning("Exact access-route refresh failed; the saved draft is unchanged.")
+                    if pending_count or map_warnings:
+                        messages = ([f"{pending_count} route(s) pending apply."] if pending_count else []) + list(map_warnings[:1])
+                        st.caption(" ".join(messages))
                     if st.session_state.get("route_planner_lock_warning"):
                         st.warning(st.session_state.pop("route_planner_lock_warning"))
                     notice = clean_text(st.session_state.get("route_planner_reshuffle_notice"))
                     if notice:
                         st.caption(notice)
-                    st.multiselect(
-                        "Locked riders",
-                        options=rider_names,
-                        key="route_planner_locked_rider_ids",
-                        help="Locked rider sequences cannot be changed by drag, undo/redo, reset, reshuffle, or apply.",
-                    )
-                    show_col, hide_col = st.columns(2)
-                    show_all = show_col.button("Show All", width="stretch")
-                    hide_all = hide_col.button("Hide All", width="stretch")
-                    if show_all or hide_all:
-                        selected = rider_names if show_all else []
-                        st.session_state["route_planner_visible_riders"] = selected
+                    st.caption("Riders start locked. Use the lock beside each rider name to allow changes.")
+                    with st.expander("Map visibility", expanded=False):
+                        show_col, hide_col = st.columns(2)
+                        show_all = show_col.button("Show All", width="stretch")
+                        hide_all = hide_col.button("Hide All", width="stretch")
+                        if show_all or hide_all:
+                            selected = rider_names if show_all else []
+                            st.session_state["route_planner_visible_riders"] = selected
+                            for rider in rider_names:
+                                st.session_state[f"route_planner_visible_{hashlib.sha1(rider.encode()).hexdigest()[:10]}"] = rider in selected
+                            st.rerun()
+                        current_visible = set(st.session_state.get("route_planner_visible_riders", rider_names))
+                        selected_riders: list[str] = []
                         for rider in rider_names:
-                            st.session_state[f"route_planner_visible_{hashlib.sha1(rider.encode()).hexdigest()[:10]}"] = rider in selected
-                        st.rerun()
-                    current_visible = set(st.session_state.get("route_planner_visible_riders", rider_names))
-                    selected_riders: list[str] = []
-                    for rider in rider_names:
-                        key = f"route_planner_visible_{hashlib.sha1(rider.encode()).hexdigest()[:10]}"
-                        if key not in st.session_state:
-                            st.session_state[key] = rider in current_visible
-                        if st.checkbox(f"{rider} · {len(draft_assignment.get(rider, []))} jobs", key=key):
-                            selected_riders.append(rider)
-                    st.session_state["route_planner_visible_riders"] = selected_riders
-                    proposed = render_route_assignment_board(
+                            key = f"route_planner_visible_{hashlib.sha1(rider.encode()).hexdigest()[:10]}"
+                            if key not in st.session_state:
+                                st.session_state[key] = rider in current_visible
+                            if st.checkbox(rider, key=key):
+                                selected_riders.append(rider)
+                        st.session_state["route_planner_visible_riders"] = selected_riders
+                    proposed, component_locks = render_route_assignment_board(
                         draft_assignment,
                         jobs_by_id,
                         state["summary_df"],
                         rider_df,
                         dark_mode=True,
                         locked_rider_ids=locked_riders,
+                        reshuffle_pool_job_ids=pool_job_ids,
                         board_revision=int(st.session_state.get("route_planner_board_revision", 0)),
+                        return_metadata=True,
                     )
-                    if proposed is not None and proposed != draft_assignment:
-                        validation = validate_assignment_board(proposed, jobs_by_id, rider_names)
-                        lock_validation = validate_locked_rider_change(locked_baselines, proposed, locked_riders)
-                        if validation.is_valid and lock_validation.is_valid and _store_draft_change(draft_assignment, proposed, confirmed_assignment, rider_starts):
+                    if component_locks is not None and set(component_locks) != set(locked_riders):
+                        next_locks, next_baselines = normalise_rider_locks(
+                            component_locks,
+                            rider_names,
+                            draft_assignment,
+                            locked_baselines,
+                        )
+                        st.session_state["route_planner_locked_rider_ids"] = next_locks
+                        st.session_state["route_planner_locked_rider_baselines"] = next_baselines
+                        st.session_state["route_planner_board_revision"] = int(st.session_state.get("route_planner_board_revision", 0)) + 1
+                        st.rerun()
+                    if proposed is not None:
+                        complete_proposed, proposed_pool = reconcile_reshuffle_pool_board(draft_assignment, proposed)
+                        pool_changed = proposed_pool != pool_job_ids
+                        assignment_changed = complete_proposed != draft_assignment
+                        locked_pool_jobs = [
+                            job_id
+                            for job_id in proposed_pool
+                            if positions.get(job_id, ("", 0))[0] in set(locked_riders)
+                        ]
+                        validation = validate_assignment_board(complete_proposed, jobs_by_id, rider_names)
+                        lock_validation = validate_locked_rider_change(locked_baselines, complete_proposed, locked_riders)
+                        if locked_pool_jobs:
+                            st.session_state["route_planner_lock_warning"] = "Unlock a rider before moving one of their orders into the reshuffle pool."
+                            st.session_state["route_planner_board_revision"] = int(st.session_state.get("route_planner_board_revision", 0)) + 1
+                            st.rerun()
+                        if validation.is_valid and lock_validation.is_valid and (pool_changed or assignment_changed):
+                            st.session_state["route_planner_reshuffle_pool_job_ids"] = proposed_pool
+                            if assignment_changed:
+                                _store_draft_change(draft_assignment, complete_proposed, confirmed_assignment, rider_starts)
+                            else:
+                                st.session_state["route_planner_board_revision"] = int(st.session_state.get("route_planner_board_revision", 0)) + 1
                             st.rerun()
                         if not validation.is_valid:
                             st.error("That move would create an invalid assignment.")
@@ -1461,6 +1516,7 @@ def render_map_planner_focus(
                             st.session_state["route_planner_affected_riders"] = []
                             st.session_state["route_planner_manual_move_history"] = {}
                             st.session_state["route_planner_draft_connectors"] = pd.DataFrame()
+                            st.session_state["route_planner_reshuffle_pool_job_ids"] = []
                             st.session_state["route_planner_board_revision"] = int(st.session_state.get("route_planner_board_revision", 0)) + 1
                             st.session_state["route_planner_preview_stale_riders"] = list(invalidate_red_preview(draft_assignment, updated, stale_riders))
                             st.rerun()

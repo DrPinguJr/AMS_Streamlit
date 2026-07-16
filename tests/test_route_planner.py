@@ -9,10 +9,12 @@ import pytest
 from Flexar.BlueSG import vehicle_route_optimizer as optimizer
 from Flexar.BlueSG.route_planner import (
     UNASSIGNED_LANE,
+    RESHUFFLE_POOL_LANE,
     assignment_from_routes,
     build_planner_session_state,
     build_draft_connector_lines,
     build_rider_access_paths,
+    build_rider_start_markers,
     build_focus_map_data,
     build_compact_rider_summary,
     build_route_leg_signatures,
@@ -32,6 +34,7 @@ from Flexar.BlueSG.route_planner import (
     normalise_assignment_board,
     refresh_red_connector_preview,
     record_manual_job_moves,
+    reconcile_reshuffle_pool_board,
     renderable_red_preview_routes,
     redo_draft,
     reset_draft,
@@ -245,6 +248,32 @@ def test_purple_connectors_cover_middle_insert_and_removed_gap(planner_data) -> 
     assert closed_gap.iloc[0]["path"] == [coordinates["Bedok"], coordinates["Yishun"]]
 
 
+def test_reshuffle_pool_freezes_selected_jobs_until_action(planner_data) -> None:
+    _, _, ids, original, _ = planner_data
+    selected = ids["SPE1002B"]
+    board = {
+        RESHUFFLE_POOL_LANE: [selected],
+        "Lester": [ids["SPE1001A"]],
+        "Syed": list(original["Syed"]),
+        UNASSIGNED_LANE: [],
+    }
+    proposed, pool = reconcile_reshuffle_pool_board(original, board)
+    assert pool == [selected]
+    assert proposed == original
+
+
+def test_rider_start_markers_are_bright_white() -> None:
+    markers = build_rider_start_markers(
+        ["Rider A", "Rider B"],
+        {"Rider A": "Home A", "Rider B": "Missing"},
+        coordinate_lookup={"Home A": [103.8, 1.3]}.get,
+    )
+    assert markers[["Rider", "lon", "lat"]].to_dict("records") == [
+        {"Rider": "Rider A", "lon": 103.8, "lat": 1.3}
+    ]
+    assert markers.iloc[0]["fill_color"] == [255, 255, 255, 255]
+
+
 def test_red_rider_access_uses_confirmed_public_transport_then_cache(planner_data) -> None:
     jobs_df, rider_df, ids, original, routes = planner_data
     starts = dict(zip(rider_df["Rider Name"], rider_df["Start Location"]))
@@ -309,6 +338,7 @@ def test_reshuffle_wrapper_preserves_locks_and_assignment_integrity(planner_data
 
     def fake_search(sequences, *args, **kwargs):
         assert kwargs["locked_riders"] == {"Lester"}
+        assert kwargs["reshuffle_job_ids"] == {ids["SPE1003C"]}
         assert kwargs["origin_rider_by_job"][ids["SPE1003C"]] == "Syed"
         proposed = {rider: list(jobs) for rider, jobs in sequences.items()}
         proposed["Syed"] = []
@@ -321,6 +351,7 @@ def test_reshuffle_wrapper_preserves_locks_and_assignment_integrity(planner_data
         {ids["SPE1003C"]: {"origin_rider_id": "Syed"}},
         rider_df,
         jobs_df,
+        eligible_job_ids=[ids["SPE1003C"]],
         search_fn=fake_search,
     )
     assert result.changed
@@ -449,9 +480,14 @@ def test_new_workbook_session_payload_clears_stale_history(planner_data) -> None
     assert payload["route_planner_undo_stack"] == []
     assert payload["route_planner_redo_stack"] == []
     assert payload["route_planner_is_dirty"] is False
-    assert payload["route_planner_locked_rider_ids"] == []
+    assert payload["route_planner_locked_rider_ids"] == ["Lester", "Syed"]
+    assert payload["route_planner_locked_rider_baselines"] == {
+        "Lester": payload["route_planner_draft_assignment"]["Lester"],
+        "Syed": payload["route_planner_draft_assignment"]["Syed"],
+    }
     assert payload["route_planner_manual_move_history"] == {}
     assert payload["route_planner_rider_access_cache"] == {}
+    assert payload["route_planner_reshuffle_pool_job_ids"] == []
 
 
 def test_unapplied_draft_is_distinct_from_confirmed_for_export_guard(planner_data) -> None:
@@ -582,6 +618,7 @@ def test_focus_success_failure_and_exit_state_are_atomic(planner_data) -> None:
     assert success["route_planner_is_dirty"] is False
     assert success["route_planner_manual_move_history"] == {}
     assert success["route_planner_draft_connectors"].empty
+    assert success["route_planner_reshuffle_pool_job_ids"] == []
     failed = focus_apply_failure_state(payload)
     assert failed["route_planner_focus_mode"] is True
     assert failed["route_planner_draft_assignment"] == payload["route_planner_draft_assignment"]

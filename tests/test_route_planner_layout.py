@@ -43,30 +43,38 @@ def test_focus_map_and_panel_use_stretch_height_and_stable_keys() -> None:
 
 
 def test_sortable_focus_styles_force_one_full_width_vertical_stack() -> None:
-    viewer = VIEWER.read_text(encoding="utf-8")
-    assert "flex-direction: column !important" in viewer
-    assert "flex-wrap: nowrap !important" in viewer
-    assert "min-width: 100% !important" in viewer
-    assert "max-width: 100% !important" in viewer
+    component = (VIEWER.parent / "route_board_component" / "index.html").read_text(encoding="utf-8")
+    assert '#board { width: 100%' in component
+    assert '.lane { width: 100%' in component
+    assert "boardElement.appendChild(laneElement)" in component
 
 
-def test_sortable_panel_has_internal_viewport_scroll_for_cross_lane_dragging() -> None:
+def test_sortable_panel_uses_parent_scroll_without_resize_feedback_loop() -> None:
     viewer = VIEWER.read_text(encoding="utf-8")
-    assert "height: calc(100dvh - 238px)" in viewer
-    assert "overflow-y: auto !important" in viewer
+    component = (VIEWER.parent / "route_board_component" / "index.html").read_text(encoding="utf-8")
+    assert "height: calc(100dvh - 238px)" not in component
+    assert "window.parent.innerHeight - top" in component
+    assert "React" not in component
+    assert ".st-key-route_planner_focus_panel > div" in viewer
+    assert "overflow-y: auto" in component
     assert "overscroll-behavior: contain" in viewer
     assert "scrollbar-gutter: stable" in viewer
 
 
 def test_focus_layout_exposes_locking_reshuffle_and_three_route_colours() -> None:
     source = current_focus_source()
-    assert '"Locked riders"' in source
+    assert "Riders start locked" in source
+    component = (VIEWER.parent / "route_board_component" / "index.html").read_text(encoding="utf-8")
+    assert 'label.className = "lock"' in component
+    assert 'checkbox.type = "checkbox"' in component
     assert "reshuffle_unlocked_assignments" in source
-    assert "Reshuffle ·" in source
+    assert "Reshuffle {len(pool_job_ids)}" in source
     viewer = VIEWER.read_text(encoding="utf-8")
     assert "focus-green-loaded-routes" in viewer
     assert "focus-red-rider-access" in viewer
     assert "focus-purple-draft-connectors" in viewer
+    assert "focus-rider-start-markers" in viewer
+    assert "RESHUFFLE_POOL_LANE" in viewer
 
 
 def test_loaded_workbook_enters_focus_and_reruns_before_summary() -> None:

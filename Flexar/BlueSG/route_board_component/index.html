@@ -1,0 +1,194 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: #111827; color: #e5e7eb; font-family: Inter, ui-sans-serif, system-ui, sans-serif; overflow: hidden; }
+    #board { width: 100%; min-height: 260px; overflow-y: auto; overflow-x: hidden; padding: 0 .25rem .8rem 0; scrollbar-gutter: stable; overscroll-behavior: contain; }
+    .lane { width: 100%; border: 1px solid #374151; border-radius: 9px; margin: 0 0 .55rem; background: #111827; overflow: hidden; }
+    .lane.pool { border: 2px dashed #38bdf8; background: #082f49; }
+    .lane.locked { border-color: #4b5563; }
+    .header { display: flex; align-items: center; justify-content: space-between; gap: .5rem; min-height: 34px; padding: .42rem .55rem; background: #1f2937; color: #f9fafb; font-weight: 700; font-size: .76rem; line-height: 1.2; }
+    .pool .header { background: #075985; color: #e0f2fe; }
+    .lock { display: inline-flex; align-items: center; gap: .25rem; flex: 0 0 auto; font-weight: 700; cursor: pointer; user-select: none; }
+    .lock input { width: 15px; height: 15px; margin: 0; accent-color: #f43f5e; cursor: pointer; }
+    .body { min-height: 42px; padding: .28rem; background: #111827; counter-reset: card; }
+    .pool .body { min-height: 78px; background: #082f49; }
+    .locked .body { background: #0f172a; }
+    .lane.drag-over .body { outline: 2px solid #38bdf8; outline-offset: -3px; background: #0c4a6e; }
+    .card { width: 100%; white-space: pre-line; border: 1px solid #4b5563; border-radius: 7px; background: #182235; color: #e5e7eb; padding: .38rem .46rem; margin: .22rem 0; font-size: .72rem; line-height: 1.22; cursor: grab; counter-increment: card; user-select: none; }
+    .card::before { content: counter(card) ". "; font-weight: 800; color: #34d399; }
+    .card:hover { border-color: #10b981; background: #1d2b3f; }
+    .card.dragging { opacity: .42; }
+    .locked .card { cursor: not-allowed; opacity: .82; }
+    .empty { color: #7dd3fc; font-size: .7rem; text-align: center; padding: .65rem .3rem; pointer-events: none; }
+  </style>
+</head>
+<body>
+  <div id="board"></div>
+  <script>
+    const STREAMLIT = {
+      send(type, data = {}) {
+        window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type }, data), "*");
+      },
+      ready() { this.send("streamlit:componentReady", { apiVersion: 1 }); },
+      value(value) { this.send("streamlit:setComponentValue", { value, dataType: "json" }); },
+      height(height) { this.send("streamlit:setFrameHeight", { height }); }
+    };
+
+    const boardElement = document.getElementById("board");
+    let lanes = [];
+    let locked = new Set();
+    let dragging = null;
+    let lastArgsKey = "";
+
+    function cloneLanes(value) {
+      return (value || []).map(lane => ({
+        header: String(lane.header || ""),
+        display_header: String(lane.display_header || lane.header || ""),
+        lane_id: String(lane.lane_id || ""),
+        is_pool: Boolean(lane.is_pool),
+        items: (lane.items || []).map(String)
+      }));
+    }
+
+    function emit(eventName) {
+      STREAMLIT.value({
+        event: eventName,
+        locked_rider_ids: Array.from(locked),
+        board: lanes.map(lane => ({ header: lane.header, items: lane.items.slice() }))
+      });
+    }
+
+    function resizeBoard() {
+      let available = 520;
+      try {
+        const top = window.frameElement ? window.frameElement.getBoundingClientRect().top : 120;
+        available = Math.max(300, window.parent.innerHeight - top - 18);
+      } catch (_error) {
+        available = Math.max(300, window.innerHeight || 520);
+      }
+      boardElement.style.height = `${Math.floor(available)}px`;
+      STREAMLIT.height(Math.floor(available));
+    }
+
+    function moveCard(fromLaneId, fromIndex, toLaneId, toIndex) {
+      const fromLane = lanes.find(lane => lane.lane_id === fromLaneId);
+      const toLane = lanes.find(lane => lane.lane_id === toLaneId);
+      if (!fromLane || !toLane || locked.has(fromLaneId) || locked.has(toLaneId)) return;
+      const [item] = fromLane.items.splice(fromIndex, 1);
+      if (item === undefined) return;
+      let insertAt = Math.max(0, Math.min(toIndex, toLane.items.length));
+      if (fromLane === toLane && fromIndex < insertAt) insertAt -= 1;
+      toLane.items.splice(insertAt, 0, item);
+      render();
+      emit("board");
+    }
+
+    function render() {
+      boardElement.replaceChildren();
+      lanes.forEach(lane => {
+        const laneElement = document.createElement("section");
+        laneElement.className = `lane${lane.is_pool ? " pool" : ""}${locked.has(lane.lane_id) ? " locked" : ""}`;
+        laneElement.dataset.laneId = lane.lane_id;
+
+        const header = document.createElement("div");
+        header.className = "header";
+        const title = document.createElement("span");
+        title.textContent = lane.display_header;
+        header.appendChild(title);
+        if (!lane.is_pool && lane.lane_id !== "__UNASSIGNED__") {
+          const label = document.createElement("label");
+          label.className = "lock";
+          label.title = "Checked: rider and order sequence are frozen";
+          const checkbox = document.createElement("input");
+          checkbox.type = "checkbox";
+          checkbox.checked = locked.has(lane.lane_id);
+          const icon = document.createElement("span");
+          icon.textContent = checkbox.checked ? "🔒" : "🔓";
+          checkbox.addEventListener("change", () => {
+            if (checkbox.checked) locked.add(lane.lane_id); else locked.delete(lane.lane_id);
+            icon.textContent = checkbox.checked ? "🔒" : "🔓";
+            render();
+            emit("locks");
+          });
+          label.append(checkbox, icon);
+          header.appendChild(label);
+        }
+        laneElement.appendChild(header);
+
+        const body = document.createElement("div");
+        body.className = "body";
+        body.addEventListener("dragover", event => {
+          if (!dragging || locked.has(lane.lane_id)) return;
+          event.preventDefault();
+          laneElement.classList.add("drag-over");
+          const rect = boardElement.getBoundingClientRect();
+          if (event.clientY < rect.top + 55) boardElement.scrollTop -= 22;
+          if (event.clientY > rect.bottom - 55) boardElement.scrollTop += 22;
+        });
+        body.addEventListener("dragleave", event => {
+          if (!laneElement.contains(event.relatedTarget)) laneElement.classList.remove("drag-over");
+        });
+        body.addEventListener("drop", event => {
+          event.preventDefault();
+          laneElement.classList.remove("drag-over");
+          if (!dragging || locked.has(lane.lane_id)) return;
+          const cards = Array.from(body.querySelectorAll(".card:not(.dragging)"));
+          const nextCard = cards.find(card => event.clientY < card.getBoundingClientRect().top + card.offsetHeight / 2);
+          const targetIndex = nextCard ? Number(nextCard.dataset.index) : lane.items.length;
+          moveCard(dragging.laneId, dragging.index, lane.lane_id, targetIndex);
+          dragging = null;
+        });
+
+        lane.items.forEach((item, index) => {
+          const card = document.createElement("div");
+          card.className = "card";
+          card.textContent = item;
+          card.dataset.index = String(index);
+          card.draggable = !locked.has(lane.lane_id);
+          card.addEventListener("dragstart", event => {
+            if (locked.has(lane.lane_id)) { event.preventDefault(); return; }
+            dragging = { laneId: lane.lane_id, index };
+            card.classList.add("dragging");
+            event.dataTransfer.effectAllowed = "move";
+            event.dataTransfer.setData("text/plain", item);
+          });
+          card.addEventListener("dragend", () => {
+            dragging = null;
+            card.classList.remove("dragging");
+            document.querySelectorAll(".drag-over").forEach(node => node.classList.remove("drag-over"));
+          });
+          body.appendChild(card);
+        });
+        if (!lane.items.length && lane.is_pool) {
+          const empty = document.createElement("div");
+          empty.className = "empty";
+          empty.textContent = "Drop unlocked orders here, then click Reshuffle";
+          body.appendChild(empty);
+        }
+        laneElement.appendChild(body);
+        boardElement.appendChild(laneElement);
+      });
+      requestAnimationFrame(resizeBoard);
+    }
+
+    window.addEventListener("message", event => {
+      if (!event.data || event.data.type !== "streamlit:render") return;
+      const args = event.data.args || {};
+      const argsKey = JSON.stringify([args.board, args.locked_rider_ids]);
+      if (argsKey !== lastArgsKey) {
+        lastArgsKey = argsKey;
+        lanes = cloneLanes(args.board);
+        locked = new Set((args.locked_rider_ids || []).map(String));
+        render();
+      } else {
+        resizeBoard();
+      }
+    });
+    window.addEventListener("resize", resizeBoard);
+    STREAMLIT.ready();
+  </script>
+</body>
+</html>
