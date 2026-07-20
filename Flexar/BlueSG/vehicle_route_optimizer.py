@@ -6,6 +6,7 @@ import itertools
 import math
 import os
 import re
+import copy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -22,6 +23,23 @@ except ImportError:  # pragma: no cover - Streamlit is present in the app, but k
     st = None
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+
+from Flexar.BlueSG.constraints import Constraint, validate_candidate_routes
+from Flexar.BlueSG.models import OptimisationRunResult, TravelLegResult
+from Flexar.BlueSG.operation_context import OperationContext
+from Flexar.BlueSG.output_sanitizer import sanitize_for_output
+from Flexar.BlueSG.regional_overflow import (
+    RegionalOverflowConfig,
+    build_regional_overflow_context,
+    normalize_region,
+    regional_audit_fields,
+)
+from Flexar.BlueSG.travel_costs import (
+    PROVIDER_VERSION,
+    build_travel_cache_key,
+    confidence_from_source,
+    fallback_warning,
+)
 
 
 REQUIRED_JOB_HEADERS = ["Car Plate", "Pickup Address", "Pickup Lot", "Drop-off Address"]
@@ -128,7 +146,27 @@ ROUTE_COLUMNS = [
     "Feasibility Status",
     "Reason if Unassigned",
     "Cost Source",
+    "Empty Confidence",
+    "Loaded Confidence",
+    "Travel Warning",
+    "Pickup Handling Min",
+    "Drop-off Handling Min",
+    "Unlock Wait Min",
+    "Route Time Min",
+    "Total Duty Time Min",
+    "Adjusted Duty Time Min",
     "Route Validation Status",
+    "Job Region",
+    "Operational Subregion",
+    "Region Confidence",
+    "Assigned Rider Home Region",
+    "Assigned Rider Current Region Before Job",
+    "Assignment Tier",
+    "Regional Specificity Score",
+    "Regional Support Penalty",
+    "Scarce Driver Protection Penalty",
+    "Unsupported Region Penalty",
+    "Reason for Regional Assignment",
 ]
 SUMMARY_COLUMNS = [
     "Rider",
@@ -140,6 +178,15 @@ SUMMARY_COLUMNS = [
     "Total Route Distance KM",
     "Total Route Duration Min",
     "Adjusted Route Duration Min",
+    "First Positioning Min",
+    "Pickup Handling Min",
+    "Drop-off Handling Min",
+    "Total Duty Time Min",
+    "Adjusted Duty Time Min",
+    "Fallback Leg Count",
+    "Max Jobs Target",
+    "Max Jobs Overage",
+    "Hard Violation Count",
     "Total Route Duration Hours",
     "Within 3 Hours",
     "Final Location",
@@ -201,6 +248,7 @@ DEFAULT_MAX_ADJUSTED_DURATION_MIN = 180.0
 DEFAULT_EMPTY_TRAVEL_DURATION_MULTIPLIER = 1.5
 DEFAULT_EMPTY_TRAVEL_WAIT_BUFFER_MIN = 6.0
 DEFAULT_CLUSTER_PRESSURE_BONUS_PER_JOB = 30.0
+DEFAULT_FALLBACK_PENALTY = 100.0
 DEFAULT_MIN_JOBS_PER_RIDER = 2
 DEFAULT_SELECTIVE_CHANGED_RIDER_PENALTY = 20.0
 DEFAULT_SELECTIVE_MOVED_JOB_PENALTY = 10.0
@@ -208,6 +256,8 @@ DEFAULT_SELECTIVE_SEQUENCE_CHANGE_PENALTY = 5.0
 MAX_SELECTIVE_RESHUFFLE_CANDIDATES = 50_000
 DEFAULT_SELECTIVE_BEAM_WIDTH = 100
 EXCEL_CELL_MAX_CHARS = 32767
+# Kept as compatibility aliases for older callers. New runs derive their actual
+# window from OperationContext full datetimes (including midnight rollover).
 JOB_WINDOW_START_MIN = 14 * 60
 JOB_WINDOW_END_MIN = 17 * 60
 FIRST_POSITIONING_WEIGHT = 0.2
@@ -294,11 +344,47 @@ class TravelCost:
     error: str = ""
     route_text: str = ""
     route_path: list[list[float]] | None = None
+    origin: str = ""
+    destination: str = ""
+    mode: str = "drive"
+    confidence: str = ""
+    warning: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.confidence:
+            object.__setattr__(self, "confidence", confidence_from_source(self.source))
+        if not self.warning and self.confidence == "fallback" and (self.origin or self.destination):
+            object.__setattr__(
+                self,
+                "warning",
+                fallback_warning(
+                    self.origin or "unknown origin",
+                    self.destination or "unknown destination",
+                    float(self.duration_min or 0.0),
+                    self.source,
+                ),
+            )
 
     def optimisation_value(self, optimise_by: str) -> float:
         if optimise_by == "distance":
             return self.distance_km if self.distance_km is not None else self.duration_min or math.inf
         return self.duration_min if self.duration_min is not None else self.distance_km or math.inf
+
+    def to_leg_result(self, origin: str | None = None, destination: str | None = None) -> TravelLegResult:
+        """Convert the compatibility value object to the canonical structured leg model."""
+
+        return TravelLegResult(
+            origin=origin or self.origin,
+            destination=destination or self.destination,
+            mode=self.mode,
+            distance_km=float(self.distance_km or 0.0),
+            duration_min=float(self.duration_min or 0.0),
+            source=self.source,
+            confidence=self.confidence,  # type: ignore[arg-type]
+            instructions=self.route_text or None,
+            route_path=list(self.route_path or []),
+            warning=self.warning or self.error or None,
+        )
 
 
 def clean_text(value: Any) -> str:
@@ -716,7 +802,11 @@ def _coerce_job_date(value: Any, swap_month_day: bool = False) -> Any:
     if pd.isna(value):
         return value
 
-    parsed = pd.to_datetime(value, errors="coerce")
+    if isinstance(value, str):
+        parsed = pd.to_datetime(value, errors="coerce", dayfirst=True)
+        swap_month_day = False
+    else:
+        parsed = pd.to_datetime(value, errors="coerce")
     if pd.isna(parsed):
         return value
 
@@ -1116,9 +1206,8 @@ def _route_source_label(route_type: str, mode: str | None = None, cached: bool =
     return f"OneMap {route_type}{suffix}"
 
 
-def _public_transport_route_time() -> tuple[str, str]:
-    now = datetime.now(SINGAPORE_TZ)
-    route_time = now.replace(hour=14, minute=0, second=0, microsecond=0)
+def _public_transport_route_time(operation_context: OperationContext | None = None) -> tuple[str, str]:
+    route_time = (operation_context or OperationContext()).operation_start
     return route_time.strftime("%m-%d-%Y"), route_time.strftime("%H:%M:%S")
 
 
@@ -1146,24 +1235,36 @@ def get_onemap_route_cost(
     route_type: str = "drive",
     mode: str | None = None,
     max_walk_distance: int = 1000,
+    operation_context: OperationContext | None = None,
 ) -> TravelCost:
+    operation_context = operation_context or OperationContext()
+    origin = from_geocode.address
+    destination = to_geocode.address
+    travel_mode = mode or route_type
     if not from_geocode.is_available or not to_geocode.is_available:
         missing = from_geocode.error or to_geocode.error or "Missing coordinates"
-        return TravelCost(None, None, "fallback estimate", missing)
+        return TravelCost(None, None, "fallback estimate", missing, origin=origin, destination=destination, mode=travel_mode)
 
     route_type = route_type.casefold()
     mode = mode.upper() if mode else None
     route_date = ""
     route_time = ""
     if route_type == "pt":
-        route_date, route_time = _public_transport_route_time()
+        route_date, route_time = _public_transport_route_time(operation_context)
 
     coordinate_key = (
         f"{from_geocode.latitude:.6f},{from_geocode.longitude:.6f}|"
         f"{to_geocode.latitude:.6f},{to_geocode.longitude:.6f}"
     )
     mode_key = mode or ("TRANSIT" if route_type == "pt" else route_type.upper())
-    key = coordinate_key if route_type == "drive" else f"{route_type}|{mode_key}|{route_date}|{route_time}|{coordinate_key}"
+    contextual_key = build_travel_cache_key(
+        origin,
+        destination,
+        f"{route_type}:{mode_key}",
+        operation_context,
+        PROVIDER_VERSION,
+    )
+    key = "|".join((*contextual_key, coordinate_key))
     _load_route_disk_cache_once()
     if key in ROUTE_MEMORY_CACHE:
         cached = ROUTE_MEMORY_CACHE[key]
@@ -1174,6 +1275,10 @@ def get_onemap_route_cost(
             cached.error,
             cached.route_text,
             cached.route_path,
+            origin,
+            destination,
+            travel_mode,
+            "cached_verified",
         )
 
     params = {
@@ -1200,15 +1305,25 @@ def get_onemap_route_cost(
         except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
             last_error = exc
     if payload is None:
-        return TravelCost(None, None, "fallback estimate", f"OneMap routing failed after 2 attempts: {last_error}")
+        return TravelCost(None, None, "fallback estimate", f"OneMap routing failed after 2 attempts: {last_error}", origin=origin, destination=destination, mode=travel_mode)
 
     distance_km, duration_min = _parse_onemap_route(payload)
     if distance_km is None and duration_min is None:
-        return TravelCost(None, None, "fallback estimate", "OneMap route returned no distance or duration")
+        return TravelCost(None, None, "fallback estimate", "OneMap route returned no distance or duration", origin=origin, destination=destination, mode=travel_mode)
 
     route_text, route_path = _parse_route_details(payload, route_type)
     source = _route_source_label(route_type, mode)
-    result = TravelCost(distance_km, duration_min, source, route_text=route_text, route_path=route_path or None)
+    result = TravelCost(
+        distance_km,
+        duration_min,
+        source,
+        route_text=route_text,
+        route_path=route_path or None,
+        origin=origin,
+        destination=destination,
+        mode=travel_mode,
+        confidence="verified",
+    )
     ROUTE_MEMORY_CACHE[key] = result
     _append_csv_cache_row(
         ROUTE_CACHE_FILE,
@@ -1233,19 +1348,19 @@ def get_fallback_cost(
     from_text = clean_text(from_address)
     to_text = clean_text(to_address)
     if not from_text or not to_text:
-        return TravelCost(UNKNOWN_DISTANCE_KM, UNKNOWN_DURATION_MIN, "fallback estimate", "Blank address")
+        return TravelCost(UNKNOWN_DISTANCE_KM, UNKNOWN_DURATION_MIN, "fallback estimate", "Blank address", origin=from_text, destination=to_text)
     if from_text.casefold() == to_text.casefold():
-        return TravelCost(0, 0, "fallback estimate")
+        return TravelCost(0, 0, "exact same location", origin=from_text, destination=to_text, confidence="verified")
 
     source_zone = from_zone or infer_zone(from_text)
     destination_zone = to_zone or infer_zone(to_text)
     if source_zone and destination_zone:
         distance = FALLBACK_ZONE_KM.get(source_zone, {}).get(destination_zone, UNKNOWN_DISTANCE_KM)
         duration = FALLBACK_ZONE_MINUTES.get(source_zone, {}).get(destination_zone, UNKNOWN_DURATION_MIN)
-        return TravelCost(float(distance), float(duration), "fallback estimate")
+        return TravelCost(float(distance), float(duration), "fallback estimate", origin=from_text, destination=to_text)
     if source_zone == destination_zone and source_zone is not None:
-        return TravelCost(SAME_UNKNOWN_DISTANCE_KM, SAME_UNKNOWN_DURATION_MIN, "fallback estimate")
-    return TravelCost(UNKNOWN_DISTANCE_KM, UNKNOWN_DURATION_MIN, "fallback estimate", "Unknown zone")
+        return TravelCost(SAME_UNKNOWN_DISTANCE_KM, SAME_UNKNOWN_DURATION_MIN, "fallback estimate", origin=from_text, destination=to_text)
+    return TravelCost(UNKNOWN_DISTANCE_KM, UNKNOWN_DURATION_MIN, "fallback estimate", "Unknown zone", origin=from_text, destination=to_text)
 
 
 def get_travel_cost(
@@ -1257,9 +1372,13 @@ def get_travel_cost(
     token: str | None = None,
     route_type: str = "drive",
     mode: str | None = None,
+    operation_context: OperationContext | None = None,
 ) -> TravelCost:
+    operation_context = operation_context or OperationContext()
+    origin = clean_text(from_address)
+    destination = clean_text(to_address)
     if clean_text(from_address).casefold() == clean_text(to_address).casefold():
-        return TravelCost(0, 0, "OneMap cache" if use_onemap else "fallback estimate")
+        return TravelCost(0, 0, "exact same location", origin=origin, destination=destination, mode=mode or route_type, confidence="verified")
 
     if use_onemap:
         from_geocode = get_cached_geocode(clean_text(from_address), token=token, use_onemap=True)
@@ -1270,6 +1389,7 @@ def get_travel_cost(
             token=token,
             route_type=route_type,
             mode=mode,
+            operation_context=operation_context,
         )
         if onemap_cost.distance_km is not None or onemap_cost.duration_min is not None:
             return onemap_cost
@@ -1279,6 +1399,9 @@ def get_travel_cost(
             fallback_cost.duration_min,
             "fallback estimate",
             onemap_cost.error or fallback_cost.error,
+            origin=origin,
+            destination=destination,
+            mode=mode or route_type,
         )
 
     return get_fallback_cost(from_address, to_address, from_zone=from_zone, to_zone=to_zone)
@@ -1292,15 +1415,32 @@ def get_empty_travel_cost(
     use_onemap: bool = True,
     token: str | None = None,
     allow_walk: bool = False,
+    operation_context: OperationContext | None = None,
 ) -> TravelCost:
+    operation_context = operation_context or OperationContext()
+    empty_mode = operation_context.empty_travel_mode
     if not use_onemap:
-        return get_travel_cost(
+        fallback = get_travel_cost(
             from_address,
             to_address,
             from_zone=from_zone,
             to_zone=to_zone,
             use_onemap=False,
             token=token,
+            operation_context=operation_context,
+        )
+        return TravelCost(
+            fallback.distance_km,
+            fallback.duration_min,
+            fallback.source,
+            fallback.error,
+            fallback.route_text,
+            fallback.route_path,
+            clean_text(from_address),
+            clean_text(to_address),
+            empty_mode,
+            fallback.confidence,
+            fallback.warning,
         )
 
     from_geocode = get_cached_geocode(clean_text(from_address), token=token, use_onemap=True)
@@ -1316,12 +1456,50 @@ def get_empty_travel_cost(
             use_onemap=True,
             token=token,
             route_type="walk",
+            operation_context=operation_context,
         )
         if (
             (walk_cost.distance_km is not None and walk_cost.distance_km <= SHORT_WALK_DISTANCE_KM)
             or (walk_cost.duration_min is not None and walk_cost.duration_min <= SHORT_WALK_DURATION_MIN)
         ):
-            return TravelCost(walk_cost.distance_km, walk_cost.duration_min, "OneMap walk", walk_cost.error)
+            return TravelCost(
+                walk_cost.distance_km,
+                walk_cost.duration_min,
+                "OneMap walk",
+                walk_cost.error,
+                walk_cost.route_text,
+                walk_cost.route_path,
+                clean_text(from_address),
+                clean_text(to_address),
+                "walking",
+                walk_cost.confidence,
+            )
+
+    if empty_mode in {"recovery_vehicle", "private_hire_taxi"}:
+        return get_travel_cost(
+            from_address,
+            to_address,
+            from_zone=from_zone,
+            to_zone=to_zone,
+            use_onemap=True,
+            token=token,
+            route_type="drive",
+            mode=empty_mode,
+            operation_context=operation_context,
+        )
+
+    if empty_mode == "walking":
+        return get_travel_cost(
+            from_address,
+            to_address,
+            from_zone=from_zone,
+            to_zone=to_zone,
+            use_onemap=True,
+            token=token,
+            route_type="walk",
+            mode="walking",
+            operation_context=operation_context,
+        )
 
     pt_cost = get_onemap_route_cost(
         from_geocode,
@@ -1329,6 +1507,7 @@ def get_empty_travel_cost(
         token=token,
         route_type="pt",
         mode="TRANSIT",
+        operation_context=operation_context,
     )
     if pt_cost.duration_min is not None or pt_cost.distance_km is not None:
         return pt_cost
@@ -1341,6 +1520,9 @@ def get_empty_travel_cost(
             fallback_cost.duration_min,
             "fallback estimate",
             geocode_error or fallback_cost.error,
+            origin=clean_text(from_address),
+            destination=clean_text(to_address),
+            mode=empty_mode,
         )
 
     return get_travel_cost(
@@ -1351,6 +1533,7 @@ def get_empty_travel_cost(
         use_onemap=True,
         token=token,
         route_type="drive",
+        operation_context=operation_context,
     )
 
 
@@ -1367,6 +1550,123 @@ def get_cost_explanation() -> pd.DataFrame:
                 }
             )
     return pd.DataFrame(rows)
+
+
+def verify_fallback_travel_legs(
+    route_df: pd.DataFrame,
+    operation_context: OperationContext,
+    *,
+    token: str | None = None,
+    retries: int = 1,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Retry low-confidence legs and retain visible warnings when unresolved."""
+
+    if route_df is None or route_df.empty:
+        return route_df, []
+    updated = route_df.copy()
+    warnings: list[str] = []
+    for index, row in updated.iterrows():
+        origin = clean_text(row.get("Start From"))
+        pickup = clean_text(row.get("Pickup Address"))
+        dropoff = clean_text(row.get("Drop-off Address"))
+        empty_confidence = clean_text(row.get("Empty Confidence")) or confidence_from_source(row.get("Cost Source"))
+        loaded_confidence = clean_text(row.get("Loaded Confidence")) or confidence_from_source(row.get("Cost Source"))
+        empty_cost: TravelCost | None = None
+        loaded_cost: TravelCost | None = None
+        for _ in range(max(1, retries)):
+            if empty_confidence == "fallback":
+                empty_cost = get_empty_travel_cost(
+                    origin,
+                    pickup,
+                    infer_zone(origin),
+                    infer_zone(pickup),
+                    use_onemap=True,
+                    token=token,
+                    allow_walk=int(row.get("Sequence", 1) or 1) > 1,
+                    operation_context=operation_context,
+                )
+                empty_cost = adjust_empty_travel_for_public_transport(empty_cost)
+                if empty_cost.confidence != "fallback":
+                    empty_confidence = empty_cost.confidence
+            if loaded_confidence == "fallback":
+                loaded_cost = get_travel_cost(
+                    pickup,
+                    dropoff,
+                    infer_zone(pickup),
+                    infer_zone(dropoff),
+                    use_onemap=True,
+                    token=token,
+                    operation_context=operation_context,
+                )
+                if loaded_cost.confidence != "fallback":
+                    loaded_confidence = loaded_cost.confidence
+            if empty_confidence != "fallback" and loaded_confidence != "fallback":
+                break
+
+        if empty_cost is not None and empty_cost.confidence != "fallback":
+            updated.at[index, "Empty Distance KM"] = empty_cost.distance_km
+            updated.at[index, "Empty Duration Min"] = empty_cost.duration_min
+            updated.at[index, "Empty PT Instructions"] = empty_cost.route_text
+            updated.at[index, "Empty Route Path"] = json.dumps(empty_cost.route_path or [])
+        if loaded_cost is not None and loaded_cost.confidence != "fallback":
+            updated.at[index, "Loaded Distance KM"] = loaded_cost.distance_km
+            updated.at[index, "Loaded Duration Min"] = loaded_cost.duration_min
+            updated.at[index, "Loaded Drive Instructions"] = loaded_cost.route_text
+            updated.at[index, "Loaded Route Path"] = json.dumps(loaded_cost.route_path or [])
+        updated.at[index, "Empty Confidence"] = empty_confidence
+        updated.at[index, "Loaded Confidence"] = loaded_confidence
+        unresolved = []
+        if empty_confidence == "fallback":
+            warning = fallback_warning(origin, pickup, float(row.get("Empty Duration Min", 0) or 0), "fallback estimate")
+            unresolved.append(warning)
+            warnings.append(warning)
+        if loaded_confidence == "fallback":
+            warning = fallback_warning(pickup, dropoff, float(row.get("Loaded Duration Min", 0) or 0), "fallback estimate")
+            unresolved.append(warning)
+            warnings.append(warning)
+        updated.at[index, "Travel Warning"] = " | ".join(unresolved)
+        empty_for_source = empty_cost or TravelCost(
+            float(row.get("Empty Distance KM", 0) or 0),
+            float(row.get("Empty Duration Min", 0) or 0),
+            "fallback estimate" if empty_confidence == "fallback" else "OneMap cache",
+            origin=origin,
+            destination=pickup,
+            confidence=empty_confidence,
+        )
+        loaded_for_source = loaded_cost or TravelCost(
+            float(row.get("Loaded Distance KM", 0) or 0),
+            float(row.get("Loaded Duration Min", 0) or 0),
+            "fallback estimate" if loaded_confidence == "fallback" else "OneMap cache",
+            origin=pickup,
+            destination=dropoff,
+            confidence=loaded_confidence,
+        )
+        updated.at[index, "Cost Source"] = _combined_source(empty_for_source, loaded_for_source)
+
+    for rider, indices in updated.groupby("Rider", sort=False).groups.items():
+        ordered_indices = sorted(indices, key=lambda idx: float(updated.at[idx, "Sequence"] or 0))
+        first_positioning = float(updated.at[ordered_indices[0], "Empty Duration Min"] or 0) if ordered_indices else 0.0
+        route_time = 0.0
+        for position, index in enumerate(ordered_indices):
+            empty = 0.0 if position == 0 else float(updated.at[index, "Empty Duration Min"] or 0)
+            loaded = float(updated.at[index, "Loaded Duration Min"] or 0)
+            handling = (
+                float(updated.at[index, "Pickup Handling Min"] or 0)
+                + float(updated.at[index, "Drop-off Handling Min"] or 0)
+                + float(updated.at[index, "Unlock Wait Min"] or 0)
+            )
+            route_time += empty + loaded + handling
+            duty = first_positioning + route_time
+            updated.at[index, "Total Duration Min"] = round(empty + loaded, 1)
+            updated.at[index, "Route Time Min"] = round(route_time, 1)
+            updated.at[index, "Total Duty Time Min"] = round(duty, 1)
+            updated.at[index, "Adjusted Duty Time Min"] = round(
+                duty * (1.0 + operation_context.default_operational_buffer_pct), 1
+            )
+            updated.at[index, "First Pickup ETA"] = _format_operation_time(operation_context, first_positioning)
+            updated.at[index, "Final Completion ETA"] = _format_operation_time(operation_context, duty)
+    updated.attrs.update(route_df.attrs)
+    return updated, sorted(set(warnings))
 
 
 def calculate_route_zone_priority(
@@ -1443,6 +1743,8 @@ def calculate_assignment_score(
     duration_penalty_per_min: float = DEFAULT_DURATION_PENALTY_PER_MIN,
     max_jobs_overage_penalty: float = DEFAULT_MAX_JOB_OVERAGE_PENALTY,
     max_adjusted_duration_min: float = DEFAULT_MAX_ADJUSTED_DURATION_MIN,
+    fallback_leg_count: int = 0,
+    fallback_penalty: float = DEFAULT_FALLBACK_PENALTY,
 ) -> dict[str, float | int] | None:
     empty_distance = empty_distance_km if empty_distance_km is not None else UNKNOWN_DISTANCE_KM
     empty_duration = empty_duration_min if empty_duration_min is not None else UNKNOWN_DURATION_MIN
@@ -1499,12 +1801,14 @@ def calculate_assignment_score(
         load_zone_adjustment += float(load_policy["cross_zone_route_penalty"])
     if stays_in_rider_zone:
         load_zone_adjustment += float(load_policy["same_area_bonus"])
+    fallback_quality_penalty = max(0, int(fallback_leg_count)) * max(0.0, float(fallback_penalty))
     assignment_score = (
         movement_score
         + zone_adjustment
         + workload_penalty
         + duration_penalty
         + max_jobs_penalty
+        + fallback_quality_penalty
         + rider_load_adjustment
         + empty_duration_penalty
         + load_zone_adjustment
@@ -1522,6 +1826,7 @@ def calculate_assignment_score(
         "projected_duration_min": round(float(projected_duration), 3),
         "projected_adjusted_duration_min": round(float(projected_adjusted_duration), 3),
         "max_jobs_overage": int(max_jobs_overage),
+        "fallback_quality_penalty": round(float(fallback_quality_penalty), 3),
     }
 
 
@@ -1685,6 +1990,8 @@ def adjust_empty_travel_for_public_transport(
 ) -> TravelCost:
     if "public transport" in empty_cost.source.lower():
         return empty_cost
+    if empty_cost.mode not in {"public_transport", "mixed_manual", "drive"}:
+        return empty_cost
     if empty_cost.duration_min is None:
         return empty_cost
     if empty_cost.duration_min <= 0:
@@ -1701,6 +2008,11 @@ def adjust_empty_travel_for_public_transport(
         empty_cost.error,
         route_text=empty_cost.route_text,
         route_path=empty_cost.route_path,
+        origin=empty_cost.origin,
+        destination=empty_cost.destination,
+        mode=empty_cost.mode,
+        confidence=empty_cost.confidence,
+        warning=empty_cost.warning,
     )
 
 
@@ -1827,7 +2139,14 @@ def _rider_sequence_cache_key(
             "duration_buffer_multiplier",
             "empty_travel_duration_multiplier",
             "empty_travel_wait_buffer_min",
+            "fallback_penalty",
         }
+    )
+    operation_context = settings.get("operation_context")
+    operation_key = (
+        tuple(sorted(operation_context.to_settings().items()))
+        if isinstance(operation_context, OperationContext)
+        else ()
     )
     return (
         rider.name,
@@ -1837,6 +2156,7 @@ def _rider_sequence_cache_key(
         rider.load_level,
         tuple(stable_job_id_from_job(job) for job in sequence),
         settings_key,
+        operation_key,
     )
 
 
@@ -1857,10 +2177,14 @@ def evaluate_explicit_rider_sequence(
     duration_buffer_multiplier: float = DEFAULT_DURATION_BUFFER_MULTIPLIER,
     empty_travel_duration_multiplier: float = DEFAULT_EMPTY_TRAVEL_DURATION_MULTIPLIER,
     empty_travel_wait_buffer_min: float = DEFAULT_EMPTY_TRAVEL_WAIT_BUFFER_MIN,
+    fallback_penalty: float = DEFAULT_FALLBACK_PENALTY,
+    operation_context: OperationContext | None = None,
+    max_total_duty_time_min: float | None = None,
     precomputed_loaded_costs: dict[str, TravelCost] | None = None,
     precomputed_empty_costs: dict[tuple[str, str], TravelCost] | None = None,
     route_lookup_stats: dict[str, int] | None = None,
 ) -> dict[str, Any]:
+    operation_context = operation_context or OperationContext()
     current_location = rider.start_location
     current_zone = rider.start_zone
     total_empty_distance = 0.0
@@ -1872,8 +2196,8 @@ def evaluate_explicit_rider_sequence(
     in_window_duration = 0.0
     first_positioning_duration: float | None = None
     first_positioning_distance = 0.0
-    first_pickup_eta = _format_minutes_as_time(JOB_WINDOW_START_MIN)
-    latest_departure_time = "-"
+    first_pickup_eta = "-"
+    latest_departure_time = operation_context.operation_start.isoformat(timespec="minutes")
     rows: list[dict[str, Any]] = []
     warnings: list[str] = []
     cluster_names = [
@@ -1906,6 +2230,7 @@ def evaluate_explicit_rider_sequence(
                 use_onemap=use_onemap,
                 token=token,
                 allow_walk=sequence_index > 1,
+                operation_context=operation_context,
             )
             empty_cost = adjust_empty_travel_for_public_transport(
                 empty_cost,
@@ -1928,6 +2253,7 @@ def evaluate_explicit_rider_sequence(
                 dropoff_zone,
                 use_onemap=use_onemap,
                 token=token,
+                operation_context=operation_context,
             )
             if route_lookup_stats is not None:
                 bucket = "cache_hits" if "cache" in loaded_cost.source.casefold() else "onemap_requests" if "onemap" in loaded_cost.source.casefold() else "fallback_routes"
@@ -1962,13 +2288,25 @@ def evaluate_explicit_rider_sequence(
             duration_penalty_per_min=duration_penalty_per_min,
             max_jobs_overage_penalty=max_job_overage_penalty,
             max_adjusted_duration_min=math.inf,
+            fallback_leg_count=int(empty_cost.confidence == "fallback") + int(loaded_cost.confidence == "fallback"),
+            fallback_penalty=fallback_penalty,
         )
         if score_data is None:
             return {
                 "valid": False,
                 "rows": rows,
                 "raw_duration": in_window_duration,
-                "adjusted_duration": in_window_duration * duration_buffer_multiplier,
+                "adjusted_duration": (
+                    float(first_positioning_duration or 0)
+                    + in_window_duration
+                    + len(rows)
+                    * (
+                        operation_context.pickup_handling_min
+                        + operation_context.dropoff_handling_min
+                        + operation_context.unlock_wait_min
+                    )
+                )
+                * duration_buffer_multiplier,
                 "reason": "route exceeded configured limits",
                 "warnings": warnings,
             }
@@ -1982,17 +2320,31 @@ def evaluate_explicit_rider_sequence(
         if sequence_index == 1:
             first_positioning_duration = empty_cost.duration_min
             first_positioning_distance = empty_cost.distance_km or 0
-            latest_departure_time = _format_minutes_as_time(
-                JOB_WINDOW_START_MIN - float(first_positioning_duration or 0)
-            )
+            first_pickup_eta = _format_operation_time(operation_context, float(first_positioning_duration or 0))
             row_in_window_duration = loaded_cost.duration_min or 0
         else:
             row_in_window_duration = (empty_cost.duration_min or 0) + (loaded_cost.duration_min or 0)
             in_window_empty_distance += empty_cost.distance_km or 0
             in_window_empty_duration += empty_cost.duration_min or 0
         in_window_duration += row_in_window_duration
-        is_window_valid, feasibility_status = _job_window_status(in_window_duration, first_positioning_duration)
-        final_completion_eta = _format_minutes_as_time(JOB_WINDOW_START_MIN + in_window_duration)
+        handling_per_job = (
+            operation_context.pickup_handling_min
+            + operation_context.dropoff_handling_min
+            + operation_context.unlock_wait_min
+        )
+        handling_duration = sequence_index * handling_per_job
+        total_duty_time = float(first_positioning_duration or 0) + in_window_duration + handling_duration
+        is_window_valid, feasibility_status = _job_window_status(
+            in_window_duration,
+            first_positioning_duration,
+            operation_context,
+            handling_duration,
+        )
+        if max_total_duty_time_min is not None and total_duty_time > max_total_duty_time_min:
+            is_window_valid = False
+            feasibility_status = f"total duty exceeds hard maximum of {max_total_duty_time_min:.1f} min"
+        final_completion_eta = _format_operation_time(operation_context, total_duty_time)
+        travel_warning = " | ".join(filter(None, [empty_cost.warning, loaded_cost.warning]))
         rows.append(
             {
                 "Rider": rider.name,
@@ -2026,7 +2378,10 @@ def evaluate_explicit_rider_sequence(
                 "Duration Penalty": score_data["duration_penalty"],
                 "Max Jobs Penalty": score_data["max_jobs_penalty"],
                 "Projected Rider Duration Min": round(float(in_window_duration), 1),
-                "Projected Adjusted Duration Min": round(float(in_window_duration * duration_buffer_multiplier), 1),
+                "Projected Adjusted Duration Min": round(
+                    total_duty_time * duration_buffer_multiplier,
+                    1,
+                ),
                 "First Positioning PT Duration Min": round(float(first_positioning_duration or 0), 1),
                 "First Pickup ETA": first_pickup_eta,
                 "Latest Departure Time": latest_departure_time,
@@ -2037,6 +2392,18 @@ def evaluate_explicit_rider_sequence(
                 "Feasibility Status": feasibility_status,
                 "Reason if Unassigned": "",
                 "Cost Source": cost_source,
+                "Empty Confidence": empty_cost.confidence,
+                "Loaded Confidence": loaded_cost.confidence,
+                "Travel Warning": travel_warning,
+                "Pickup Handling Min": operation_context.pickup_handling_min,
+                "Drop-off Handling Min": operation_context.dropoff_handling_min,
+                "Unlock Wait Min": operation_context.unlock_wait_min,
+                "Route Time Min": round(float(in_window_duration + handling_duration), 1),
+                "Total Duty Time Min": round(total_duty_time, 1),
+                "Adjusted Duty Time Min": round(
+                    total_duty_time * (1.0 + operation_context.default_operational_buffer_pct),
+                    1,
+                ),
                 "Route Validation Status": "",
             }
         )
@@ -2061,7 +2428,7 @@ def evaluate_explicit_rider_sequence(
                 "loaded_distance": loaded_distance,
                 "loaded_duration": loaded_duration,
                 "raw_duration": in_window_duration,
-                "adjusted_duration": in_window_duration * duration_buffer_multiplier,
+                "adjusted_duration": total_duty_time * duration_buffer_multiplier,
                 "final_location": current_location,
                 "final_zone": current_zone,
                 "reason": feasibility_status,
@@ -2069,7 +2436,21 @@ def evaluate_explicit_rider_sequence(
             }
 
     raw_duration = in_window_duration
-    valid, reason = _job_window_status(raw_duration, first_positioning_duration if sequence else 0)
+    total_handling_duration = len(sequence) * (
+        operation_context.pickup_handling_min
+        + operation_context.dropoff_handling_min
+        + operation_context.unlock_wait_min
+    )
+    total_duty_duration = float(first_positioning_duration or 0) + raw_duration + total_handling_duration
+    valid, reason = _job_window_status(
+        raw_duration,
+        first_positioning_duration if sequence else 0,
+        operation_context,
+        total_handling_duration,
+    )
+    if max_total_duty_time_min is not None and total_duty_duration > max_total_duty_time_min:
+        valid = False
+        reason = f"total duty exceeds hard maximum of {max_total_duty_time_min:.1f} min"
     return {
         "valid": valid,
         "rows": rows,
@@ -2082,10 +2463,11 @@ def evaluate_explicit_rider_sequence(
         "loaded_distance": loaded_distance,
         "loaded_duration": loaded_duration,
         "raw_duration": raw_duration,
-        "adjusted_duration": raw_duration * duration_buffer_multiplier,
+        "adjusted_duration": total_duty_duration * duration_buffer_multiplier,
+        "total_duty_duration": total_duty_duration,
         "final_location": current_location,
         "final_zone": current_zone,
-        "final_completion_eta": _format_minutes_as_time(JOB_WINDOW_START_MIN + raw_duration),
+        "final_completion_eta": _format_operation_time(operation_context, total_duty_duration),
         "reason": reason,
         "warnings": warnings,
     }
@@ -2098,6 +2480,14 @@ def rebuild_outputs_from_sequences(
     jobs_df: pd.DataFrame | None = None,
     **settings: Any,
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    settings = dict(settings)
+    operation_context = settings.get("operation_context")
+    if not isinstance(operation_context, OperationContext):
+        operation_context = OperationContext()
+        settings["operation_context"] = operation_context
+    constraints = settings.pop("constraints", [])
+    regional_overflow_config = RegionalOverflowConfig.from_value(settings.pop("regional_overflow_config", None))
+    settings.pop("experimental_cluster_first", None)
     route_rows: list[dict[str, Any]] = []
     lookup_warnings: list[str] = []
     rider_by_name = {rider.name: RiderState(
@@ -2124,7 +2514,61 @@ def rebuild_outputs_from_sequences(
         rider.current_location = clean_text(evaluation.get("final_location", rider.start_location))
         rider.current_zone = evaluation.get("final_zone") or rider.start_zone
 
+    if regional_overflow_config.enabled and route_rows:
+        regional_context = build_regional_overflow_context(
+            list(jobs_by_id.values()),
+            list(rider_by_name.values()),
+            operation_window_min=operation_context.window_duration_min,
+            config=regional_overflow_config,
+        )
+        jobs_by_uploaded_row = {_job_uploaded_row(job): job for job in jobs_by_id.values()}
+        for row in route_rows:
+            job = jobs_by_uploaded_row.get(int(row.get("Uploaded Row", -1)))
+            if job is None:
+                continue
+            candidate_cost = float(row.get("Empty Duration Min", math.inf) or math.inf)
+            assessment = regional_context.assess_candidate(
+                job,
+                str(row.get("Rider", "")),
+                infer_zone(row.get("Start From")) or "unknown",
+                candidate_cost,
+                candidate_cost,
+                candidate_cost,
+            )
+            audit = regional_audit_fields(
+                regional_context,
+                job,
+                str(row.get("Rider", "")),
+                infer_zone(row.get("Start From")) or "unknown",
+                assessment,
+            )
+            row.update(audit)
+            regional_context.record_assignment(job, str(row.get("Rider", "")), audit)
+    else:
+        regional_context = None
+
     route_df = format_route_output(pd.DataFrame(route_rows, columns=ROUTE_COLUMNS), list(rider_by_name.values()))
+    candidate_job_sequences = {
+        rider_name: [jobs_by_id[job_id] for job_id in rider_sequences.get(rider_name, []) if job_id in jobs_by_id]
+        for rider_name in rider_by_name
+    }
+    hard_validation = validate_candidate_routes(candidate_job_sequences, operation_context, constraints)
+    route_df.attrs["hard_constraint_validation"] = hard_validation.to_dict()
+    route_df.attrs["operation_context"] = operation_context.to_settings()
+    route_df.attrs["constraints"] = [
+        constraint.to_dict() if isinstance(constraint, Constraint) else dict(constraint)
+        for constraint in constraints
+    ]
+    route_df.attrs["rider_max_jobs"] = {name: rider.max_jobs for name, rider in rider_by_name.items()}
+    if regional_context:
+        route_df.attrs["regional_capacity"] = sanitize_for_output(regional_context.capacity_rows())
+        route_df.attrs["regional_overflow_config"] = regional_overflow_config.to_dict()
+        route_df.attrs["regional_exception_count"] = int(route_df["Assignment Tier"].eq("exceptional").sum())
+        route_df.attrs["protected_job_misassignment_count"] = int(
+            ((route_df["Operational Subregion"] == "west_core") & (route_df["Assignment Tier"] != "primary")).sum()
+        )
+    if not hard_validation.is_valid:
+        raise ValueError("Rebuilt route violates a hard constraint.")
     if jobs_df is not None:
         validate_optimisation_integrity(route_df, jobs_df)
 
@@ -2610,13 +3054,24 @@ def _format_minutes_as_time(minutes_after_midnight: float | None) -> str:
     return f"{minutes // 60:02d}:{minutes % 60:02d}"
 
 
-def _job_window_status(in_window_duration: float, first_positioning_duration: float | None = None) -> tuple[bool, str]:
+def _format_operation_time(operation_context: OperationContext, minutes_from_start: float | None) -> str:
+    if minutes_from_start is None or math.isinf(float(minutes_from_start)):
+        return "-"
+    return operation_context.at_minutes(float(minutes_from_start)).isoformat(timespec="minutes")
+
+
+def _job_window_status(
+    in_window_duration: float,
+    first_positioning_duration: float | None = None,
+    operation_context: OperationContext | None = None,
+    handling_duration: float = 0.0,
+) -> tuple[bool, str]:
+    operation_context = operation_context or OperationContext()
     if first_positioning_duration is None or math.isinf(float(first_positioning_duration)):
         return False, "no valid OneMap route"
-    if JOB_WINDOW_START_MIN - float(first_positioning_duration) < 0:
-        return False, "missed first pickup target"
-    if JOB_WINDOW_START_MIN + float(in_window_duration) > JOB_WINDOW_END_MIN:
-        return False, "final completion after 17:00"
+    duty_duration = float(first_positioning_duration) + float(in_window_duration) + float(handling_duration)
+    if duty_duration > operation_context.window_duration_min:
+        return False, f"final completion after {operation_context.operation_end.isoformat(timespec='minutes')}"
     return True, "OK"
 
 
@@ -2673,11 +3128,27 @@ def optimise_vehicle_routes(
     force_complete_assignment: bool = True,
     cluster_pressure_bonus_per_job: float = DEFAULT_CLUSTER_PRESSURE_BONUS_PER_JOB,
     route_variant_index: int = 0,
+    fallback_penalty: float = DEFAULT_FALLBACK_PENALTY,
+    operation_context: OperationContext | None = None,
+    constraints: list[Constraint | dict[str, Any]] | None = None,
+    experimental_cluster_first: bool = False,
+    verify_fallbacks_after_solve: bool = True,
+    fallback_verification_retries: int = 1,
+    max_total_duty_time_min: float | None = None,
+    regional_overflow_config: RegionalOverflowConfig | dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    operation_context = operation_context or OperationContext()
+    constraints = constraints or []
+    if experimental_cluster_first:
+        # The production solver deliberately remains job-by-job. This explicit
+        # flag is recorded for experiments but does not pre-package hard clusters.
+        lookup_warnings_prefix = ["Experimental cluster-first requested; retained safe job-by-job baseline."]
+    else:
+        lookup_warnings_prefix = []
     token = token or get_onemap_token()
     remaining = jobs.sort_values("_original_order").to_dict("records")
     route_rows: list[dict[str, Any]] = []
-    lookup_warnings: list[str] = []
+    lookup_warnings: list[str] = list(lookup_warnings_prefix)
     total_jobs = len(remaining)
     active_rider_count = max(1, len(riders))
     minimum_job_target = _minimum_job_target(total_jobs, active_rider_count)
@@ -2701,6 +3172,8 @@ def optimise_vehicle_routes(
         for rider in riders
     }
     assigned_job_ids: set[int] = set()
+    regional_config = RegionalOverflowConfig.from_value(regional_overflow_config)
+    regional_context = None
     rejected_candidate_audit: list[dict[str, Any]] = []
     sequence_evaluation_cache: dict[tuple[str, float, tuple[int, ...]], dict[str, Any]] = {}
 
@@ -2741,8 +3214,8 @@ def optimise_vehicle_routes(
         in_window_duration = 0.0
         first_positioning_duration: float | None = None
         first_positioning_distance = 0.0
-        first_pickup_eta = _format_minutes_as_time(JOB_WINDOW_START_MIN)
-        latest_departure_time = "-"
+        first_pickup_eta = "-"
+        latest_departure_time = operation_context.operation_start.isoformat(timespec="minutes")
         rows: list[dict[str, Any]] = []
         warnings: list[str] = []
         cluster_names = [
@@ -2768,6 +3241,7 @@ def optimise_vehicle_routes(
                 use_onemap=use_onemap,
                 token=token,
                 allow_walk=sequence_index > 1,
+                operation_context=operation_context,
             )
             empty_cost = adjust_empty_travel_for_public_transport(
                 empty_cost,
@@ -2781,6 +3255,7 @@ def optimise_vehicle_routes(
                 dropoff_zone,
                 use_onemap=use_onemap,
                 token=token,
+                operation_context=operation_context,
             )
             route_zone_priority, same_zone_pickup, route_stays_current_zone = calculate_route_zone_priority(
                 current_zone,
@@ -2812,13 +3287,25 @@ def optimise_vehicle_routes(
                 duration_penalty_per_min=duration_penalty_per_min,
                 max_jobs_overage_penalty=max_job_overage_penalty,
                 max_adjusted_duration_min=math.inf,
+                fallback_leg_count=int(empty_cost.confidence == "fallback") + int(loaded_cost.confidence == "fallback"),
+                fallback_penalty=fallback_penalty,
             )
             if score_data is None:
                 result = {
                     "valid": False,
                     "rows": rows,
                     "raw_duration": in_window_duration,
-                    "adjusted_duration": in_window_duration * duration_buffer_multiplier,
+                    "adjusted_duration": (
+                        float(first_positioning_duration or 0)
+                        + in_window_duration
+                        + len(rows)
+                        * (
+                            operation_context.pickup_handling_min
+                            + operation_context.dropoff_handling_min
+                            + operation_context.unlock_wait_min
+                        )
+                    )
+                    * duration_buffer_multiplier,
                     "reason": "exceeded max jobs only if max jobs is a hard setting",
                     "warnings": warnings,
                 }
@@ -2834,17 +3321,31 @@ def optimise_vehicle_routes(
             if sequence_index == 1:
                 first_positioning_duration = empty_cost.duration_min
                 first_positioning_distance = empty_cost.distance_km or 0
-                latest_departure_time = _format_minutes_as_time(
-                    JOB_WINDOW_START_MIN - float(first_positioning_duration or 0)
-                )
+                first_pickup_eta = _format_operation_time(operation_context, float(first_positioning_duration or 0))
                 row_in_window_duration = loaded_cost.duration_min or 0
             else:
                 row_in_window_duration = (empty_cost.duration_min or 0) + (loaded_cost.duration_min or 0)
                 in_window_empty_distance += empty_cost.distance_km or 0
                 in_window_empty_duration += empty_cost.duration_min or 0
             in_window_duration += row_in_window_duration
-            is_window_valid, feasibility_status = _job_window_status(in_window_duration, first_positioning_duration)
-            final_completion_eta = _format_minutes_as_time(JOB_WINDOW_START_MIN + in_window_duration)
+            handling_per_job = (
+                operation_context.pickup_handling_min
+                + operation_context.dropoff_handling_min
+                + operation_context.unlock_wait_min
+            )
+            handling_duration = sequence_index * handling_per_job
+            total_duty_time = float(first_positioning_duration or 0) + in_window_duration + handling_duration
+            is_window_valid, feasibility_status = _job_window_status(
+                in_window_duration,
+                first_positioning_duration,
+                operation_context,
+                handling_duration,
+            )
+            if max_total_duty_time_min is not None and total_duty_time > max_total_duty_time_min:
+                is_window_valid = False
+                feasibility_status = f"total duty exceeds hard maximum of {max_total_duty_time_min:.1f} min"
+            final_completion_eta = _format_operation_time(operation_context, total_duty_time)
+            travel_warning = " | ".join(filter(None, [empty_cost.warning, loaded_cost.warning]))
             rows.append(
                 {
                     "Rider": rider.name,
@@ -2878,7 +3379,10 @@ def optimise_vehicle_routes(
                     "Duration Penalty": score_data["duration_penalty"],
                     "Max Jobs Penalty": score_data["max_jobs_penalty"],
                     "Projected Rider Duration Min": round(float(in_window_duration), 1),
-                    "Projected Adjusted Duration Min": round(float(in_window_duration * duration_buffer_multiplier), 1),
+                    "Projected Adjusted Duration Min": round(
+                        total_duty_time * duration_buffer_multiplier,
+                        1,
+                    ),
                     "First Positioning PT Duration Min": round(float(first_positioning_duration or 0), 1),
                     "First Pickup ETA": first_pickup_eta,
                     "Latest Departure Time": latest_departure_time,
@@ -2889,6 +3393,18 @@ def optimise_vehicle_routes(
                     "Feasibility Status": feasibility_status,
                     "Reason if Unassigned": "",
                     "Cost Source": cost_source,
+                    "Empty Confidence": empty_cost.confidence,
+                    "Loaded Confidence": loaded_cost.confidence,
+                    "Travel Warning": travel_warning,
+                    "Pickup Handling Min": operation_context.pickup_handling_min,
+                    "Drop-off Handling Min": operation_context.dropoff_handling_min,
+                    "Unlock Wait Min": operation_context.unlock_wait_min,
+                    "Route Time Min": round(float(in_window_duration + handling_duration), 1),
+                    "Total Duty Time Min": round(total_duty_time, 1),
+                    "Adjusted Duty Time Min": round(
+                        total_duty_time * (1.0 + operation_context.default_operational_buffer_pct),
+                        1,
+                    ),
                     "Route Validation Status": "",
                 }
             )
@@ -2901,7 +3417,21 @@ def optimise_vehicle_routes(
             current_zone = dropoff_zone
 
         raw_duration = in_window_duration
-        valid, reason = _job_window_status(raw_duration, first_positioning_duration if sequence else 0)
+        total_handling_duration = len(sequence) * (
+            operation_context.pickup_handling_min
+            + operation_context.dropoff_handling_min
+            + operation_context.unlock_wait_min
+        )
+        total_duty_duration = float(first_positioning_duration or 0) + raw_duration + total_handling_duration
+        valid, reason = _job_window_status(
+            raw_duration,
+            first_positioning_duration if sequence else 0,
+            operation_context,
+            total_handling_duration,
+        )
+        if max_total_duty_time_min is not None and total_duty_duration > max_total_duty_time_min:
+            valid = False
+            reason = f"total duty exceeds hard maximum of {max_total_duty_time_min:.1f} min"
         result = {
             "valid": valid,
             "rows": rows,
@@ -2914,15 +3444,25 @@ def optimise_vehicle_routes(
             "loaded_distance": loaded_distance,
             "loaded_duration": loaded_duration,
             "raw_duration": raw_duration,
-            "adjusted_duration": raw_duration * duration_buffer_multiplier,
+            "adjusted_duration": total_duty_duration * duration_buffer_multiplier,
+            "total_duty_duration": total_duty_duration,
             "final_location": current_location,
             "final_zone": current_zone,
-            "final_completion_eta": _format_minutes_as_time(JOB_WINDOW_START_MIN + raw_duration),
+            "final_completion_eta": _format_operation_time(operation_context, total_duty_duration),
             "reason": reason,
             "warnings": warnings,
         }
         sequence_evaluation_cache[cache_key] = result
         return result
+
+    def candidate_hard_valid(overrides: dict[str, list[dict[str, Any]]]) -> bool:
+        if not constraints:
+            return True
+        sequences_by_name = {
+            rider.name: list(overrides.get(rider.name, rider_sequences[rider_key(rider)]))
+            for rider in riders
+        }
+        return validate_candidate_routes(sequences_by_name, operation_context, constraints).is_valid
 
     if use_onemap:
         unique_addresses = sorted(
@@ -2949,6 +3489,29 @@ def optimise_vehicle_routes(
     else:
         report("Using fallback zone estimates only", phase="Fallback")
 
+    def east_affinity_estimator(origin: str, destination: str) -> float:
+        leg = get_empty_travel_cost(
+            origin,
+            destination,
+            infer_zone(origin),
+            infer_zone(destination),
+            use_onemap=use_onemap,
+            token=token,
+            allow_walk=False,
+            operation_context=operation_context,
+        )
+        return float(leg.duration_min or math.inf)
+
+    if regional_config.enabled:
+        regional_context = build_regional_overflow_context(
+            remaining,
+            riders,
+            operation_window_min=operation_context.window_duration_min,
+            config=regional_config,
+            east_affinity_estimator=east_affinity_estimator,
+        )
+    all_job_records_by_id = {_job_id(job): job for job in remaining}
+
     # Semi-optimised greedy assignment: every round compares all remaining fixed
     # pickup-to-drop-off jobs against every rider's real current location.
     assignment_round = 0
@@ -2961,14 +3524,15 @@ def optimise_vehicle_routes(
             remaining_pickup_zone_counts[remaining_zone] = remaining_pickup_zone_counts.get(remaining_zone, 0) + 1
 
         best_choice: tuple[
-            tuple[int, float, float, float, int, int],
+            tuple[float, int, float, float, int, int, str],
             int,
             RiderState,
             dict[str, Any],
             dict[str, Any],
             dict[str, Any],
+            dict[str, Any],
         ] | None = None
-
+        feasible_candidates: list[dict[str, Any]] = []
         for rider in riders:
             for job_index, job in enumerate(remaining):
                 if _job_id(job) in assigned_job_ids:
@@ -2979,7 +3543,7 @@ def optimise_vehicle_routes(
                 key = rider_key(rider)
                 candidate_sequence = rider_sequences[key] + [job]
                 evaluation = evaluate_rider_sequence(rider, candidate_sequence, max_adjusted_duration_min)
-                if not evaluation.get("valid"):
+                if not evaluation.get("valid") or not candidate_hard_valid({rider.name: candidate_sequence}):
                     continue
                 inserted_row = evaluation["rows"][-1]
 
@@ -3010,23 +3574,19 @@ def optimise_vehicle_routes(
                     if rider.current_zone == pickup_zone or rider.assigned_count == 0
                     else int(load_policy["cluster_jump_penalty"])
                 )
-                candidate_rank = (
-                    minimum_priority,
-                    greedy_assignment_score,
-                    float(evaluation.get("raw_duration", math.inf)),
-                    cluster_jump_penalty,
-                    -int(inserted_row.get("Cluster Job Count", 1) or 1),
-                    int(job["_original_order"]),
+                feasible_candidates.append(
+                    {
+                        "job_index": job_index,
+                        "rider": rider,
+                        "job": job,
+                        "evaluation": evaluation,
+                        "inserted_row": inserted_row,
+                        "minimum_priority": minimum_priority,
+                        "greedy_assignment_score": greedy_assignment_score,
+                        "cluster_jump_penalty": cluster_jump_penalty,
+                        "candidate_cost": float(inserted_row.get("Empty Duration Min", math.inf) or math.inf),
+                    }
                 )
-                if best_choice is None or candidate_rank < best_choice[0]:
-                    best_choice = (
-                        candidate_rank,
-                        job_index,
-                        rider,
-                        job,
-                        evaluation,
-                        inserted_row,
-                    )
 
                 if comparison_count == 1 or comparison_count % 10 == 0:
                     report(
@@ -3035,6 +3595,76 @@ def optimise_vehicle_routes(
                         current_rider=rider.name,
                         current_pickup=pickup_address,
                     )
+
+        regional_candidate_costs: dict[int, dict[str, float]] = {}
+        for candidate in feasible_candidates:
+            regional_candidate_costs.setdefault(_job_id(candidate["job"]), {})[candidate["rider"].name] = candidate["candidate_cost"]
+        if regional_context:
+            # The policy is deliberately refreshed after every accepted job,
+            # using costs from each rider's latest real route state.
+            regional_context.update_round(remaining, regional_candidate_costs)
+
+        candidates_by_job: dict[int, list[dict[str, Any]]] = {}
+        for candidate in feasible_candidates:
+            candidates_by_job.setdefault(_job_id(candidate["job"]), []).append(candidate)
+
+        for candidate in feasible_candidates:
+            rider = candidate["rider"]
+            job = candidate["job"]
+            job_candidates = candidates_by_job[_job_id(job)]
+            best_feasible = min(item["candidate_cost"] for item in job_candidates)
+            regional_audit: dict[str, Any] = {}
+            regional_penalty = 0.0
+            affinity_adjustment = 0.0
+            if regional_context:
+                meta = regional_context.metadata(job)
+                rules = regional_context.support_rules[meta["operational_subregion"]]
+                tier12_costs = [
+                    item["candidate_cost"]
+                    for item in job_candidates
+                    if regional_context.rider_home_regions.get(item["rider"].name)
+                    in rules["primary_regions"] + rules["support_regions"]
+                ]
+                assessment = regional_context.assess_candidate(
+                    job,
+                    rider.name,
+                    normalize_region(rider.current_zone or infer_zone(rider.current_location)),
+                    candidate["candidate_cost"],
+                    best_feasible,
+                    min(tier12_costs, default=math.inf),
+                )
+                regional_penalty = assessment.total_penalty
+                if (
+                    regional_context.rider_home_regions.get(rider.name) == "east"
+                    and regional_context.rider_affinities.get(rider.name) == meta["operational_subregion"]
+                ):
+                    affinity_adjustment = -1.0
+                regional_audit = regional_audit_fields(
+                    regional_context,
+                    job,
+                    rider.name,
+                    rider.current_zone or infer_zone(rider.current_location) or "unknown",
+                    assessment,
+                )
+            candidate_rank = (
+                float(candidate["greedy_assignment_score"]) + regional_penalty + affinity_adjustment,
+                int(candidate["minimum_priority"]),
+                float(candidate["evaluation"].get("raw_duration", math.inf)),
+                float(candidate["cluster_jump_penalty"]),
+                -int(candidate["inserted_row"].get("Cluster Job Count", 1) or 1),
+                int(job["_original_order"]),
+                rider.name.casefold(),
+            )
+            if best_choice is None or candidate_rank < best_choice[0]:
+                best_choice = (
+                    candidate_rank,
+                    candidate["job_index"],
+                    rider,
+                    job,
+                    candidate["evaluation"],
+                    candidate["inserted_row"],
+                    regional_audit,
+                )
 
         if best_choice is None:
             break
@@ -3046,6 +3676,7 @@ def optimise_vehicle_routes(
             job,
             evaluation,
             inserted_row,
+            regional_audit,
         ) = best_choice
         pickup_address = clean_text(job["Pickup Address"])
         dropoff_address = clean_text(job["Drop-off Address"])
@@ -3054,12 +3685,19 @@ def optimise_vehicle_routes(
         report(
             f"Assigned job {len(route_rows) + 1} of {total_jobs}",
             phase="Assigning",
+            event_type="assignment",
+            current_car_plate=clean_text(job.get("Car Plate")),
             current_rider=rider.name,
             current_pickup=pickup_address,
             current_dropoff=dropoff_address,
+            assigned_jobs=len(route_rows) + 1,
+            remaining_jobs=max(0, len(remaining) - 1),
         )
 
+        inserted_row.update(regional_audit)
         route_rows.append(inserted_row)
+        if regional_context:
+            regional_context.record_assignment(job, rider.name, regional_audit)
 
         assigned_job_ids.add(_job_id(job))
         key = rider_key(rider)
@@ -3081,7 +3719,8 @@ def optimise_vehicle_routes(
             made_assignment = True
             while remaining and made_assignment:
                 made_assignment = False
-                best_insertion: tuple[int, float, float, int, RiderState, int, int, dict[str, Any], dict[str, Any]] | None = None
+                best_insertion: tuple[float, int, float, int, str, RiderState, int, int, dict[str, Any], dict[str, Any], dict[str, Any]] | None = None
+                feasible_insertions: list[dict[str, Any]] = []
 
                 current_evaluations = {
                     rider_key(rider): evaluate_rider_sequence(rider, rider_sequences[rider_key(rider)], cap)
@@ -3099,35 +3738,100 @@ def optimise_vehicle_routes(
                             evaluation = evaluate_rider_sequence(rider, candidate_sequence, cap)
                             added_duration = float(evaluation.get("raw_duration", math.inf)) - current_duration
                             projected_adjusted = float(evaluation.get("adjusted_duration", math.inf))
-                            if not evaluation.get("valid"):
+                            if not evaluation.get("valid") or not candidate_hard_valid({rider.name: candidate_sequence}):
                                 continue
                             rider_minimum_target = _rider_minimum_job_target(rider, minimum_job_target)
                             minimum_priority = _minimum_job_priority(len(current_sequence), rider_minimum_target)
-                            candidate_rank = (
-                                minimum_priority,
-                                added_duration,
-                                projected_adjusted,
-                                int(job.get("_original_order", job_index)),
+                            inserted_rows = [
+                                row for row in evaluation.get("rows", [])
+                                if int(row.get("Uploaded Row", -1)) == _job_id(job)
+                            ]
+                            inserted_row = inserted_rows[0] if inserted_rows else {}
+                            feasible_insertions.append(
+                                {
+                                    "minimum_priority": minimum_priority,
+                                    "added_duration": added_duration,
+                                    "projected_adjusted": projected_adjusted,
+                                    "rider": rider,
+                                    "insert_at": insert_at,
+                                    "job_index": job_index,
+                                    "job": job,
+                                    "evaluation": evaluation,
+                                    "candidate_cost": float(inserted_row.get("Empty Duration Min", math.inf) or math.inf),
+                                    "current_region": infer_zone(inserted_row.get("Start From")) or rider.current_zone or "unknown",
+                                }
                             )
-                            if best_insertion is None or candidate_rank < best_insertion[:4]:
-                                best_insertion = (
-                                    minimum_priority,
-                                    added_duration,
-                                    projected_adjusted,
-                                    int(job.get("_original_order", job_index)),
-                                    rider,
-                                    insert_at,
-                                    job_index,
-                                    job,
-                                    evaluation,
-                                )
+
+                rescue_costs: dict[int, dict[str, float]] = {}
+                for candidate in feasible_insertions:
+                    job_costs = rescue_costs.setdefault(_job_id(candidate["job"]), {})
+                    job_costs[candidate["rider"].name] = min(
+                        candidate["candidate_cost"],
+                        job_costs.get(candidate["rider"].name, math.inf),
+                    )
+                if regional_context:
+                    regional_context.update_round(remaining, rescue_costs)
+                rescue_by_job: dict[int, list[dict[str, Any]]] = {}
+                for candidate in feasible_insertions:
+                    rescue_by_job.setdefault(_job_id(candidate["job"]), []).append(candidate)
+
+                for candidate in feasible_insertions:
+                    rider = candidate["rider"]
+                    job = candidate["job"]
+                    regional_penalty = 0.0
+                    audit: dict[str, Any] = {}
+                    if regional_context:
+                        peers = rescue_by_job[_job_id(job)]
+                        best_feasible = min(item["candidate_cost"] for item in peers)
+                        meta = regional_context.metadata(job)
+                        rules = regional_context.support_rules[meta["operational_subregion"]]
+                        tier12 = [
+                            item["candidate_cost"] for item in peers
+                            if regional_context.rider_home_regions.get(item["rider"].name)
+                            in rules["primary_regions"] + rules["support_regions"]
+                        ]
+                        assessment = regional_context.assess_candidate(
+                            job,
+                            rider.name,
+                            candidate["current_region"],
+                            candidate["candidate_cost"],
+                            best_feasible,
+                            min(tier12, default=math.inf),
+                        )
+                        regional_penalty = assessment.total_penalty
+                        audit = regional_audit_fields(
+                            regional_context,
+                            job,
+                            rider.name,
+                            candidate["current_region"],
+                            assessment,
+                        )
+                    candidate_rank = (
+                        float(candidate["added_duration"]) + regional_penalty,
+                        int(candidate["minimum_priority"]),
+                        float(candidate["projected_adjusted"]),
+                        int(job.get("_original_order", candidate["job_index"])),
+                        rider.name.casefold(),
+                    )
+                    if best_insertion is None or candidate_rank < best_insertion[:5]:
+                        best_insertion = (
+                            *candidate_rank,
+                            rider,
+                            candidate["insert_at"],
+                            candidate["job_index"],
+                            job,
+                            candidate["evaluation"],
+                            audit,
+                        )
 
                 if best_insertion is not None:
-                    _, _, _, _, rider, insert_at, job_index, job, _ = best_insertion
+                    _, _, _, _, _, rider, insert_at, job_index, job, _, audit = best_insertion
                     if _job_id(job) in assigned_job_ids:
                         remaining.pop(job_index)
                         continue
                     rider_sequences[rider_key(rider)].insert(insert_at, job)
+                    if regional_context:
+                        regional_context.record_assignment(job, rider.name, audit)
                     assigned_job_ids.add(_job_id(job))
                     remaining.pop(job_index)
                     made_assignment = True
@@ -3154,7 +3858,7 @@ def optimise_vehicle_routes(
             if not underfilled_riders:
                 break
 
-            best_transfer: tuple[float, float, int, RiderState, RiderState, int, int, dict[str, Any]] | None = None
+            best_transfer: tuple[float, float, int, str, RiderState, RiderState, int, int, dict[str, Any], dict[str, Any]] | None = None
             for receiver in underfilled_riders:
                 receiver_key = rider_key(receiver)
                 receiver_sequence = rider_sequences[receiver_key]
@@ -3183,18 +3887,65 @@ def optimise_vehicle_routes(
                                 receiver_sequence[:insert_at] + [job] + receiver_sequence[insert_at:]
                             )
                             receiver_evaluation = evaluate_rider_sequence(receiver, receiver_candidate_sequence, cap_used)
-                            if not receiver_evaluation.get("valid"):
+                            if not receiver_evaluation.get("valid") or not candidate_hard_valid(
+                                {donor.name: donor_candidate_sequence, receiver.name: receiver_candidate_sequence}
+                            ):
                                 continue
 
                             receiver_added_duration = (
                                 float(receiver_evaluation.get("raw_duration", math.inf)) - receiver_current_duration
                             )
+                            regional_penalty = 0.0
+                            regional_audit: dict[str, Any] = {}
+                            protected_primary_transfer = False
+                            if regional_context:
+                                inserted_rows = [
+                                    row for row in receiver_evaluation.get("rows", [])
+                                    if int(row.get("Uploaded Row", -1)) == _job_id(job)
+                                ]
+                                inserted_row = inserted_rows[0] if inserted_rows else {}
+                                candidate_cost = float(inserted_row.get("Empty Duration Min", math.inf) or math.inf)
+                                assessment = regional_context.assess_candidate(
+                                    job,
+                                    receiver.name,
+                                    infer_zone(inserted_row.get("Start From")) or receiver.current_zone or "unknown",
+                                    candidate_cost,
+                                    candidate_cost,
+                                    candidate_cost,
+                                )
+                                regional_penalty = assessment.total_penalty
+                                # Moving a high-specificity job away from its primary
+                                # rider needs a measurable route improvement.
+                                donor_home = regional_context.rider_home_regions.get(donor.name, "unknown")
+                                meta = regional_context.metadata(job)
+                                if (
+                                    donor_home in regional_context.support_rules[meta["operational_subregion"]]["primary_regions"]
+                                    and assessment.tier != "primary"
+                                    and regional_context.max_specificity_by_job_id.get(_job_id(job), 0.0)
+                                    >= regional_config.protected_job_advantage_min
+                                ):
+                                    protected_primary_transfer = True
+                                    regional_penalty += regional_config.scarce_driver_large_escape_penalty
+                                regional_audit = regional_audit_fields(
+                                    regional_context,
+                                    job,
+                                    receiver.name,
+                                    infer_zone(inserted_row.get("Start From")) or receiver.current_zone or "unknown",
+                                    assessment,
+                                )
+                            if (
+                                protected_primary_transfer
+                                and receiver_added_duration - donor_saved_duration
+                                >= -regional_config.protected_job_advantage_min
+                            ):
+                                continue
                             transfer_rank = (
-                                receiver_added_duration - donor_saved_duration,
+                                receiver_added_duration - donor_saved_duration + regional_penalty,
                                 float(receiver_evaluation.get("adjusted_duration", math.inf)),
                                 int(job.get("_original_order", remove_at)),
+                                receiver.name.casefold(),
                             )
-                            if best_transfer is None or transfer_rank < best_transfer[:3]:
+                            if best_transfer is None or transfer_rank < best_transfer[:4]:
                                 best_transfer = (
                                     *transfer_rank,
                                     donor,
@@ -3202,18 +3953,21 @@ def optimise_vehicle_routes(
                                     remove_at,
                                     insert_at,
                                     job,
+                                    regional_audit,
                                 )
 
             if best_transfer is None:
                 break
 
-            _, _, _, donor, receiver, remove_at, insert_at, job = best_transfer
+            _, _, _, _, donor, receiver, remove_at, insert_at, job, regional_audit = best_transfer
             donor_key = rider_key(donor)
             receiver_key = rider_key(receiver)
             donor_sequence = rider_sequences[donor_key]
             receiver_sequence = rider_sequences[receiver_key]
             rider_sequences[donor_key] = donor_sequence[:remove_at] + donor_sequence[remove_at + 1 :]
             rider_sequences[receiver_key] = receiver_sequence[:insert_at] + [job] + receiver_sequence[insert_at:]
+            if regional_context:
+                regional_context.assignments[_job_id(job)] = regional_audit
             moved_job = True
 
     rebalance_minimum_jobs()
@@ -3223,6 +3977,11 @@ def optimise_vehicle_routes(
         for rider in riders
     }
     route_rows = []
+    if regional_context:
+        for capacity_item in regional_context.capacity_summary.values():
+            capacity_item.jobs_assigned_to_primary_riders = 0
+            capacity_item.jobs_assigned_to_support_riders = 0
+            capacity_item.exceptional_unsupported_assignments = 0
     lookup_warnings.extend(
         warning
         for evaluation in final_evaluations.values()
@@ -3231,7 +3990,43 @@ def optimise_vehicle_routes(
     for rider in riders:
         key = rider_key(rider)
         evaluation = final_evaluations[key]
-        route_rows.extend(evaluation.get("rows", []))
+        for route_row in evaluation.get("rows", []):
+            if regional_context:
+                job_id = int(route_row.get("Uploaded Row", -1))
+                job = all_job_records_by_id.get(job_id)
+                audit = dict(regional_context.assignments.get(job_id, {}))
+                if job is not None and not audit:
+                    candidate_cost = float(route_row.get("Empty Duration Min", math.inf) or math.inf)
+                    assessment = regional_context.assess_candidate(
+                        job,
+                        rider.name,
+                        infer_zone(route_row.get("Start From")) or rider.start_zone or "unknown",
+                        candidate_cost,
+                        candidate_cost,
+                        candidate_cost,
+                    )
+                    audit = regional_audit_fields(
+                        regional_context,
+                        job,
+                        rider.name,
+                        infer_zone(route_row.get("Start From")) or rider.start_zone or "unknown",
+                        assessment,
+                    )
+                audit["Assigned Rider Current Region Before Job"] = normalize_region(
+                    infer_zone(route_row.get("Start From")) or rider.start_zone or "unknown"
+                )
+                route_row.update(audit)
+                regional_context.assignments[job_id] = audit
+                subregion = audit.get("Operational Subregion", "unknown")
+                if subregion in regional_context.capacity_summary:
+                    capacity_item = regional_context.capacity_summary[subregion]
+                    if audit.get("Assignment Tier") == "primary":
+                        capacity_item.jobs_assigned_to_primary_riders += 1
+                    elif audit.get("Assignment Tier") == "support":
+                        capacity_item.jobs_assigned_to_support_riders += 1
+                    else:
+                        capacity_item.exceptional_unsupported_assignments += 1
+            route_rows.append(route_row)
         rider.assigned_count = len(rider_sequences[key])
         rider.empty_distance_km = float(evaluation.get("empty_distance", 0) or 0)
         rider.empty_duration_min = float(evaluation.get("empty_duration", 0) or 0)
@@ -3315,6 +4110,63 @@ def optimise_vehicle_routes(
     route_df.attrs["rejected_candidate_audit"] = rejected_candidate_audit
     route_df.attrs["force_complete_cap_used"] = cap_used
     validate_optimisation_integrity(route_df, jobs)
+    hard_validation = validate_candidate_routes(
+        {rider.name: rider_sequences[rider_key(rider)] for rider in riders},
+        operation_context,
+        constraints,
+    )
+    route_df.attrs["hard_constraint_validation"] = hard_validation.to_dict()
+    route_df.attrs["operation_context"] = operation_context.to_settings()
+    route_df.attrs["constraints"] = [
+        constraint.to_dict() if isinstance(constraint, Constraint) else dict(constraint)
+        for constraint in constraints
+    ]
+    route_df.attrs["rider_max_jobs"] = {rider.name: rider.max_jobs for rider in riders}
+    if regional_context:
+        route_df.attrs["regional_capacity"] = sanitize_for_output(regional_context.capacity_rows())
+        regional_audit_columns = [
+            "Uploaded Row", "Car Plate", "Rider", "Sequence", "Pickup Address",
+            "Job Region", "Operational Subregion", "Region Confidence",
+            "Assigned Rider Home Region", "Assigned Rider Current Region Before Job",
+            "Assignment Tier", "Regional Specificity Score", "Regional Support Penalty",
+            "Scarce Driver Protection Penalty", "Unsupported Region Penalty",
+            "Reason for Regional Assignment",
+        ]
+        route_df.attrs["regional_assignment_audit"] = sanitize_for_output(
+            route_df.loc[:, [column for column in regional_audit_columns if column in route_df.columns]].to_dict("records")
+        )
+        route_df.attrs["regional_overflow_config"] = regional_config.to_dict()
+        route_df.attrs["regional_exception_count"] = sum(
+            int(item.exceptional_unsupported_assignments)
+            for item in regional_context.capacity_summary.values()
+        )
+        route_df.attrs["protected_job_misassignment_count"] = sum(
+            1
+            for job_id, audit in regional_context.assignments.items()
+            if regional_context.max_specificity_by_job_id.get(job_id, 0.0) >= regional_config.protected_job_advantage_min
+            and audit.get("Assignment Tier") != "primary"
+            and audit.get("Operational Subregion") == "west_core"
+        )
+    if not hard_validation.is_valid:
+        raise ValueError(
+            "Invalid optimisation result: hard constraint violation(s): "
+            + "; ".join(item["message"] for item in hard_validation.violations)
+        )
+    if use_onemap and verify_fallbacks_after_solve:
+        route_df, verification_warnings = verify_fallback_travel_legs(
+            route_df,
+            operation_context,
+            token=token,
+            retries=fallback_verification_retries,
+        )
+        lookup_warnings.extend(verification_warnings)
+        validate_optimisation_integrity(route_df, jobs)
+    if "Travel Warning" in route_df.columns:
+        lookup_warnings.extend(
+            warning
+            for warning in route_df["Travel Warning"].fillna("").astype(str)
+            if warning.strip()
+        )
     summary_df = pd.DataFrame(
         [
             {
@@ -3341,8 +4193,164 @@ def optimise_vehicle_routes(
         columns=SUMMARY_COLUMNS,
     )
     summary_df = format_summary_output(summary_df, route_df)
+    for final_index, row in route_df.reset_index(drop=True).iterrows():
+        report(
+            f"Confirmed final assignment {final_index + 1} of {len(route_df)}",
+            phase="Finalising",
+            event_type="final_assignment",
+            current_car_plate=clean_text(row.get("Car Plate")),
+            current_rider=clean_text(row.get("Rider")),
+            current_pickup=clean_text(row.get("Pickup Address")),
+            current_dropoff=clean_text(row.get("Drop-off Address")),
+            assigned_jobs=final_index + 1,
+            remaining_jobs=max(0, total_jobs - final_index - 1),
+            progress=0.99,
+        )
     report("Finished route optimisation", phase="Finished", progress=1.0)
     return route_df, summary_df, _dedupe_lookup_warnings(lookup_warnings)
+
+
+def improve_route_dataframe(
+    route_df: pd.DataFrame,
+    jobs_df: pd.DataFrame,
+    riders: list[RiderState],
+    operation_context: OperationContext,
+    settings: dict[str, Any],
+    constraints: list[Constraint | dict[str, Any]] | None = None,
+    *,
+    time_limit_seconds: int = 30,
+    max_iterations: int = 100,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[dict[str, Any]]]:
+    """Run bounded local search after a complete production baseline exists."""
+
+    from Flexar.BlueSG.local_improvement import improve_assigned_routes
+    from Flexar.BlueSG.run_metrics import create_run_result, objective_tuple
+
+    integrity = optimisation_integrity_report(route_df, jobs_df)
+    if not integrity["is_valid"] or integrity["unassigned_jobs"]:
+        return route_df, format_summary_output(pd.DataFrame(), route_df), [], [
+            {
+                "move_id": "",
+                "move_type": "not_started",
+                "accepted": False,
+                "rejection_reason": "Local improvement requires a complete, valid baseline route.",
+            }
+        ]
+
+    jobs_by_id = build_jobs_by_stable_id(jobs_df)
+    id_sequences = build_rider_sequences_from_route_df(route_df)
+    job_sequences = {
+        rider.name: [copy.deepcopy(jobs_by_id[job_id]) for job_id in id_sequences.get(rider.name, [])]
+        for rider in riders
+    }
+    engine_keys = {
+        "use_onemap",
+        "optimise_by",
+        "token",
+        "empty_weight",
+        "loaded_weight",
+        "soft_workload_min",
+        "workload_penalty_per_min",
+        "soft_adjusted_duration_min",
+        "duration_penalty_per_min",
+        "max_job_overage_penalty",
+        "duration_buffer_multiplier",
+        "empty_travel_duration_multiplier",
+        "empty_travel_wait_buffer_min",
+        "fallback_penalty",
+        "max_total_duty_time_min",
+        "regional_overflow_config",
+    }
+    engine_settings = {key: value for key, value in settings.items() if key in engine_keys}
+    engine_settings.update({"operation_context": operation_context, "constraints": constraints or []})
+
+    def candidate_evaluator(candidate: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+        candidate_ids = {
+            rider: [stable_job_id_from_job(job) for job in jobs]
+            for rider, jobs in candidate.items()
+        }
+        candidate_route, candidate_summary, candidate_warnings = rebuild_outputs_from_sequences(
+            candidate_ids,
+            riders,
+            jobs_by_id,
+            jobs_df=jobs_df,
+            **engine_settings,
+        )
+        validation = candidate_route.attrs.get("hard_constraint_validation", {})
+        candidate_result = create_run_result(
+            route_df=candidate_route,
+            unassigned_df=pd.DataFrame(),
+            riders=riders,
+            context=operation_context,
+            settings={"jobs_uploaded": len(jobs_df)},
+            input_filename="local-search-candidate",
+            input_sha256="",
+            selected_job_date="",
+            warnings=[{"message": warning} for warning in candidate_warnings],
+            validation=validation,
+        )
+        return {
+            "objective_tuple": objective_tuple(candidate_result),
+            "jobs_assigned": len(candidate_route),
+            "unassigned_job_count": 0,
+            "hard_constraint_violation_count": int(validation.get("hard_violation_count", 0)),
+            "fallback_leg_count": int(candidate_result.summary.get("fallback_leg_count", 0)),
+            "validation": validation,
+            "rider_metrics": {
+                metric.rider_name: sanitize_for_output(metric)
+                for metric in candidate_result.rider_metrics
+            },
+            "route_df": candidate_route,
+            "summary_df": candidate_summary,
+            "lookup_warnings": candidate_warnings,
+            "regional_exception_count": int(candidate_route.attrs.get("regional_exception_count", 0)),
+            "protected_job_misassignment_count": int(candidate_route.attrs.get("protected_job_misassignment_count", 0)),
+        }
+
+    local_settings = dict(settings)
+    local_settings["_candidate_evaluator"] = candidate_evaluator
+    improved_sequences, move_audit = improve_assigned_routes(
+        job_sequences,
+        riders,
+        operation_context,
+        local_settings,
+        constraints or [],
+        time_limit_seconds=time_limit_seconds,
+        max_iterations=max_iterations,
+    )
+    if not any(move.get("accepted") for move in move_audit):
+        rebuilt_route, rebuilt_summary, rebuilt_warnings = rebuild_outputs_from_sequences(
+            id_sequences,
+            riders,
+            jobs_by_id,
+            jobs_df=jobs_df,
+            **engine_settings,
+        )
+        return rebuilt_route, rebuilt_summary, rebuilt_warnings, move_audit
+
+    improved_ids = {
+        rider: [stable_job_id_from_job(job) for job in jobs]
+        for rider, jobs in improved_sequences.items()
+    }
+    improved_route, improved_summary, warnings = rebuild_outputs_from_sequences(
+        improved_ids,
+        riders,
+        jobs_by_id,
+        jobs_df=jobs_df,
+        **engine_settings,
+    )
+    if bool(engine_settings.get("use_onemap")):
+        improved_route, verification_warnings = verify_fallback_travel_legs(
+            improved_route,
+            operation_context,
+            token=engine_settings.get("token"),
+            retries=1,
+        )
+        warnings = sorted(set([*warnings, *verification_warnings]))
+        improved_summary = format_summary_output(improved_summary, improved_route)
+    improved_route.attrs["move_audit"] = move_audit
+    validate_optimisation_integrity(improved_route, jobs_df)
+    return improved_route, improved_summary, warnings, move_audit
 
 
 def validate_route_chain(route_df: pd.DataFrame, riders: list[RiderState]) -> dict[tuple[str, int], str]:
@@ -3393,10 +4401,77 @@ def format_summary_output(summary_df: pd.DataFrame, route_df: pd.DataFrame) -> p
             .count()
         )
         summary_df["Total Jobs"] = summary_df["Rider"].map(unique_jobs_by_rider).fillna(0).astype(int)
-    if "Adjusted Route Duration Min" not in summary_df.columns or summary_df["Adjusted Route Duration Min"].isna().all():
-        summary_df["Adjusted Route Duration Min"] = (
-            summary_df["Total Route Duration Min"].fillna(0).astype(float) * DEFAULT_DURATION_BUFFER_MULTIPLIER
-        ).round(1)
+        first_positioning_by_rider: dict[str, float] = {}
+        empty_by_rider: dict[str, float] = {}
+        loaded_by_rider: dict[str, float] = {}
+        handling_by_rider: dict[str, tuple[float, float]] = {}
+        fallback_by_rider: dict[str, int] = {}
+        route_time_by_rider: dict[str, float] = {}
+        duty_by_rider: dict[str, float] = {}
+        adjusted_duty_by_rider: dict[str, float] = {}
+        for rider, rider_routes in route_df.groupby("Rider", sort=False):
+            ordered = rider_routes.sort_values("Sequence", kind="stable")
+            empty_values = pd.to_numeric(ordered.get("Empty Duration Min", 0), errors="coerce").fillna(0)
+            loaded_values = pd.to_numeric(ordered.get("Loaded Duration Min", 0), errors="coerce").fillna(0)
+            first_positioning = float(empty_values.iloc[0]) if len(empty_values) else 0.0
+            non_positioning_empty = max(0.0, float(empty_values.sum()) - first_positioning)
+            pickup_handling = float(pd.to_numeric(ordered.get("Pickup Handling Min", 0), errors="coerce").fillna(0).sum())
+            dropoff_handling = float(pd.to_numeric(ordered.get("Drop-off Handling Min", 0), errors="coerce").fillna(0).sum())
+            unlock_wait = float(pd.to_numeric(ordered.get("Unlock Wait Min", 0), errors="coerce").fillna(0).sum())
+            route_time = non_positioning_empty + float(loaded_values.sum()) + pickup_handling + dropoff_handling + unlock_wait
+            duty = first_positioning + route_time
+            adjusted_values = pd.to_numeric(ordered.get("Adjusted Duty Time Min", pd.Series(dtype=float)), errors="coerce").dropna()
+            adjusted_duty = float(adjusted_values.iloc[-1]) if len(adjusted_values) else duty * DEFAULT_DURATION_BUFFER_MULTIPLIER
+            rider_key = str(rider)
+            first_positioning_by_rider[rider_key] = first_positioning
+            empty_by_rider[rider_key] = non_positioning_empty
+            loaded_by_rider[rider_key] = float(loaded_values.sum())
+            handling_by_rider[rider_key] = (pickup_handling, dropoff_handling)
+            route_time_by_rider[rider_key] = route_time
+            duty_by_rider[rider_key] = duty
+            adjusted_duty_by_rider[rider_key] = adjusted_duty
+            if "Empty Confidence" in ordered and "Loaded Confidence" in ordered:
+                fallback_by_rider[rider_key] = int(ordered["Empty Confidence"].eq("fallback").sum() + ordered["Loaded Confidence"].eq("fallback").sum())
+            else:
+                fallback_by_rider[rider_key] = int(ordered["Cost Source"].astype(str).str.contains("fallback", case=False, na=False).sum())
+
+        summary_df["First Positioning Min"] = summary_df["Rider"].astype(str).map(first_positioning_by_rider).fillna(0).round(1)
+        summary_df["Total Empty Duration Min"] = summary_df["Rider"].astype(str).map(empty_by_rider).fillna(0).round(1)
+        summary_df["Total Loaded Duration Min"] = summary_df["Rider"].astype(str).map(loaded_by_rider).fillna(0).round(1)
+        summary_df["Pickup Handling Min"] = summary_df["Rider"].astype(str).map(lambda rider: handling_by_rider.get(rider, (0.0, 0.0))[0]).round(1)
+        summary_df["Drop-off Handling Min"] = summary_df["Rider"].astype(str).map(lambda rider: handling_by_rider.get(rider, (0.0, 0.0))[1]).round(1)
+        summary_df["Total Route Duration Min"] = summary_df["Rider"].astype(str).map(route_time_by_rider).fillna(0).round(1)
+        summary_df["Total Duty Time Min"] = summary_df["Rider"].astype(str).map(duty_by_rider).fillna(0).round(1)
+        summary_df["Adjusted Duty Time Min"] = summary_df["Rider"].astype(str).map(adjusted_duty_by_rider).fillna(0).round(1)
+        summary_df["Fallback Leg Count"] = summary_df["Rider"].astype(str).map(fallback_by_rider).fillna(0).astype(int)
+    for column in [
+        "First Positioning Min",
+        "Pickup Handling Min",
+        "Drop-off Handling Min",
+        "Total Duty Time Min",
+        "Adjusted Duty Time Min",
+        "Fallback Leg Count",
+        "Max Jobs Target",
+        "Max Jobs Overage",
+        "Hard Violation Count",
+    ]:
+        if column not in summary_df.columns:
+            summary_df[column] = 0
+    rider_caps = route_df.attrs.get("rider_max_jobs", {}) if route_df is not None else {}
+    if rider_caps:
+        summary_df["Max Jobs Target"] = summary_df["Rider"].astype(str).map(rider_caps)
+    summary_df["Max Jobs Overage"] = summary_df.apply(
+        lambda row: max(0, int(row["Total Jobs"] or 0) - int(row["Max Jobs Target"]))
+        if pd.notna(row["Max Jobs Target"]) and str(row["Max Jobs Target"]) != ""
+        else 0,
+        axis=1,
+    )
+    hard_validation = route_df.attrs.get("hard_constraint_validation", {}) if route_df is not None else {}
+    violations = hard_validation.get("violations", [])
+    summary_df["Hard Violation Count"] = summary_df["Rider"].astype(str).map(
+        lambda rider: sum(1 for item in violations if not item.get("rider") or str(item.get("rider")) == rider)
+    )
+    summary_df["Adjusted Route Duration Min"] = summary_df["Adjusted Duty Time Min"]
     summary_df["Total Route Duration Hours"] = (
         summary_df["Total Route Duration Min"].fillna(0).astype(float) / 60
     ).round(2)
@@ -3466,6 +4541,16 @@ def _write_title(ws: Any, title: str, row: int = 1) -> None:
 
 
 def _excel_safe_value(value: Any) -> Any:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    value = sanitize_for_output(value)
+    if isinstance(value, (dict, list, tuple, set)):
+        value = json.dumps(value, ensure_ascii=False)
     if isinstance(value, str) and len(value) > EXCEL_CELL_MAX_CHARS:
         suffix = "\n\n[Truncated for Excel cell limit]"
         return value[: EXCEL_CELL_MAX_CHARS - len(suffix)] + suffix
@@ -3570,7 +4655,39 @@ def _style_summary_sheet(ws: Any, rider_summary_header_row: int) -> None:
         ws.cell(row, SUMMARY_COLUMNS.index("Workload Comment") + 1).fill = fill
 
 
-def _overall_summary(route_df: pd.DataFrame, summary_df: pd.DataFrame, jobs_df: pd.DataFrame | None) -> list[list[Any]]:
+def _overall_summary(
+    route_df: pd.DataFrame,
+    summary_df: pd.DataFrame,
+    jobs_df: pd.DataFrame | None,
+    run_result: OptimisationRunResult | None = None,
+) -> list[list[Any]]:
+    if run_result is not None:
+        summary = run_result.summary
+        return [
+            ["Metric", "Value"],
+            ["Run ID", summary.get("run_id", run_result.run_id)],
+            ["Algorithm", f"{run_result.algorithm_name} {run_result.algorithm_version}"],
+            ["Input filename", run_result.input_filename],
+            ["Input SHA-256", run_result.input_sha256],
+            ["Selected job date", run_result.selected_job_date],
+            ["Total jobs uploaded", summary.get("jobs_uploaded", 0)],
+            ["Total jobs selected", summary.get("jobs_selected", 0)],
+            ["Total jobs assigned", summary.get("jobs_assigned", 0)],
+            ["Total jobs unassigned", summary.get("jobs_unassigned", 0)],
+            ["Total riders available", summary.get("riders_available", 0)],
+            ["Total riders used", summary.get("riders_used", 0)],
+            ["Total route time", f"{summary.get('total_route_time_min', 0)} min"],
+            ["Total rider duty time", f"{summary.get('total_duty_time_min', 0)} min"],
+            ["Maximum rider duty", f"{summary.get('longest_rider_duty_min', 0)} min"],
+            ["Minimum rider duty", f"{summary.get('shortest_rider_duty_min', 0)} min"],
+            ["Total first positioning", f"{summary.get('total_first_positioning_min', 0)} min"],
+            ["Total empty travel", f"{summary.get('total_empty_travel_min', 0)} min"],
+            ["Empty travel percentage", f"{summary.get('empty_travel_pct', 0)}%"],
+            ["Fallback legs", summary.get("fallback_leg_count", 0)],
+            ["Hard constraint violations", summary.get("hard_violation_count", 0)],
+            ["Accepted local-search moves", summary.get("accepted_local_search_moves", 0)],
+            ["Manual-review warnings", summary.get("manual_review_warning_count", 0)],
+        ]
     active_summary = summary_df[summary_df["Total Jobs"].fillna(0).astype(int) > 0]
     total_duration = float(summary_df["Total Route Duration Min"].fillna(0).sum()) if not summary_df.empty else 0
     average_duration = float(active_summary["Total Route Duration Min"].mean()) if not active_summary.empty else 0
@@ -3854,6 +4971,9 @@ def _build_whatsapp_message(rider: str, rider_routes: pd.DataFrame) -> str:
             job_lines.append(f"Lot Range: {lot_range}")
         if zone != "-":
             job_lines.append(f"Zone: {zone}")
+        travel_warning = _route_value(route, "Travel Warning", "")
+        if travel_warning:
+            job_lines.append(f"⚠ {travel_warning}")
         message_parts.extend(["", *job_lines])
 
     message_parts.extend(
@@ -4083,14 +5203,151 @@ def _write_map_loader_sheet(writer: pd.ExcelWriter, route_df: pd.DataFrame) -> N
     _autosize_columns(ws, 45)
 
 
+def _write_manual_review_sheet(writer: pd.ExcelWriter, route_df: pd.DataFrame) -> None:
+    ws = writer.book.create_sheet("Manual Review")
+    _write_title(ws, "Manual Review Warnings", 1)
+    headers = ["Rider", "Sequence", "Car Plate", "Origin", "Destination", "Warning"]
+    for column, header in enumerate(headers, start=1):
+        ws.cell(row=3, column=column, value=header)
+    _style_header_row(ws, 3, len(headers))
+    row_number = 4
+    for _, row in _sort_routes_for_export(route_df).iterrows():
+        warning = clean_text(row.get("Travel Warning"))
+        if not warning:
+            continue
+        values = [
+            row.get("Rider"),
+            row.get("Sequence"),
+            row.get("Car Plate"),
+            row.get("Start From"),
+            row.get("Drop-off Address"),
+            warning,
+        ]
+        for column, value in enumerate(values, start=1):
+            ws.cell(row=row_number, column=column, value=_excel_safe_value(value)).alignment = Alignment(wrap_text=True, vertical="top")
+        row_number += 1
+    if row_number == 4:
+        ws.cell(row=4, column=1, value="No manual-review travel warnings.")
+    ws.freeze_panes = "A4"
+    _autosize_columns(ws, 70)
+
+
+def _write_local_search_audit_sheet(writer: pd.ExcelWriter, move_audit: list[dict[str, Any]]) -> None:
+    ws = writer.book.create_sheet("Local Search Audit")
+    _write_title(ws, "Bounded Local Search Audit", 1)
+    if not move_audit:
+        ws.cell(row=3, column=1, value="Local improvement was disabled or no moves were evaluated.")
+        return
+    audit_df = pd.DataFrame(sanitize_for_output(move_audit))
+    for column, header in enumerate(audit_df.columns, start=1):
+        ws.cell(row=3, column=column, value=_excel_safe_value(header))
+    _style_header_row(ws, 3, len(audit_df.columns))
+    for row_number, values in enumerate(audit_df.itertuples(index=False), start=4):
+        for column, value in enumerate(values, start=1):
+            ws.cell(row=row_number, column=column, value=_excel_safe_value(value)).alignment = Alignment(wrap_text=True, vertical="top")
+    ws.freeze_panes = "A4"
+    _autosize_columns(ws, 55)
+
+
+def _write_regional_capacity_sheet(writer: pd.ExcelWriter, route_df: pd.DataFrame) -> None:
+    ws = writer.book.create_sheet("Regional Capacity")
+    _write_title(ws, "Regional Demand, Capacity and Overflow", 1)
+    rows = list(route_df.attrs.get("regional_capacity", []))
+    if not rows:
+        ws.cell(row=3, column=1, value="Regional overflow diagnostics were not enabled for this run.")
+        return
+    frame = _excel_safe_dataframe(pd.DataFrame(rows))
+    for column, header in enumerate(frame.columns, start=1):
+        ws.cell(row=3, column=column, value=_excel_safe_value(header))
+    _style_header_row(ws, 3, len(frame.columns))
+    for row_number, values in enumerate(frame.itertuples(index=False), start=4):
+        for column, value in enumerate(values, start=1):
+            ws.cell(row=row_number, column=column, value=_excel_safe_value(value))
+    ws.freeze_panes = "A4"
+    _autosize_columns(ws, 42)
+
+
+def _write_regional_assignment_audit_sheet(writer: pd.ExcelWriter, route_df: pd.DataFrame) -> None:
+    ws = writer.book.create_sheet("Regional Assignment Audit")
+    _write_title(ws, "Per-job Regional Assignment Audit", 1)
+    columns = [
+        "Uploaded Row", "Car Plate", "Rider", "Sequence", "Pickup Address",
+        "Job Region", "Operational Subregion", "Region Confidence",
+        "Assigned Rider Home Region", "Assigned Rider Current Region Before Job",
+        "Assignment Tier", "Regional Specificity Score", "Regional Support Penalty",
+        "Scarce Driver Protection Penalty", "Unsupported Region Penalty",
+        "Reason for Regional Assignment",
+    ]
+    columns = [column for column in columns if column in route_df.columns]
+    if not columns or route_df.empty:
+        ws.cell(row=3, column=1, value="No regional assignment audit rows were available.")
+        return
+    frame = _excel_safe_dataframe(route_df.loc[:, columns])
+    for column, header in enumerate(frame.columns, start=1):
+        ws.cell(row=3, column=column, value=_excel_safe_value(header))
+    _style_header_row(ws, 3, len(frame.columns))
+    for row_number, values in enumerate(frame.itertuples(index=False), start=4):
+        for column, value in enumerate(values, start=1):
+            ws.cell(row=row_number, column=column, value=_excel_safe_value(value)).alignment = Alignment(
+                wrap_text=True, vertical="top"
+            )
+    ws.freeze_panes = "A4"
+    _autosize_columns(ws, 60)
+
+
+def _write_run_metadata_sheet(writer: pd.ExcelWriter, run_result: OptimisationRunResult | None) -> None:
+    ws = writer.book.create_sheet("Run Metadata")
+    _write_title(ws, "Canonical Run Metadata", 1)
+    if run_result is None:
+        ws.cell(row=3, column=1, value="Canonical run metadata was not supplied by this legacy caller.")
+        return
+    rows = [["Field", "Value"]]
+    for key, value in sanitize_for_output(run_result.summary).items():
+        rows.append([key, json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else value])
+    _write_rows(ws, rows, 3)
+    _style_header_row(ws, 3, 2)
+    _autosize_columns(ws, 80)
+
+
+def _write_before_after_sheet(writer: pd.ExcelWriter, run_result: OptimisationRunResult | None) -> None:
+    ws = writer.book.create_sheet("Before After")
+    _write_title(ws, "Baseline vs Final", 1)
+    if run_result is None:
+        ws.cell(row=3, column=1, value="Canonical comparison data was not supplied by this legacy caller.")
+        return
+    baseline = run_result.settings.get("baseline_summary") or run_result.summary
+    fields = [
+        ("Jobs assigned", "jobs_assigned"),
+        ("Jobs unassigned", "jobs_unassigned"),
+        ("Total route time min", "total_route_time_min"),
+        ("Total duty time min", "total_duty_time_min"),
+        ("Maximum rider duty min", "longest_rider_duty_min"),
+        ("Duty spread min", "duty_time_spread_min"),
+        ("Duty variance", "duty_time_variance"),
+        ("Total empty travel min", "total_empty_travel_min"),
+        ("Fallback legs", "fallback_leg_count"),
+        ("Hard violations", "hard_violation_count"),
+        ("Max Jobs overage", "max_jobs_overage_total"),
+    ]
+    rows = [["Metric", "Baseline", "Final"]]
+    rows.extend([[label, baseline.get(key, 0), run_result.summary.get(key, 0)] for label, key in fields])
+    _write_rows(ws, rows, 3)
+    _style_header_row(ws, 3, 3)
+    _autosize_columns(ws, 45)
+
+
 def export_routes_to_excel(
     route_df: pd.DataFrame,
     summary_df: pd.DataFrame,
     jobs_df: pd.DataFrame | None = None,
     validation_warnings: list[str] | None = None,
     lookup_warnings: list[str] | None = None,
+    run_result: OptimisationRunResult | None = None,
+    move_audit: list[dict[str, Any]] | None = None,
 ) -> bytes:
+    route_attrs = copy.deepcopy(route_df.attrs)
     route_df = _sort_routes_for_export(route_df).reset_index(drop=True) if not route_df.empty else route_df
+    route_df.attrs.update(route_attrs)
     if jobs_df is not None:
         validate_optimisation_integrity(route_df, jobs_df)
     summary_df = format_summary_output(summary_df, route_df)
@@ -4125,7 +5382,7 @@ def export_routes_to_excel(
 
         summary_ws = writer.book.create_sheet("Summary")
         _write_title(summary_ws, "Overall Route Summary", 1)
-        overall_rows = _overall_summary(route_df, summary_df, jobs_df)
+        overall_rows = _overall_summary(route_df, summary_df, jobs_df, run_result)
         next_row = _write_rows(summary_ws, overall_rows, 3) + 2
         _write_title(summary_ws, "Rider Workload Summary", next_row)
         rider_header_row = next_row + 2
@@ -4138,6 +5395,12 @@ def export_routes_to_excel(
         _autosize_columns(summary_ws, 45)
 
         _write_rider_instructions_sheet(writer, route_df, summary_df)
+        _write_manual_review_sheet(writer, route_df)
+        _write_regional_capacity_sheet(writer, route_df)
+        _write_regional_assignment_audit_sheet(writer, route_df)
+        _write_local_search_audit_sheet(writer, move_audit or (run_result.move_audit if run_result else []))
+        _write_run_metadata_sheet(writer, run_result)
+        _write_before_after_sheet(writer, run_result)
     return output.getvalue()
 
 

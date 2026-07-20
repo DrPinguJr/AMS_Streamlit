@@ -1,0 +1,66 @@
+2026-07-20T11:10:45+08:00 INPUT C:\Users\HRteam\Downloads\Antares x Flexar - RB Jobs (5) 1.xlsx sha256=a83a92bef07b192401ed314c2fcde682ead5db9359cf9f09c9c5870f2c5e9285 valid_uploaded_jobs=60 selected_date=2026-07-17 selected_jobs=30
+2026-07-20T11:10:45+08:00 LIVE_ONEMAP_ATTEMPT timed_out_after_seconds=600 before_first_assignment; provider/cache state prevented reproducible completion
+2026-07-20T11:10:45+08:00 HISTORICAL_OUTPUT copied_as=historical_2026-07-17_output.xlsx sha256=b1c6a1013ed4d5dec2ec2e629441fa5d53a76bcb39f676a2b8f537d718e08930; not_used_as_job_input
+2026-07-20T11:10:45+08:00 Fallback assigned=0/30 rider= car= status=Using fallback zone estimates only
+2026-07-20T11:10:45+08:00 Assigning assigned=1/30 rider=Hidayat car=SNE7629Z status=Assigned job 1 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=2/30 rider=Ooi Kin Soon car=SLV7639D status=Assigned job 2 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=3/30 rider=Raihan car=SPE9404T status=Assigned job 3 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=4/30 rider=Arin Joshua Daniel car=SNB9063H status=Assigned job 4 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=5/30 rider=Lim Choon Yong Lester car=SPE9366U status=Assigned job 5 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=6/30 rider=Asiah car=SNG7827H status=Assigned job 6 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=7/30 rider=Chean Zheng Tao Clifford car=SLN9720E status=Assigned job 7 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=8/30 rider=Chen Yen Zong (El-Tian) car=SMJ1400R status=Assigned job 8 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=9/30 rider=Gary Koh Foo Choy car=SNA5711C status=Assigned job 9 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=10/30 rider=Gary Koh Foo Choy car=SMF4679E status=Assigned job 10 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=11/30 rider=Jasmet Singh car=SLQ8973H status=Assigned job 11 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=12/30 rider=Lim Choon Yong Lester car=SNE7225E status=Assigned job 12 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=13/30 rider=Jasmine ( Low Bee Har ) car=SNT4154S status=Assigned job 13 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=14/30 rider=Hidayat car=SMV3524R status=Assigned job 14 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=15/30 rider=Nabil hakim car=SNT4247H status=Assigned job 15 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=16/30 rider=Syed Muhammad Faiq Bin Bagal car=SPH9479L status=Assigned job 16 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=17/30 rider=Syed Muhammad Faiq Bin Bagal car=SLZ5455J status=Assigned job 17 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=18/30 rider=Zhi Ming car=SLP1229A status=Assigned job 18 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=19/30 rider=Ooi Kin Soon car=SNT4212H status=Assigned job 19 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=20/30 rider=Raihan car=SPG6567R status=Assigned job 20 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=21/30 rider=Chen Yen Zong (El-Tian) car=SNT4332U status=Assigned job 21 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=22/30 rider=Jasmet Singh car=SMU4161C status=Assigned job 22 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=23/30 rider=Nabil hakim car=SMH8695X status=Assigned job 23 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=24/30 rider=Arin Joshua Daniel car=SNY1392P status=Assigned job 24 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=25/30 rider=Asiah car=SPE9390Z status=Assigned job 25 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=26/30 rider=Chean Zheng Tao Clifford car=SMN4891R status=Assigned job 26 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=27/30 rider=Jasmine ( Low Bee Har ) car=SPH6955Z status=Assigned job 27 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=28/30 rider=Zhi Ming car=SMT9751Y status=Assigned job 28 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=29/30 rider=Lim Choon Yong Lester car=SLP6171Z status=Assigned job 29 of 30
+2026-07-20T11:10:45+08:00 Assigning assigned=30/30 rider=Hidayat car=SMR491S status=Assigned job 30 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=1/30 rider=Arin Joshua Daniel car=SNB9063H status=Confirmed final assignment 1 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=2/30 rider=Arin Joshua Daniel car=SNY1392P status=Confirmed final assignment 2 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=3/30 rider=Asiah car=SNG7827H status=Confirmed final assignment 3 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=4/30 rider=Asiah car=SPE9390Z status=Confirmed final assignment 4 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=5/30 rider=Chean Zheng Tao Clifford car=SLN9720E status=Confirmed final assignment 5 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=6/30 rider=Chean Zheng Tao Clifford car=SMN4891R status=Confirmed final assignment 6 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=7/30 rider=Chen Yen Zong (El-Tian) car=SMJ1400R status=Confirmed final assignment 7 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=8/30 rider=Chen Yen Zong (El-Tian) car=SNT4332U status=Confirmed final assignment 8 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=9/30 rider=Gary Koh Foo Choy car=SNA5711C status=Confirmed final assignment 9 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=10/30 rider=Gary Koh Foo Choy car=SMF4679E status=Confirmed final assignment 10 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=11/30 rider=Hidayat car=SNE7629Z status=Confirmed final assignment 11 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=12/30 rider=Hidayat car=SMV3524R status=Confirmed final assignment 12 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=13/30 rider=Hidayat car=SMR491S status=Confirmed final assignment 13 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=14/30 rider=Jasmet Singh car=SLQ8973H status=Confirmed final assignment 14 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=15/30 rider=Jasmet Singh car=SMU4161C status=Confirmed final assignment 15 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=16/30 rider=Jasmine ( Low Bee Har ) car=SNT4154S status=Confirmed final assignment 16 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=17/30 rider=Jasmine ( Low Bee Har ) car=SPH6955Z status=Confirmed final assignment 17 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=18/30 rider=Lim Choon Yong Lester car=SPE9366U status=Confirmed final assignment 18 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=19/30 rider=Lim Choon Yong Lester car=SNE7225E status=Confirmed final assignment 19 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=20/30 rider=Lim Choon Yong Lester car=SLP6171Z status=Confirmed final assignment 20 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=21/30 rider=Nabil hakim car=SNT4247H status=Confirmed final assignment 21 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=22/30 rider=Nabil hakim car=SMH8695X status=Confirmed final assignment 22 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=23/30 rider=Ooi Kin Soon car=SLV7639D status=Confirmed final assignment 23 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=24/30 rider=Ooi Kin Soon car=SNT4212H status=Confirmed final assignment 24 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=25/30 rider=Raihan car=SPE9404T status=Confirmed final assignment 25 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=26/30 rider=Raihan car=SPG6567R status=Confirmed final assignment 26 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=27/30 rider=Syed Muhammad Faiq Bin Bagal car=SPH9479L status=Confirmed final assignment 27 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=28/30 rider=Syed Muhammad Faiq Bin Bagal car=SLZ5455J status=Confirmed final assignment 28 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=29/30 rider=Zhi Ming car=SLP1229A status=Confirmed final assignment 29 of 30
+2026-07-20T11:10:45+08:00 Finalising assigned=30/30 rider=Zhi Ming car=SMT9751Y status=Confirmed final assignment 30 of 30
+2026-07-20T11:10:45+08:00 Finished assigned=30/30 rider= car= status=Finished route optimisation
+2026-07-20T11:10:46+08:00 FINISHED elapsed=0.612s assigned=30 unassigned=0 riders_used=14 route_min=1489.5

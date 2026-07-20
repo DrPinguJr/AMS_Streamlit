@@ -1,9 +1,11 @@
 import os
+import html
 import json
 import sys
 import time
 import copy
 import hashlib
+from datetime import time as clock_time
 from pathlib import Path
 
 import pandas as pd
@@ -25,6 +27,7 @@ from Flexar.BlueSG.vehicle_route_optimizer import (
     DEFAULT_EMPTY_TRAVEL_DURATION_MULTIPLIER,
     DEFAULT_EMPTY_TRAVEL_WAIT_BUFFER_MIN,
     DEFAULT_CLUSTER_PRESSURE_BONUS_PER_JOB,
+    DEFAULT_FALLBACK_PENALTY,
     DEFAULT_SOFT_ADJUSTED_DURATION_MIN,
     DEFAULT_SOFT_WORKLOAD_MIN,
     DEFAULT_WORKLOAD_PENALTY_PER_MIN,
@@ -55,10 +58,15 @@ from Flexar.BlueSG.vehicle_route_optimizer import (
     onemap_credentials_configured,
     optimisation_integrity_report,
     optimise_vehicle_routes,
+    improve_route_dataframe,
     read_rider_roster_file,
     save_rider_roster,
     validate_riders,
 )
+from Flexar.BlueSG.constraints import Constraint
+from Flexar.BlueSG.operation_context import EMPTY_TRAVEL_MODES, OperationContext
+from Flexar.BlueSG.output_sanitizer import sanitize_for_output
+from Flexar.BlueSG.run_metrics import create_run_result, save_run_artifact, sha256_bytes
 
 try:
     st.set_page_config(page_title="Vehicle Route Optimiser", layout="wide")
@@ -1093,6 +1101,9 @@ with st.expander("How the route optimiser works", expanded=False):
     )
 
 jobs_df = pd.DataFrame()
+selected_job_date = pd.Timestamp.now(tz="Asia/Singapore").date()
+input_filename = ""
+input_sha256 = ""
 file_is_valid = False
 missing_headers: list[str] = []
 validation_warnings: list[str] = []
@@ -1111,6 +1122,7 @@ scoring_defaults = {
     "empty_travel_duration_multiplier": DEFAULT_EMPTY_TRAVEL_DURATION_MULTIPLIER,
     "empty_travel_wait_buffer_min": DEFAULT_EMPTY_TRAVEL_WAIT_BUFFER_MIN,
     "cluster_pressure_bonus_per_job": DEFAULT_CLUSTER_PRESSURE_BONUS_PER_JOB,
+    "fallback_penalty": DEFAULT_FALLBACK_PENALTY,
 }
 
 upload_col, riders_col = st.columns(2, gap="large")
@@ -1123,6 +1135,8 @@ with upload_col:
         st.caption("Upload an Excel file to begin.")
     else:
         try:
+            input_filename = clean_text(getattr(uploaded_file, "name", "uploaded_jobs.xlsx"))
+            input_sha256 = sha256_bytes(uploaded_file.getvalue())
             jobs_df, missing_headers, validation_warnings = load_and_validate_jobs(uploaded_file)
         except ValueError as exc:
             upload_error = str(exc)
@@ -1307,6 +1321,33 @@ with action_col:
                 "Fallback estimates will be used where needed."
             )
 
+        st.markdown("**Overnight operating window**")
+        operation_date = st.date_input(
+            "Operation date",
+            value=selected_job_date,
+            help="The date on which rider duty begins.",
+        )
+        window_cols = st.columns(2)
+        operation_start_time = window_cols[0].time_input("Duty start", value=clock_time(14, 0))
+        operation_end_time = window_cols[1].time_input("Duty end", value=clock_time(17, 0))
+        empty_travel_mode_label = st.selectbox(
+            "Empty-travel mode",
+            list(EMPTY_TRAVEL_MODES),
+            index=0,
+            help="Stored in the run record and route-cache context. Overnight transit is not reused from daytime.",
+        )
+        operation_context = OperationContext.for_window(
+            operation_date,
+            operation_start_time,
+            operation_end_time,
+            empty_travel_mode=EMPTY_TRAVEL_MODES[empty_travel_mode_label],
+        )
+        st.caption(
+            f"Window: {operation_context.operation_start.isoformat(timespec='minutes')} → "
+            f"{operation_context.operation_end.isoformat(timespec='minutes')} "
+            f"({operation_context.window_duration_min:.0f} min)"
+        )
+
         ready_text = "Ready to optimise" if file_is_valid else "Upload a valid job file first"
         st.caption(ready_text)
         optimise_cols = st.columns(2)
@@ -1338,6 +1379,72 @@ with action_col:
     with st.expander("Advanced Settings", expanded=False):
         st.write("Fallback travel cost table")
         st.dataframe(cached_cost_explanation(), width="stretch", hide_index=True, height=180)
+
+        st.markdown("**Duty time and hard constraints**")
+        handling_cols = st.columns(3)
+        pickup_handling_min = handling_cols[0].number_input("Pickup handling min", min_value=0.0, max_value=30.0, value=3.0, step=0.5)
+        dropoff_handling_min = handling_cols[1].number_input("Drop-off handling min", min_value=0.0, max_value=30.0, value=3.0, step=0.5)
+        unlock_wait_min = handling_cols[2].number_input("Unlock wait min/job", min_value=0.0, max_value=30.0, value=0.0, step=0.5)
+        operational_buffer_pct = st.number_input("Operational buffer %", min_value=0.0, max_value=100.0, value=20.0, step=5.0)
+        hard_max_jobs_enabled = st.checkbox(
+            "Enforce each rider's Max Jobs as a hard cap",
+            value=False,
+            help="Off by default: Max Jobs remains a soft preference.",
+        )
+        hard_duty_enabled = st.checkbox("Enforce maximum total duty time", value=True)
+        hard_max_duty_min = st.number_input(
+            "Maximum total duty min",
+            min_value=30.0,
+            max_value=720.0,
+            value=float(operation_context.window_duration_min),
+            step=15.0,
+            disabled=not hard_duty_enabled,
+        )
+
+        st.markdown("**Capacity-aware regional overflow**")
+        enable_regional_overflow = st.checkbox(
+            "Protect scarce-region riders and enable approved overflow support",
+            value=True,
+            help="Uses current route position, regional demand/capacity and soft support penalties. It never blocks coverage.",
+        )
+        regional_cols = st.columns(3)
+        support_tolerance_min = regional_cols[0].number_input(
+            "Support tolerance min", min_value=0.0, max_value=120.0, value=15.0, step=5.0,
+            disabled=not enable_regional_overflow,
+        )
+        protected_job_advantage_min = regional_cols[1].number_input(
+            "Protected-job advantage min", min_value=0.0, max_value=120.0, value=15.0, step=5.0,
+            disabled=not enable_regional_overflow,
+        )
+        unsupported_region_penalty = regional_cols[2].number_input(
+            "Unsupported-region penalty", min_value=0.0, max_value=500.0, value=180.0, step=10.0,
+            disabled=not enable_regional_overflow,
+        )
+        regional_overflow_config = {
+            "enabled": enable_regional_overflow,
+            "support_tolerance_min": support_tolerance_min,
+            "support_tolerance_ratio": 1.25,
+            "protected_job_advantage_min": protected_job_advantage_min,
+            "approved_support_penalty": 5.0,
+            "unsupported_region_penalty": unsupported_region_penalty,
+            "scarce_driver_small_escape_penalty": 40.0,
+            "scarce_driver_large_escape_penalty": 180.0,
+        }
+
+        st.markdown("**Bounded local improvement**")
+        enable_local_improvement = st.checkbox(
+            "Evaluate local improvement after the complete baseline",
+            value=False,
+            help="The stable greedy baseline remains the default until benchmark promotion criteria pass.",
+        )
+        local_cols = st.columns(2)
+        local_time_limit_seconds = int(local_cols[0].number_input("Local-search seconds", min_value=1, max_value=120, value=30, step=1))
+        local_max_iterations = int(local_cols[1].number_input("Local-search iterations", min_value=1, max_value=500, value=100, step=10))
+        experimental_cluster_first = st.checkbox(
+            "Experimental cluster-first flag",
+            value=False,
+            help="Disabled by default. Production assignment remains state-aware and job-by-job.",
+        )
 
         st.markdown("**Public Transport Empty Leg**")
         pt_col_a, pt_col_b = st.columns(2)
@@ -1462,6 +1569,26 @@ with action_col:
             step=5.0,
             key="bluesg_cluster_pressure_bonus_per_job",
         )
+        fallback_penalty = st.number_input(
+            "Fallback quality penalty",
+            value=scoring_defaults["fallback_penalty"],
+            min_value=0.0,
+            max_value=1000.0,
+            step=25.0,
+            key="bluesg_fallback_penalty",
+            help="Affects assignment quality only; reported travel minutes remain unchanged.",
+        )
+
+    operation_context = OperationContext.for_window(
+        operation_date,
+        operation_start_time,
+        operation_end_time,
+        empty_travel_mode=EMPTY_TRAVEL_MODES[empty_travel_mode_label],
+        pickup_handling_min=pickup_handling_min,
+        dropoff_handling_min=dropoff_handling_min,
+        unlock_wait_min=unlock_wait_min,
+        default_operational_buffer_pct=operational_buffer_pct / 100.0,
+    )
 
 if optimise_clicked or optimise_new_route_clicked:
     rider_df_for_optimise, duplicate_rider_rows_removed = dedupe_rider_roster(rider_df)
@@ -1494,8 +1621,26 @@ if optimise_clicked or optimise_new_route_clicked:
             progress_bar = st.progress(0, text="Preparing optimisation...")
             activity_text = st.empty()
             detail_text = st.empty()
+            st.caption("Live activity terminal · latest 23 lines")
+            terminal_output = st.empty()
         started_at = time.monotonic()
         last_progress_event: dict = {}
+        terminal_lines = ["[   0.0s] START  Preparing route optimisation..."]
+        terminal_state = {"last_signature": None}
+
+        def render_terminal() -> None:
+            safe_output = html.escape("\n".join(terminal_lines))
+            terminal_output.markdown(
+                (
+                    '<pre style="margin:0; height:428px; overflow:hidden; box-sizing:border-box; '
+                    'padding:12px 14px; border:1px solid #334155; border-radius:8px; '
+                    'background:#07111f; color:#d1fae5; font:13px/1.35 Consolas, Monaco, monospace; '
+                    f'white-space:pre;">{safe_output}</pre>'
+                ),
+                unsafe_allow_html=True,
+            )
+
+        render_terminal()
 
         def show_progress(event: dict) -> None:
             last_progress_event.clear()
@@ -1509,6 +1654,35 @@ if optimise_clicked or optimise_new_route_clicked:
             estimated_comparisons = int(event.get("estimated_comparisons", 0) or 0)
             phase = str(event.get("phase", "Working"))
             status = str(event.get("status", "Optimising routes..."))
+
+            car_plate = clean_text(event.get("current_car_plate"))
+            rider_name = clean_text(event.get("current_rider"))
+            pickup = clean_text(event.get("current_pickup"))
+            dropoff = clean_text(event.get("current_dropoff"))
+            address = clean_text(event.get("current_address"))
+            event_type = clean_text(event.get("event_type"))
+            if event_type in {"assignment", "final_assignment"}:
+                label = "FINAL" if event_type == "final_assignment" else "GIVE "
+                terminal_message = (
+                    f"{label}  Car {car_plate or '(no plate)'} -> {rider_name or '(no rider)'}"
+                    f" | {pickup or '?'} -> {dropoff or '?'}"
+                )
+            elif address:
+                terminal_message = f"GEO    {status}: {address}"
+            elif rider_name or pickup:
+                terminal_message = (
+                    f"CHECK  {comparison_count:,}/{estimated_comparisons:,}"
+                    f" | rider={rider_name or '?'} | pickup={pickup or '?'}"
+                )
+            else:
+                terminal_message = f"{phase.upper()[:6]:<6} {status}"
+
+            signature = (event_type, phase, status, car_plate, rider_name, pickup, dropoff, address)
+            if signature != terminal_state["last_signature"]:
+                terminal_state["last_signature"] = signature
+                terminal_lines.append(f"[{elapsed:6.1f}s] {terminal_message}")
+                del terminal_lines[:-23]
+                render_terminal()
 
             phase_metric.metric("Phase", phase)
             assigned_metric.metric("Assigned", f"{assigned_jobs}/{total_jobs}")
@@ -1537,6 +1711,51 @@ if optimise_clicked or optimise_new_route_clicked:
             else:
                 detail_text.caption("Warming up caches and preparing route checks...")
 
+        hard_constraints: list[Constraint] = []
+        if hard_max_jobs_enabled:
+            hard_constraints.append(
+                Constraint(
+                    "hard_max_jobs",
+                    {"rider_caps": {rider.name: rider.max_jobs for rider in riders if rider.max_jobs is not None}},
+                    constraint_id="ui_hard_max_jobs",
+                )
+            )
+        if hard_duty_enabled:
+            hard_constraints.append(
+                Constraint(
+                    "max_total_duty_time",
+                    {"minutes": hard_max_duty_min},
+                    constraint_id="ui_max_total_duty",
+                )
+            )
+        canonical_settings = {
+            "jobs_uploaded": int(jobs_df.attrs.get("uploaded_count", len(jobs_df))),
+            "use_onemap": use_onemap,
+            "onemap_token_configured": bool(onemap_token),
+            "optimise_by": optimise_by,
+            "empty_weight": empty_weight,
+            "loaded_weight": loaded_weight,
+            "soft_workload_min": soft_workload_min,
+            "workload_penalty_per_min": workload_penalty_per_min,
+            "soft_adjusted_duration_min": soft_adjusted_duration_min,
+            "duration_penalty_per_min": duration_penalty_per_min,
+            "max_job_overage_penalty": max_job_overage_penalty,
+            "duration_buffer_multiplier": duration_buffer_multiplier,
+            "max_adjusted_duration_min": max_adjusted_duration_min,
+            "max_total_duty_time_min": hard_max_duty_min if hard_duty_enabled else None,
+            "empty_travel_duration_multiplier": empty_travel_duration_multiplier,
+            "empty_travel_wait_buffer_min": empty_travel_wait_buffer_min,
+            "fallback_penalty": fallback_penalty,
+            "force_complete_assignment": force_complete_assignment,
+            "cluster_pressure_bonus_per_job": cluster_pressure_bonus_per_job,
+            "experimental_cluster_first": experimental_cluster_first,
+            "local_improvement_enabled": enable_local_improvement,
+            "local_search_time_limit_seconds": local_time_limit_seconds,
+            "local_search_max_iterations": local_max_iterations,
+            "constraints": [constraint.to_dict() for constraint in hard_constraints],
+            "regional_overflow_config": regional_overflow_config,
+        }
+
         try:
             route_df, summary_df, lookup_warnings = optimise_vehicle_routes(
                 jobs_df,
@@ -1559,6 +1778,12 @@ if optimise_clicked or optimise_new_route_clicked:
                 force_complete_assignment=force_complete_assignment,
                 cluster_pressure_bonus_per_job=cluster_pressure_bonus_per_job,
                 route_variant_index=route_variant_index,
+                fallback_penalty=fallback_penalty,
+                operation_context=operation_context,
+                constraints=hard_constraints,
+                experimental_cluster_first=experimental_cluster_first,
+                max_total_duty_time_min=hard_max_duty_min if hard_duty_enabled else None,
+                regional_overflow_config=regional_overflow_config,
             )
             integrity_report = optimisation_integrity_report(route_df, jobs_df)
             if not integrity_report["is_valid"]:
@@ -1566,6 +1791,44 @@ if optimise_clicked or optimise_new_route_clicked:
                 if integrity_report["duplicate_details"]:
                     st.dataframe(pd.DataFrame(integrity_report["duplicate_details"]), width="stretch", hide_index=True)
                 st.stop()
+            baseline_route_df = route_df.copy()
+            baseline_summary_df = summary_df.copy()
+            baseline_integrity = {key: value for key, value in integrity_report.items() if key != "unassigned_df"}
+            baseline_integrity.update(route_df.attrs.get("hard_constraint_validation", {}))
+            baseline_run_result = create_run_result(
+                route_df=baseline_route_df,
+                unassigned_df=integrity_report["unassigned_df"],
+                riders=riders,
+                context=operation_context,
+                settings={**canonical_settings, "wall_clock_seconds": time.monotonic() - started_at},
+                input_filename=input_filename,
+                input_sha256=input_sha256,
+                selected_job_date=str(selected_job_date),
+                warnings=[
+                    {"severity": "manual_review" if "fallback" in warning.casefold() or "low-confidence" in warning.casefold() else "warning", "message": warning}
+                    for warning in lookup_warnings
+                ],
+                validation=baseline_integrity,
+            )
+            move_audit: list[dict] = []
+            if enable_local_improvement and integrity_report["unassigned_jobs"] == 0:
+                route_df, summary_df, improvement_warnings, move_audit = improve_route_dataframe(
+                    baseline_route_df,
+                    jobs_df,
+                    riders,
+                    operation_context,
+                    {**canonical_settings, "token": onemap_token or None},
+                    hard_constraints,
+                    time_limit_seconds=local_time_limit_seconds,
+                    max_iterations=local_max_iterations,
+                )
+                lookup_warnings = sorted(set([*lookup_warnings, *improvement_warnings]))
+                integrity_report = optimisation_integrity_report(route_df, jobs_df)
+                if not integrity_report["is_valid"] or integrity_report["assigned_unique_jobs"] < baseline_integrity["assigned_unique_jobs"]:
+                    route_df, summary_df = baseline_route_df, baseline_summary_df
+                    move_audit.append(
+                        {"move_id": "safety_revert", "move_type": "safety_revert", "accepted": False, "rejection_reason": "Improved result failed coverage/integrity safety checks; baseline retained."}
+                    )
         except ValueError as exc:
             st.error(str(exc))
             st.stop()
@@ -1577,6 +1840,34 @@ if optimise_clicked or optimise_new_route_clicked:
             st.session_state.bluesg_latest_optimisation = None
             st.warning("No jobs could be assigned. Check rider roster and input data.")
         else:
+            integrity_json = {key: value for key, value in integrity_report.items() if key != "unassigned_df"}
+            integrity_json.update(route_df.attrs.get("hard_constraint_validation", {}))
+            run_result = create_run_result(
+                route_df=route_df,
+                unassigned_df=integrity_report["unassigned_df"],
+                riders=riders,
+                context=operation_context,
+                settings={
+                    **canonical_settings,
+                    "wall_clock_seconds": elapsed_total,
+                    "baseline_summary": baseline_run_result.summary,
+                },
+                input_filename=input_filename,
+                input_sha256=input_sha256,
+                selected_job_date=str(selected_job_date),
+                warnings=[
+                    {"severity": "manual_review" if "fallback" in warning.casefold() or "low-confidence" in warning.casefold() else "warning", "message": warning}
+                    for warning in lookup_warnings
+                ],
+                move_audit=move_audit,
+                validation=integrity_json,
+                algorithm_name=(
+                    "state_aware_greedy_insertion+bounded_local_improvement"
+                    if any(move.get("accepted") for move in move_audit)
+                    else "state_aware_greedy_insertion"
+                ),
+            )
+            run_artifact_path = save_run_artifact(run_result)
             st.session_state.bluesg_selected_map_rider = ""
             st.session_state.bluesg_latest_optimisation = {
                 "route_df": route_df.copy(),
@@ -1589,6 +1880,10 @@ if optimise_clicked or optimise_new_route_clicked:
                 "integrity_report": integrity_report,
                 "duplicate_rider_rows_removed": duplicate_rider_rows_removed,
                 "route_variant_index": route_variant_index,
+                "run_result": run_result,
+                "baseline_summary": baseline_run_result.summary,
+                "move_audit": move_audit,
+                "run_artifact_path": str(run_artifact_path),
                 "optimisation_settings": {
                     "use_onemap": use_onemap,
                     "optimise_by": optimise_by,
@@ -1603,12 +1898,14 @@ if optimise_clicked or optimise_new_route_clicked:
                     "duration_buffer_multiplier": duration_buffer_multiplier,
                     "empty_travel_duration_multiplier": empty_travel_duration_multiplier,
                     "empty_travel_wait_buffer_min": empty_travel_wait_buffer_min,
+                    "fallback_penalty": fallback_penalty,
+                    "operation_context": operation_context,
                 },
-                "diagnostics": {
+                "diagnostics": sanitize_for_output({
                     "rider_job_checks": int(last_progress_event.get("comparison_count", 0)),
                     "estimated_checks": int(last_progress_event.get("estimated_comparisons", estimated_checks)),
                     "elapsed_seconds": elapsed_total,
-                },
+                }),
             }
 
 latest_optimisation = st.session_state.get("bluesg_latest_optimisation")
@@ -1624,6 +1921,10 @@ if latest_optimisation:
     result_integrity = latest_optimisation.get("integrity_report") or optimisation_integrity_report(route_df, result_jobs_df)
     duplicate_rider_rows_removed = int(latest_optimisation.get("duplicate_rider_rows_removed", 0))
     result_route_variant_index = int(latest_optimisation.get("route_variant_index", 0))
+    result_run = latest_optimisation.get("run_result")
+    baseline_run_summary = latest_optimisation.get("baseline_summary", {})
+    result_move_audit = latest_optimisation.get("move_audit", [])
+    run_artifact_path = latest_optimisation.get("run_artifact_path", "")
     unassigned_jobs_df = result_integrity["unassigned_df"]
 
     if not result_integrity["is_valid"]:
@@ -1634,25 +1935,52 @@ if latest_optimisation:
 
     with review_col:
         st.subheader("4. Review Results")
-        assigned_jobs = int(result_integrity["assigned_unique_jobs"])
+        canonical_summary = result_run.summary if result_run is not None else {}
+        assigned_jobs = int(canonical_summary.get("jobs_assigned", result_integrity["assigned_unique_jobs"]))
         assigned_route_rows = int(result_integrity["assigned_route_rows"])
         total_jobs_uploaded = int(result_integrity["total_valid_jobs"])
         unassigned_jobs = int(result_integrity["unassigned_jobs"])
-        riders_used = (
+        riders_used = int(canonical_summary.get("riders_used", 0)) or (
             int((summary_df["Total Jobs"].fillna(0).astype(int) > 0).sum())
             if "Total Jobs" in summary_df.columns
             else 0
         )
-        total_duration = (
-            float(summary_df["Total Route Duration Min"].fillna(0).sum())
-            if "Total Route Duration Min" in summary_df.columns
-            else 0.0
-        )
-        metric_cols = st.columns(4)
+        total_duration = float(canonical_summary.get("total_duty_time_min", 0.0))
+        metric_cols = st.columns(5)
         metric_cols[0].metric("Jobs Assigned", f"{assigned_jobs}/{total_jobs_uploaded}")
         metric_cols[1].metric("Riders Used", riders_used)
-        metric_cols[2].metric("Total Estimated Duration", f"{total_duration:.1f} min")
+        metric_cols[2].metric("Total Rider Duty", f"{total_duration:.1f} min")
         metric_cols[3].metric("Unassigned Jobs", unassigned_jobs)
+        metric_cols[4].metric("Fallback Legs", int(canonical_summary.get("fallback_leg_count", 0)))
+
+        if baseline_run_summary:
+            comparison_fields = [
+                ("Jobs assigned", "jobs_assigned"),
+                ("Maximum duty min", "longest_rider_duty_min"),
+                ("Duty spread min", "duty_time_spread_min"),
+                ("Empty travel min", "total_empty_travel_min"),
+                ("Fallback legs", "fallback_leg_count"),
+                ("Hard violations", "hard_violation_count"),
+            ]
+            comparison_df = pd.DataFrame(
+                [
+                    {
+                        "Metric": label,
+                        "Baseline": baseline_run_summary.get(key, 0),
+                        "Final": canonical_summary.get(key, 0),
+                    }
+                    for label, key in comparison_fields
+                ]
+            )
+            with st.expander("Baseline vs bounded local improvement", expanded=False):
+                st.dataframe(comparison_df, width="stretch", hide_index=True)
+                accepted_moves = sum(1 for move in result_move_audit if move.get("accepted"))
+                if accepted_moves:
+                    st.success(f"Accepted {accepted_moves} safe improving move(s).")
+                else:
+                    st.info("No safe lexicographic improvement was found; the baseline was retained.")
+                if run_artifact_path:
+                    st.caption(f"Run artifact: {run_artifact_path}")
 
         with st.expander("Optimisation Integrity Checks", expanded=False):
             integrity_rows = [
@@ -1674,7 +2002,7 @@ if latest_optimisation:
         if unassigned_jobs:
             st.warning(
                 f"Assigned {assigned_jobs} of {total_jobs_uploaded} job(s). "
-                "Some jobs were left unassigned because no rider route could fit them inside the 14:00-17:00 job window."
+                "Some jobs were left unassigned because no rider route satisfied the configured overnight window and hard constraints."
             )
             if not unassigned_jobs_df.empty:
                 st.write("Unassigned jobs")
@@ -1712,6 +2040,25 @@ if latest_optimisation:
             diag_cols[1].metric("Estimated checks", f"{int(result_diagnostics.get('estimated_checks', 0)):,}")
             diag_cols[2].metric("Elapsed time", f"{float(result_diagnostics.get('elapsed_seconds', 0.0)):.1f}s")
 
+        with st.expander("Regional capacity and assignment audit", expanded=False):
+            regional_capacity = route_df.attrs.get("regional_capacity", [])
+            if regional_capacity:
+                st.write("Demand, primary capacity and approved directional support")
+                st.dataframe(pd.DataFrame(regional_capacity), width="stretch", hide_index=True)
+                regional_columns = [
+                    "Uploaded Row", "Car Plate", "Rider", "Pickup Address", "Job Region",
+                    "Operational Subregion", "Assigned Rider Home Region",
+                    "Assigned Rider Current Region Before Job", "Assignment Tier",
+                    "Regional Specificity Score", "Regional Support Penalty",
+                    "Scarce Driver Protection Penalty", "Unsupported Region Penalty",
+                    "Reason for Regional Assignment",
+                ]
+                regional_columns = [column for column in regional_columns if column in route_df.columns]
+                st.write("Per-job regional decisions")
+                st.dataframe(route_df[regional_columns], width="stretch", hide_index=True, height=280)
+            else:
+                st.caption("Regional overflow diagnostics were not enabled for this run.")
+
     render_route_editor(route_df, summary_df, result_jobs_df, result_rider_df)
 
     show_route_map(route_df, result_jobs_df, result_rider_df, result_token)
@@ -1741,7 +2088,11 @@ if latest_optimisation:
         "Total Jobs",
         "Total Route Distance KM",
         "Total Route Duration Min",
-        "Adjusted Route Duration Min",
+        "First Positioning Min",
+        "Total Duty Time Min",
+        "Adjusted Duty Time Min",
+        "Fallback Leg Count",
+        "Max Jobs Overage",
         "Within 3 Hours",
         "Final Location",
         "Workload Comment",
@@ -1771,6 +2122,8 @@ if latest_optimisation:
             jobs_df=result_jobs_df,
             validation_warnings=result_validation_warnings,
             lookup_warnings=result_lookup_warnings,
+            run_result=result_run,
+            move_audit=result_move_audit,
         ),
         file_name="vehicle_route_optimisation.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

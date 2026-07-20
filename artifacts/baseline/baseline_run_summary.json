@@ -1,0 +1,43 @@
+{
+  "run_id": "20260720_111046_baseline_greedy_insertion",
+  "generated_at": "2026-07-20T11:10:46.204313+08:00",
+  "algorithm_name": "state_aware_greedy_insertion",
+  "algorithm_version": "pre-2.0.0",
+  "input_filename": "Antares x Flexar - RB Jobs (5) 1.xlsx",
+  "input_sha256": "a83a92bef07b192401ed314c2fcde682ead5db9359cf9f09c9c5870f2c5e9285",
+  "selected_job_date": "2026-07-17",
+  "git_commit": "704ac6a6cc214fe43302806daa7f7948a7af7512",
+  "git_worktree_dirty": true,
+  "jobs_uploaded": 60,
+  "jobs_selected": 30,
+  "jobs_assigned": 30,
+  "jobs_unassigned": 0,
+  "riders_available": 14,
+  "riders_used": 14,
+  "total_route_time_min": 1489.5,
+  "longest_route_time_min": 146.0,
+  "shortest_route_time_min": 41.0,
+  "fallback_route_row_count": 30,
+  "lookup_warning_count": 9,
+  "wall_clock_seconds": 0.612,
+  "settings": {
+    "use_onemap": false,
+    "reason": "live/cached OneMap attempt exceeded 600 seconds before first assignment"
+  },
+  "integrity": {
+    "is_valid": true,
+    "message": "",
+    "total_valid_jobs": 30,
+    "assigned_unique_jobs": 30,
+    "assigned_route_rows": 30,
+    "unassigned_jobs": 0,
+    "duplicate_uploaded_rows": [],
+    "overlap_uploaded_rows": [],
+    "duplicate_details": []
+  },
+  "rider_reconstruction": {
+    "source": "vehicle_route_optimisation (5) 1.xlsx",
+    "limitation": "Historical output supplied 14 rider names and first Start From values; Max Jobs reconstructed as 3."
+  },
+  "historical_output_sha256": "b1c6a1013ed4d5dec2ec2e629441fa5d53a76bcb39f676a2b8f537d718e08930"
+}
