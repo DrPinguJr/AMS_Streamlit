@@ -10,6 +10,7 @@ from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
+from docx import Document
 from docxtpl import DocxTemplate
 
 from Contracts.shared.file_utils import create_zip_from_bytes, sanitize_filename
@@ -19,6 +20,35 @@ from Contracts.shared.pdf_utils import convert_docx_to_pdf
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CFS_TEMPLATE_PATH = PROJECT_ROOT / "Contracts" / "templates" / "CFS" / "AMS - CFS - REB - Template.docx"
 LOGGER = logging.getLogger(__name__)
+
+CFS_MAIN_SECTION_HEADINGS = (
+    "Appointment",
+    "Independent Contractor Relationship",
+    "Term",
+    "Scope of Services",
+    "Engagement Arrangement",
+    "Fees and Payment Terms",
+    "Expenses and Reimbursements",
+    "Confidentiality",
+    "Non-Solicitation",
+    "Liability and Indemnity",
+    "Vehicle Use and Damage",
+    "Termination",
+    "Intellectual Property",
+    "Conflict of Interest",
+    "Data Protection",
+    "Dispute Resolution",
+    "Governing Law",
+    "Entire Agreement",
+)
+CFS_ANNEX_SECTION_HEADINGS = (
+    "1. Service Responsibilities",
+    "2. Operational Requirements",
+    "3. Safety and Compliance",
+    "4. Conduct",
+    "5. Reporting of Incidents",
+    "6. Service Standards",
+)
 
 # Printable writing lines used when producing an unfilled copy of the contract.
 # Underscore characters are intentional: they remain visible in both Word and
@@ -114,15 +144,96 @@ def build_contract_context(
     }
 
 
+def _normalise_paragraph_text(value: str) -> str:
+    return " ".join(value.split())
+
+
+def _keep_paragraph_group_together(paragraphs, start_index: int, end_index: int) -> None:
+    """Keep a logical clause together when it fits, while allowing oversized clauses to flow."""
+    meaningful_indices = [
+        index
+        for index in range(start_index, end_index)
+        if _normalise_paragraph_text(paragraphs[index].text)
+    ]
+    if not meaningful_indices:
+        return
+
+    last_meaningful_index = meaningful_indices[-1]
+    for index in range(start_index, last_meaningful_index):
+        paragraphs[index].paragraph_format.keep_with_next = True
+
+
+def _remove_manual_page_breaks(paragraph) -> None:
+    """Replace embedded page-break runs with a stable paragraph pagination property."""
+    for page_break in paragraph._p.xpath(".//w:br[@w:type='page']"):
+        page_break.getparent().remove(page_break)
+
+
+def _apply_cfs_pagination(document) -> None:
+    """Apply legal-document pagination rules to a rendered CFS contract."""
+    paragraphs = document.paragraphs
+    normalised_text = [_normalise_paragraph_text(paragraph.text) for paragraph in paragraphs]
+
+    for paragraph in paragraphs:
+        paragraph_format = paragraph.paragraph_format
+        paragraph_format.keep_together = True
+        paragraph_format.keep_with_next = False
+        paragraph_format.widow_control = True
+
+    main_heading_indices = [
+        index for index, text in enumerate(normalised_text) if text in CFS_MAIN_SECTION_HEADINGS
+    ]
+    signature_index = next(
+        (index for index, text in enumerate(normalised_text) if text == "SIGNATURES"),
+        len(paragraphs),
+    )
+    annex_index = next(
+        (index for index, text in enumerate(normalised_text) if text == "Annex A – Scope of Services"),
+        len(paragraphs),
+    )
+
+    if main_heading_indices:
+        _keep_paragraph_group_together(paragraphs, 0, main_heading_indices[0])
+        main_group_boundaries = main_heading_indices[1:] + [signature_index]
+        for start_index, end_index in zip(main_heading_indices, main_group_boundaries):
+            _keep_paragraph_group_together(paragraphs, start_index, end_index)
+
+    if signature_index < annex_index:
+        _keep_paragraph_group_together(paragraphs, signature_index, annex_index)
+
+    if annex_index < len(paragraphs):
+        annex_paragraph = paragraphs[annex_index]
+        _remove_manual_page_breaks(annex_paragraph)
+        annex_paragraph.paragraph_format.page_break_before = True
+
+        annex_heading_indices = [
+            index
+            for index, text in enumerate(normalised_text)
+            if index > annex_index and text in CFS_ANNEX_SECTION_HEADINGS
+        ]
+        if annex_heading_indices:
+            _keep_paragraph_group_together(paragraphs, annex_index, annex_heading_indices[0])
+            annex_group_boundaries = annex_heading_indices[1:] + [len(paragraphs)]
+            for start_index, end_index in zip(annex_heading_indices, annex_group_boundaries):
+                _keep_paragraph_group_together(paragraphs, start_index, end_index)
+
+
 def generate_cfs_docx(context: dict, template_path: Path = CFS_TEMPLATE_PATH) -> BytesIO:
     """Render the CFS Word template and return the file bytes in memory."""
     if not template_path.exists():
         raise FileNotFoundError("The base contract template file could not be found.")
 
-    output = BytesIO()
     template = DocxTemplate(str(template_path))
     template.render(context)
-    template.save(output)
+    rendered_template = BytesIO()
+    template.save(rendered_template)
+    rendered_template.seek(0)
+
+    document = Document(rendered_template)
+    _apply_cfs_pagination(document)
+
+    output = BytesIO()
+    document.save(output)
     output.seek(0)
     return output
 
