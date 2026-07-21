@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Made clustered cross-region trips human-first: when at least three jobs form a cluster, the optimiser applies zero first-positioning and unsupported-region scoring penalty, while retaining the real travel time for duty and feasibility checks.
 - Changed the default operating-window preset to 14:00-17:00. Cross-midnight windows remain supported when selected.
 - Added capacity-aware regional overflow without replacing the state-aware greedy/insertion solver.
 - Added directional North-to-North-West, Central-to-South-West, and East-to-boundary support rules.

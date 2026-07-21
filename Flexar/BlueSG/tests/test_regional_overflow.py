@@ -178,6 +178,73 @@ def test_unsupported_candidate_used_only_as_exception(monkeypatch) -> None:
     assert west_by_east.empty or west_by_east["Assignment Tier"].eq("exceptional").all()
 
 
+def test_clustered_cross_region_trip_has_zero_penalty_but_singleton_does_not() -> None:
+    jobs = [_job(index, "west_core") for index in range(3)]
+    rider = RiderState("Lester", "EAST_HOME", "East", max_jobs=5)
+    context = build_regional_overflow_context(jobs, [rider], operation_window_min=180)
+    context.update_round(
+        jobs,
+        {_job["_original_order"] + 2: {"Lester": 60.0} for _job in jobs},
+    )
+
+    clustered = context.assess_candidate(
+        jobs[0],
+        "Lester",
+        "east",
+        60.0,
+        60.0,
+        math.inf,
+        remaining_cluster_jobs=3,
+        rider_has_assignments=False,
+    )
+    singleton = context.assess_candidate(
+        jobs[0],
+        "Lester",
+        "east",
+        60.0,
+        60.0,
+        math.inf,
+        remaining_cluster_jobs=1,
+        rider_has_assignments=False,
+    )
+
+    assert clustered.tier == singleton.tier == "exceptional"
+    assert clustered.unsupported_region_penalty == 0
+    assert singleton.unsupported_region_penalty == 180
+    assert "clustered trip" in clustered.reason
+
+
+def test_lester_takes_five_job_west_cluster_before_isolated_east_jobs(monkeypatch) -> None:
+    _patch_travel(monkeypatch)
+    jobs = pd.DataFrame(
+        [_job(index, "west_core") for index in range(5)]
+        + [
+            {
+                **_job(5, "east_core"),
+                "Pickup Zone": "Bedok",
+                "Drop-off Zone": "Bedok",
+            },
+            {
+                **_job(6, "east_core"),
+                "Pickup Zone": "Tampines",
+                "Drop-off Zone": "Tampines",
+            },
+        ]
+    )
+    route, _, _ = optimise_vehicle_routes(
+        jobs,
+        [RiderState("Lester", "EAST_HOME", "East", max_jobs=5)],
+        use_onemap=False,
+        constraints=[{"kind": "hard_max_jobs", "params": {"rider": "Lester", "max_jobs": 5}}],
+        operation_context=OperationContext.for_window(date(2026, 7, 17), time(14), time(17)),
+    )
+
+    lester = route[route["Rider"] == "Lester"].sort_values("Sequence")
+    assert len(lester) == 5
+    assert lester["Operational Subregion"].eq("west_core").all()
+    assert lester["Unsupported Region Penalty"].eq(0).all()
+
+
 def test_regional_protection_recalculates_after_assignment() -> None:
     jobs = [_job(0, "west_core"), _job(1, "west_core")]
     riders = [RiderState("W", "WEST_HOME", "West", max_jobs=1), RiderState("N", "NORTH_HOME", "North", max_jobs=3)]

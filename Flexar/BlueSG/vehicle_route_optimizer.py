@@ -31,6 +31,7 @@ from Flexar.BlueSG.output_sanitizer import sanitize_for_output
 from Flexar.BlueSG.regional_overflow import (
     RegionalOverflowConfig,
     build_regional_overflow_context,
+    classify_job_region,
     normalize_region,
     regional_audit_fields,
 )
@@ -3081,6 +3082,18 @@ def _route_zone_for_job(job: dict[str, Any], key: str) -> str | None:
     return job.get(zone_key) or infer_zone(address)
 
 
+def _assignment_cluster_key(job: dict[str, Any]) -> str:
+    """Use a locality-sized cluster, not an entire side of Singapore."""
+    _, subregion, _ = classify_job_region(job)
+    if subregion != "unknown":
+        return subregion
+    return str(
+        _route_zone_for_job(job, "Pickup Address")
+        or _route_zone_for_job(job, "Drop-off Address")
+        or "Unknown"
+    ).strip().casefold()
+
+
 def _route_variant_score_adjustment(
     route_variant_index: int,
     rider: RiderState,
@@ -3519,9 +3532,14 @@ def optimise_vehicle_routes(
         assignment_round += 1
         report("Comparing rider-job combinations", phase="Comparing")
         remaining_pickup_zone_counts: dict[str, int] = {}
+        remaining_specific_cluster_counts: dict[str, int] = {}
         for remaining_job in remaining:
             remaining_zone = _route_zone_for_job(remaining_job, "Pickup Address") or "Unknown"
             remaining_pickup_zone_counts[remaining_zone] = remaining_pickup_zone_counts.get(remaining_zone, 0) + 1
+            specific_cluster = _assignment_cluster_key(remaining_job)
+            remaining_specific_cluster_counts[specific_cluster] = (
+                remaining_specific_cluster_counts.get(specific_cluster, 0) + 1
+            )
 
         best_choice: tuple[
             tuple[float, int, float, float, int, int, str],
@@ -3540,6 +3558,7 @@ def optimise_vehicle_routes(
                 comparison_count += 1
                 pickup_address = clean_text(job["Pickup Address"])
                 pickup_zone = job.get("Pickup Zone") or infer_zone(pickup_address)
+                cluster_key = _assignment_cluster_key(job)
                 key = rider_key(rider)
                 candidate_sequence = rider_sequences[key] + [job]
                 evaluation = evaluate_rider_sequence(rider, candidate_sequence, max_adjusted_duration_min)
@@ -3558,6 +3577,31 @@ def optimise_vehicle_routes(
                     * float(load_policy["cluster_pressure_multiplier"])
                     * remaining_pickup_zone_counts.get(pickup_zone or "Unknown", 0)
                 )
+                starts_dense_cluster = (
+                    rider.assigned_count == 0
+                    and remaining_specific_cluster_counts.get(cluster_key, 0)
+                    >= max(1, int(regional_config.clustered_trip_min_jobs))
+                )
+                current_sequence = rider_sequences[key]
+                continues_cluster = bool(
+                    current_sequence
+                    and _assignment_cluster_key(current_sequence[-1]) == cluster_key
+                )
+                # People tolerate one positioning trip when it unlocks a useful
+                # block of nearby work. Remove that initial movement from the
+                # choice score, but keep its real minutes in feasibility/duty.
+                cluster_positioning_credit = 0.0
+                if starts_dense_cluster:
+                    if optimise_by.casefold() == "distance":
+                        cluster_positioning_credit = (
+                            float(inserted_row.get("Empty Distance KM", 0) or 0) * empty_weight
+                        )
+                    else:
+                        cluster_positioning_credit = (
+                            float(inserted_row.get("Empty Duration Min", 0) or 0)
+                            * FIRST_POSITIONING_WEIGHT
+                            * empty_weight
+                        )
                 route_variant_adjustment = _route_variant_score_adjustment(
                     route_variant_index,
                     rider,
@@ -3584,6 +3628,12 @@ def optimise_vehicle_routes(
                         "minimum_priority": minimum_priority,
                         "greedy_assignment_score": greedy_assignment_score,
                         "cluster_jump_penalty": cluster_jump_penalty,
+                        "cluster_positioning_credit": cluster_positioning_credit,
+                        "remaining_cluster_jobs": remaining_specific_cluster_counts.get(
+                            cluster_key, 0
+                        ),
+                        "starts_dense_cluster": starts_dense_cluster,
+                        "continues_cluster": continues_cluster,
                         "candidate_cost": float(inserted_row.get("Empty Duration Min", math.inf) or math.inf),
                     }
                 )
@@ -3616,6 +3666,7 @@ def optimise_vehicle_routes(
             regional_audit: dict[str, Any] = {}
             regional_penalty = 0.0
             affinity_adjustment = 0.0
+            cluster_trip_adjustment = 0.0
             if regional_context:
                 meta = regional_context.metadata(job)
                 rules = regional_context.support_rules[meta["operational_subregion"]]
@@ -3632,8 +3683,17 @@ def optimise_vehicle_routes(
                     candidate["candidate_cost"],
                     best_feasible,
                     min(tier12_costs, default=math.inf),
+                    remaining_cluster_jobs=int(candidate["remaining_cluster_jobs"]),
+                    rider_has_assignments=bool(rider.assigned_count),
+                    continues_cluster=bool(candidate["continues_cluster"]),
                 )
                 regional_penalty = assessment.total_penalty
+                if (
+                    assessment.tier == "exceptional"
+                    and assessment.unsupported_region_penalty == 0
+                    and (candidate["starts_dense_cluster"] or candidate["continues_cluster"])
+                ):
+                    cluster_trip_adjustment = -float(candidate["cluster_positioning_credit"])
                 if (
                     regional_context.rider_home_regions.get(rider.name) == "east"
                     and regional_context.rider_affinities.get(rider.name) == meta["operational_subregion"]
@@ -3647,7 +3707,10 @@ def optimise_vehicle_routes(
                     assessment,
                 )
             candidate_rank = (
-                float(candidate["greedy_assignment_score"]) + regional_penalty + affinity_adjustment,
+                float(candidate["greedy_assignment_score"])
+                + regional_penalty
+                + affinity_adjustment
+                + cluster_trip_adjustment,
                 int(candidate["minimum_priority"]),
                 float(candidate["evaluation"].get("raw_duration", math.inf)),
                 float(candidate["cluster_jump_penalty"]),

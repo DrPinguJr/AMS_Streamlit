@@ -130,6 +130,8 @@ def run_benchmark(args: argparse.Namespace) -> list[dict[str, Any]]:
             "protected_job_advantage_min": args.protected_job_advantage_min,
             "approved_support_penalty": args.approved_support_penalty,
             "unsupported_region_penalty": args.unsupported_region_penalty,
+            "clustered_trip_penalty": 0.0,
+            "clustered_trip_min_jobs": 3,
             "scarce_driver_small_escape_penalty": args.scarce_driver_small_escape_penalty,
             "scarce_driver_large_escape_penalty": args.scarce_driver_large_escape_penalty,
         },

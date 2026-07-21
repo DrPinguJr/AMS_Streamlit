@@ -50,6 +50,8 @@ class RegionalOverflowConfig:
     protected_job_advantage_min: float = 15.0
     approved_support_penalty: float = 5.0
     unsupported_region_penalty: float = 180.0
+    clustered_trip_penalty: float = 0.0
+    clustered_trip_min_jobs: int = 3
     scarce_driver_small_escape_penalty: float = 40.0
     scarce_driver_large_escape_penalty: float = 180.0
     estimated_job_duration_min: float = 45.0
@@ -385,6 +387,10 @@ class RegionalOverflowContext:
         candidate_cost: float,
         best_feasible_cost: float,
         best_primary_or_support_cost: float,
+        *,
+        remaining_cluster_jobs: int = 1,
+        rider_has_assignments: bool = True,
+        continues_cluster: bool = False,
     ) -> RegionalCandidateAssessment:
         job_id = _job_identifier(job)
         meta = self.metadata(job)
@@ -408,7 +414,19 @@ class RegionalOverflowContext:
             materially_closer = math.isfinite(best_primary_or_support_cost) and (
                 candidate_cost + self.config.protected_job_advantage_min < best_primary_or_support_cost
             )
-            unsupported_penalty = 0.0 if materially_closer else self.config.unsupported_region_penalty
+            starts_clustered_trip = (
+                not rider_has_assignments
+                and remaining_cluster_jobs >= max(1, int(self.config.clustered_trip_min_jobs))
+                and not math.isfinite(best_primary_or_support_cost)
+            )
+            clustered_trip = starts_clustered_trip or continues_cluster
+            unsupported_penalty = (
+                0.0
+                if materially_closer
+                else self.config.clustered_trip_penalty
+                if clustered_trip
+                else self.config.unsupported_region_penalty
+            )
 
         protected = self.protected_job_ids_by_region.get(home, set())
         if protected and job_id not in protected:
@@ -431,6 +449,8 @@ class RegionalOverflowContext:
                 f"Exceptional unsupported {home} assignment retained for coverage/current-route efficiency; "
                 f"route-aware cost {candidate_cost:.1f} min."
             )
+            if clustered_trip and not unsupported_penalty:
+                reason += " Cross-region penalty was zero because this is a clustered trip."
         if scarce_penalty:
             reason += f" Scarce {home} capacity was protected while higher-specificity regional work remained."
         return RegionalCandidateAssessment(

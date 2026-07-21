@@ -1427,6 +1427,8 @@ with action_col:
             "protected_job_advantage_min": protected_job_advantage_min,
             "approved_support_penalty": 5.0,
             "unsupported_region_penalty": unsupported_region_penalty,
+            "clustered_trip_penalty": 0.0,
+            "clustered_trip_min_jobs": 3,
             "scarce_driver_small_escape_penalty": 40.0,
             "scarce_driver_large_escape_penalty": 180.0,
         }
