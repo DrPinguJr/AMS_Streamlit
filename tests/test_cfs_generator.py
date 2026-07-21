@@ -83,5 +83,6 @@ def test_entire_agreement_heading_stays_with_its_body() -> None:
     paragraph_text = [" ".join(paragraph.text.split()) for paragraph in document.paragraphs]
     heading_index = paragraph_text.index("Entire Agreement")
 
+    assert document.paragraphs[heading_index].paragraph_format.page_break_before is True
     assert document.paragraphs[heading_index].paragraph_format.keep_with_next is True
     assert document.paragraphs[heading_index + 1].paragraph_format.keep_together is True

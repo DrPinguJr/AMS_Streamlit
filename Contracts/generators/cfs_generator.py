@@ -198,6 +198,17 @@ def _apply_cfs_pagination(document) -> None:
         for start_index, end_index in zip(main_heading_indices, main_group_boundaries):
             _keep_paragraph_group_together(paragraphs, start_index, end_index)
 
+        entire_agreement_index = next(
+            (
+                index
+                for index in main_heading_indices
+                if normalised_text[index] == "Entire Agreement"
+            ),
+            None,
+        )
+        if entire_agreement_index is not None:
+            paragraphs[entire_agreement_index].paragraph_format.page_break_before = True
+
     if signature_index < annex_index:
         _keep_paragraph_group_together(paragraphs, signature_index, annex_index)
 
