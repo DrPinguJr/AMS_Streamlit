@@ -1,6 +1,6 @@
 param(
     [string]$InstallRoot = (Join-Path $PSScriptRoot "LibreOfficePortable"),
-    [string]$DownloadUrl = "https://portableapps.com/redirect/?a=LibreOfficePortable&s=s&p=&d=pa&f=LibreOfficePortable_26.2.1_MultilingualStandard.paf.exe",
+    [string]$DownloadUrl = "https://download.documentfoundation.org/libreoffice/portable/26.2.1/LibreOfficePortable_26.2.1_MultilingualStandard.paf.exe",
     [string]$ExpectedSha256 = "93ab521584f06c08398b1f753c7cac268865c632c5ed038d8cb9d29372c53763"
 )
 
@@ -27,11 +27,12 @@ if ($hash -ne $ExpectedSha256) {
     throw "Downloaded installer hash mismatch. Expected $ExpectedSha256 but got $hash."
 }
 
-Write-Host "Opening the portable installer. Choose this destination when prompted:"
+Write-Host "Installing LibreOffice Portable silently under:"
 Write-Host $InstallRoot
 Write-Host ""
 Write-Host "This writes inside the project folder only; it does not need Program Files/admin installation."
-Start-Process -FilePath $installerPath -ArgumentList @("/DESTINATION=$InstallRoot") -Wait
+$destinationArgument = $InstallRoot.TrimEnd("\") + "\"
+Start-Process -FilePath $installerPath -ArgumentList @("/S", "/DESTINATION=$destinationArgument") -Wait
 
 if ((Test-Path $sofficePath) -or (Test-Path $nestedSofficePath)) {
     Write-Host "LibreOffice Portable installed successfully. Restart Streamlit before generating PDFs."

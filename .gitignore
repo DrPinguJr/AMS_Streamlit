@@ -1,23 +1,32 @@
 .env
+.venv/
+.pytest_cache/
+**/__pycache__/
+*.py[cod]
+
 tenderboard_results.csv
 Lance/Tender/Excel Sheets/*.csv
 Lance/Tender/Excel Sheets/*.xlsx
+
 streamlit.err.log
 streamlit.out.log
 .streamlit/secrets.toml
-__pycache__/
-*.pyc
+
 *.db
 *.sqlite
 *.sqlite3
 *.db-wal
 *.db-shm
+
 chrome_profiles/
 data/whatsapp_messages.sqlite
 data/whatsapp_images/
 Flexar/BlueSG/cache/runtime/
+
+# Local downloads and portable applications (thousands of generated files).
 tools/_downloads/
-tools/LibreOfficePortable/
+tools/LibreOfficePortable*/
 tools/PortableApps/
+
 HR/RDL_Parsed/
 Lance/HRIQ_Report_Tool/logs/*.log*
