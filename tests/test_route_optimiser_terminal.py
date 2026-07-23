@@ -9,12 +9,13 @@ from Flexar.BlueSG.vehicle_route_optimizer import RiderState, TravelCost
 APP = Path(__file__).parents[1] / "Flexar" / "BlueSG" / "Vehicle_Route_Optimiser.py"
 
 
-def test_progress_terminal_is_fixed_to_latest_23_lines_without_scrollbar() -> None:
+def test_progress_terminal_keeps_explanatory_scrollable_history() -> None:
     source = APP.read_text(encoding="utf-8")
 
-    assert "Live activity terminal · latest 23 lines" in source
-    assert "del terminal_lines[:-23]" in source
-    assert "height:428px; overflow:hidden" in source
+    assert "ASSIGN explains each routing decision. Latest 60 events." in source
+    assert "del terminal_lines[:-60]" in source
+    assert "height:520px; overflow-y:auto" in source
+    assert 'detail_parts.append(("Why routed", event["assignment_reason"]))' in source
 
 
 def test_assignment_progress_events_include_car_and_final_rider(monkeypatch) -> None:
@@ -55,5 +56,7 @@ def test_assignment_progress_events_include_car_and_final_rider(monkeypatch) -> 
     final = next(event for event in events if event.get("event_type") == "final_assignment")
     assert assignment["current_car_plate"] == "SBA1234A"
     assert assignment["assigned_jobs"] == 1
+    assert assignment["assignment_reason"]
+    assert assignment["current_region"] == "east_core"
     assert final["current_car_plate"] == "SBA1234A"
     assert final["current_rider"] == "Rider One"

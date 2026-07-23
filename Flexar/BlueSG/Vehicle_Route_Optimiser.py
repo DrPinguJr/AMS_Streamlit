@@ -49,6 +49,7 @@ from Flexar.BlueSG.vehicle_route_optimizer import (
     ensure_rider_roster_workbook,
     export_routes_to_excel,
     build_unassigned_jobs_df,
+    cache_unique_geocodes,
     get_cost_explanation,
     get_cached_geocode,
     get_onemap_token,
@@ -81,9 +82,9 @@ def cached_cost_explanation() -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def cached_route_map_geocodes(addresses: tuple[str, ...], token: str | None) -> dict[str, dict[str, object]]:
+    results = cache_unique_geocodes(addresses, token=token, use_onemap=True)
     geocodes: dict[str, dict[str, object]] = {}
-    for address in addresses:
-        result = get_cached_geocode(address, token=token, use_onemap=True)
+    for address, result in results.items():
         geocodes[address] = {
             "lat": result.latitude,
             "lon": result.longitude,
@@ -1235,8 +1236,8 @@ with riders_col:
             "Rider Name": st.column_config.TextColumn(required=True),
             "Start Location": st.column_config.TextColumn(required=True),
             "Start Zone": st.column_config.SelectboxColumn(
-                options=["", "North", "North-East", "East", "Central", "West", "South/CBD"],
-                help="Used as an initial fallback estimate and tie-breaker.",
+                options=["", "North", "North-West", "North-East", "East", "Central", "West", "South/CBD"],
+                help="Used for regional ownership, the initial fallback estimate, and tie-breaking.",
             ),
             "Max Jobs": st.column_config.NumberColumn(
                 min_value=1,
@@ -1247,7 +1248,8 @@ with riders_col:
                 options=RIDER_LOAD_LEVELS,
                 help=(
                     "Session-only priority. Low keeps PT/empty travel and area changes low; "
-                    "Medium is balanced; High and Very High are preferred for clustered work."
+                    "Medium is balanced; High and Very High prefer clustered work. Priority owns "
+                    "matching-area jobs; multiple Priority riders in one area split them evenly."
                 ),
             ),
         },
@@ -1623,7 +1625,10 @@ if optimise_clicked or optimise_new_route_clicked:
             progress_bar = st.progress(0, text="Preparing optimisation...")
             activity_text = st.empty()
             detail_text = st.empty()
-            st.caption("Live activity terminal · latest 23 lines")
+            st.caption(
+                "Live routing terminal · GEO shows cache warm-up; CHECK shows comparisons; "
+                "ASSIGN explains each routing decision. Latest 60 events."
+            )
             terminal_output = st.empty()
         started_at = time.monotonic()
         last_progress_event: dict = {}
@@ -1634,10 +1639,10 @@ if optimise_clicked or optimise_new_route_clicked:
             safe_output = html.escape("\n".join(terminal_lines))
             terminal_output.markdown(
                 (
-                    '<pre style="margin:0; height:428px; overflow:hidden; box-sizing:border-box; '
+                    '<pre style="margin:0; height:520px; overflow-y:auto; box-sizing:border-box; '
                     'padding:12px 14px; border:1px solid #334155; border-radius:8px; '
                     'background:#07111f; color:#d1fae5; font:13px/1.35 Consolas, Monaco, monospace; '
-                    f'white-space:pre;">{safe_output}</pre>'
+                    f'white-space:pre-wrap; overflow-wrap:anywhere;">{safe_output}</pre>'
                 ),
                 unsafe_allow_html=True,
             )
@@ -1663,27 +1668,47 @@ if optimise_clicked or optimise_new_route_clicked:
             dropoff = clean_text(event.get("current_dropoff"))
             address = clean_text(event.get("current_address"))
             event_type = clean_text(event.get("event_type"))
+            region = clean_text(event.get("current_region"))
+            assignment_reason = clean_text(event.get("assignment_reason"))
+            rider_load_level = clean_text(event.get("rider_load_level"))
             if event_type in {"assignment", "final_assignment"}:
-                label = "FINAL" if event_type == "final_assignment" else "GIVE "
+                label = "FINAL " if event_type == "final_assignment" else "ASSIGN"
                 terminal_message = (
-                    f"{label}  Car {car_plate or '(no plate)'} -> {rider_name or '(no rider)'}"
-                    f" | {pickup or '?'} -> {dropoff or '?'}"
+                    f"{label} [{assigned_jobs}/{total_jobs}, {remaining_jobs} left] "
+                    f"Car {car_plate or '(no plate)'} -> {rider_name or '(no rider)'}"
+                    f" ({rider_load_level or 'standard'}) | {pickup or '?'} -> {dropoff or '?'}"
+                    f" | area={region or '?'} | score={event.get('assignment_score', '?')}"
+                    f" | why: {assignment_reason or 'best feasible route'}"
                 )
-            elif address:
-                terminal_message = f"GEO    {status}: {address}"
+            elif event_type == "geocode" or address:
+                geocode_completed = int(event.get("geocode_completed", 0) or 0)
+                geocode_unique = int(event.get("geocode_unique_count", 0) or 0)
+                geocode_remaining = int(event.get("geocode_remaining", 0) or 0)
+                geocode_original = int(event.get("geocode_original_count", 0) or 0)
+                geocode_source = clean_text(event.get("geocode_source")) or "unknown"
+                workers = int(event.get("geocode_workers", 1) or 1)
+                terminal_message = (
+                    f"GEO    [{geocode_completed}/{geocode_unique}, {geocode_remaining} left] "
+                    f"{address} | {geocode_source} | {workers} parallel worker(s) | "
+                    f"{geocode_original} input addresses -> {geocode_unique} unique places"
+                )
             elif rider_name or pickup:
                 terminal_message = (
                     f"CHECK  {comparison_count:,}/{estimated_comparisons:,}"
+                    f" | {assigned_jobs}/{total_jobs} assigned, {remaining_jobs} left"
                     f" | rider={rider_name or '?'} | pickup={pickup or '?'}"
                 )
             else:
                 terminal_message = f"{phase.upper()[:6]:<6} {status}"
 
-            signature = (event_type, phase, status, car_plate, rider_name, pickup, dropoff, address)
+            signature = (
+                event_type, phase, status, car_plate, rider_name, pickup, dropoff,
+                address, assignment_reason, event.get("geocode_completed"),
+            )
             if signature != terminal_state["last_signature"]:
                 terminal_state["last_signature"] = signature
                 terminal_lines.append(f"[{elapsed:6.1f}s] {terminal_message}")
-                del terminal_lines[:-23]
+                del terminal_lines[:-60]
                 render_terminal()
 
             phase_metric.metric("Phase", phase)
@@ -1703,6 +1728,12 @@ if optimise_clicked or optimise_new_route_clicked:
                 detail_parts.append(("Pickup", event["current_pickup"]))
             if event.get("current_dropoff"):
                 detail_parts.append(("Drop-off", event["current_dropoff"]))
+            if event.get("current_region"):
+                detail_parts.append(("Area", event["current_region"]))
+            if event.get("rider_load_level"):
+                detail_parts.append(("Rider mode", event["rider_load_level"]))
+            if event.get("assignment_reason"):
+                detail_parts.append(("Why routed", event["assignment_reason"]))
 
             if detail_parts:
                 detail_text.dataframe(

@@ -7,10 +7,12 @@ import math
 import os
 import re
 import copy
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
+from threading import RLock
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -46,7 +48,7 @@ from Flexar.BlueSG.travel_costs import (
 REQUIRED_JOB_HEADERS = ["Car Plate", "Pickup Address", "Pickup Lot", "Drop-off Address"]
 OPTIONAL_JOB_HEADERS = ["Date", "Fuel %", "Pickup Time", "Notes"]
 RIDER_COLUMNS = ["Rider Name", "Start Location", "Start Zone", "Max Jobs", "Rider Load"]
-RIDER_LOAD_LEVELS = ["Low", "Medium", "High", "Very High"]
+RIDER_LOAD_LEVELS = ["Low", "Medium", "High", "Very High", "Priority"]
 RIDER_LOAD_ALIASES = {
     "Normal": "Medium",
 }
@@ -88,6 +90,21 @@ RIDER_LOAD_POLICIES = {
         "minimum_target_multiplier": 1.0,
     },
     "Very High": {
+        "job_score_adjustment": -42.0,
+        "job_escalation": -8.0,
+        "empty_duration_soft_limit": 999.0,
+        "empty_duration_penalty_per_min": 0.0,
+        "different_pickup_zone_penalty": 0.0,
+        "cross_zone_route_penalty": 0.0,
+        "same_area_bonus": -18.0,
+        "cluster_pressure_multiplier": 1.8,
+        "cluster_jump_penalty": 5.0,
+        "minimum_target_multiplier": 1.2,
+    },
+    # Priority uses Very High's route-shaping preferences, plus an explicit
+    # regional allocation rule in the solver. It is deliberately not modelled
+    # as an arbitrarily large score bonus.
+    "Priority": {
         "job_score_adjustment": -42.0,
         "job_escalation": -8.0,
         "empty_duration_soft_limit": 999.0,
@@ -285,6 +302,8 @@ GEOCODE_MEMORY_CACHE: dict[str, GeocodeResult] = {}
 ROUTE_MEMORY_CACHE: dict[str, TravelCost] = {}
 GEOCODE_DISK_CACHE_LOADED = False
 ROUTE_DISK_CACHE_LOADED = False
+CACHE_IO_LOCK = RLock()
+DEFAULT_GEOCODE_WORKERS = 4
 SINGAPORE_TZ = timezone(timedelta(hours=8))
 ONEMAP_MEMORY_TOKEN: str = ""
 ONEMAP_MEMORY_TOKEN_EXPIRY: datetime | None = None
@@ -460,6 +479,27 @@ def normalise_rider_load_level(value: Any) -> str:
     return "Medium"
 
 
+def _priority_area_label(rider: "RiderState") -> str:
+    return clean_text(rider.start_zone) or clean_text(rider.start_location) or "Unknown"
+
+
+def _priority_rider_matches_job(rider: "RiderState", job: dict[str, Any]) -> bool:
+    """Return whether a Priority rider owns this job's pickup area."""
+
+    if normalise_rider_load_level(rider.load_level) != "Priority":
+        return False
+    rider_zone_key = re.sub(
+        r"[^a-z]+", "_", _priority_area_label(rider).lower()
+    ).strip("_")
+    job_region, job_subregion, _ = classify_job_region(job)
+    if rider_zone_key in {"north_west", "northwest"}:
+        return job_subregion == "north_west"
+
+    explicit_pickup_region = normalize_region(job.get("Pickup Zone"))
+    target_region = explicit_pickup_region if explicit_pickup_region != "unknown" else job_region
+    return normalize_region(_priority_area_label(rider)) == target_region
+
+
 def _read_csv_cache(path: Path, columns: list[str]) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame(columns=columns)
@@ -471,37 +511,55 @@ def _read_csv_cache(path: Path, columns: list[str]) -> pd.DataFrame:
 
 def _write_csv_cache(path: Path, df: pd.DataFrame) -> None:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(path, index=False)
+        with CACHE_IO_LOCK:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            df.to_csv(path, index=False)
     except OSError:
         return
 
 
 def _append_csv_cache_row(path: Path, row: dict[str, Any], columns: list[str]) -> None:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame([row], columns=columns).to_csv(path, mode="a", index=False, header=not path.exists())
+        with CACHE_IO_LOCK:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame([row], columns=columns).to_csv(path, mode="a", index=False, header=not path.exists())
     except OSError:
         return
 
 
 def _load_geocode_disk_cache_once() -> None:
     global GEOCODE_DISK_CACHE_LOADED
-    if GEOCODE_DISK_CACHE_LOADED:
-        return
-    for cache_file in [GEOCODE_SEED_CACHE_FILE, GEOCODE_CACHE_FILE]:
-        cache = _read_csv_cache(cache_file, ["address", "latitude", "longitude"])
-        for row in cache.itertuples(index=False):
-            address = clean_text(getattr(row, "address", ""))
-            if not address:
-                continue
-            try:
-                latitude = float(getattr(row, "latitude"))
-                longitude = float(getattr(row, "longitude"))
-            except (TypeError, ValueError):
-                continue
-            GEOCODE_MEMORY_CACHE[address.casefold()] = GeocodeResult(address, latitude, longitude, "OneMap cache")
-    GEOCODE_DISK_CACHE_LOADED = True
+    with CACHE_IO_LOCK:
+        if GEOCODE_DISK_CACHE_LOADED:
+            return
+        seen: set[str] = set()
+        for cache_file in [GEOCODE_SEED_CACHE_FILE, GEOCODE_CACHE_FILE]:
+            cache = _read_csv_cache(cache_file, ["address", "latitude", "longitude"])
+            compact_rows: list[dict[str, Any]] = []
+            for row in cache.itertuples(index=False):
+                address = clean_text(getattr(row, "address", ""))
+                canonical_address = clean_address_for_geocoding(address) or address
+                memory_key = canonical_address.casefold()
+                if not memory_key or memory_key in seen:
+                    continue
+                try:
+                    latitude = float(getattr(row, "latitude"))
+                    longitude = float(getattr(row, "longitude"))
+                except (TypeError, ValueError):
+                    continue
+                seen.add(memory_key)
+                compact_rows.append(
+                    {"address": canonical_address, "latitude": latitude, "longitude": longitude}
+                )
+                GEOCODE_MEMORY_CACHE[memory_key] = GeocodeResult(
+                    canonical_address, latitude, longitude, "OneMap cache"
+                )
+            # Keep the two cache layers unique as a combined set. This also
+            # migrates old lot/deck variants such as 313@somerset to one place.
+            compact = pd.DataFrame(compact_rows, columns=["address", "latitude", "longitude"])
+            if len(compact) != len(cache) or list(compact.columns) != list(cache.columns):
+                _write_csv_cache(cache_file, compact)
+        GEOCODE_DISK_CACHE_LOADED = True
 
 
 def _load_route_disk_cache_once() -> None:
@@ -721,6 +779,18 @@ def infer_zone(address: Any) -> str | None:
         if any(keyword.lower() in text for keyword in keywords):
             return zone
     return None
+
+
+def _fallback_zone(value: Any) -> str | None:
+    """Map detailed operational zones onto the fallback travel matrix."""
+
+    text = re.sub(r"[^a-z]+", "_", clean_text(value).lower()).strip("_")
+    if text in {"north_west", "northwest"}:
+        return "West"
+    for zone in ZONE_KEYWORDS:
+        if text == re.sub(r"[^a-z]+", "_", zone.lower()).strip("_"):
+            return zone
+    return clean_text(value) or None
 
 
 def clean_address_for_geocoding(address: Any) -> str:
@@ -1010,21 +1080,102 @@ def get_cached_geocode(address: str, token: str | None = None, use_onemap: bool 
         return GeocodeResult(address, None, None, "fallback estimate", "OneMap disabled")
 
     _load_geocode_disk_cache_once()
-    memory_key = address.casefold()
-    if memory_key in GEOCODE_MEMORY_CACHE:
-        cached = GEOCODE_MEMORY_CACHE[memory_key]
-        if cached.is_available:
+    canonical_address = clean_address_for_geocoding(address) or address
+    memory_key = canonical_address.casefold()
+    with CACHE_IO_LOCK:
+        cached = GEOCODE_MEMORY_CACHE.get(memory_key)
+        if cached is not None and cached.is_available:
             return GeocodeResult(address, cached.latitude, cached.longitude, "OneMap cache", cached.error)
 
-    result = geocode_address_onemap(address, token=token)
-    GEOCODE_MEMORY_CACHE[memory_key] = result
-    if result.is_available:
-        _append_csv_cache_row(
-            GEOCODE_CACHE_FILE,
-            {"address": address, "latitude": result.latitude, "longitude": result.longitude},
-            ["address", "latitude", "longitude"],
+    result = geocode_address_onemap(canonical_address, token=token)
+    with CACHE_IO_LOCK:
+        # A concurrent lookup may have completed while this request was in
+        # flight. Prefer it and never append the same canonical place twice.
+        cached = GEOCODE_MEMORY_CACHE.get(memory_key)
+        if cached is not None and cached.is_available:
+            return GeocodeResult(address, cached.latitude, cached.longitude, "OneMap cache", cached.error)
+        stored = GeocodeResult(
+            canonical_address,
+            result.latitude,
+            result.longitude,
+            result.source,
+            result.error,
         )
-    return result
+        GEOCODE_MEMORY_CACHE[memory_key] = stored
+        if stored.is_available:
+            _append_csv_cache_row(
+                GEOCODE_CACHE_FILE,
+                {
+                    "address": canonical_address,
+                    "latitude": stored.latitude,
+                    "longitude": stored.longitude,
+                },
+                ["address", "latitude", "longitude"],
+            )
+    return GeocodeResult(address, stored.latitude, stored.longitude, stored.source, stored.error)
+
+
+def cache_unique_geocodes(
+    addresses: list[str] | tuple[str, ...],
+    token: str | None = None,
+    use_onemap: bool = True,
+    max_workers: int = DEFAULT_GEOCODE_WORKERS,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, GeocodeResult]:
+    """Geocode unique physical places concurrently and fan results to aliases."""
+
+    grouped: dict[str, list[str]] = {}
+    canonical_by_key: dict[str, str] = {}
+    for raw_address in addresses:
+        address = clean_text(raw_address)
+        if not address:
+            continue
+        canonical = clean_address_for_geocoding(address) or address
+        key = canonical.casefold()
+        grouped.setdefault(key, []).append(address)
+        canonical_by_key.setdefault(key, canonical)
+
+    total = len(grouped)
+    if total == 0:
+        return {}
+    worker_count = max(1, min(int(max_workers or 1), 8, total))
+    completed = 0
+    results_by_key: dict[str, GeocodeResult] = {}
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="bluesg-geocode") as pool:
+        futures = {
+            pool.submit(get_cached_geocode, canonical, token, use_onemap): key
+            for key, canonical in canonical_by_key.items()
+        }
+        for future in as_completed(futures):
+            key = futures[future]
+            canonical = canonical_by_key[key]
+            try:
+                result = future.result()
+            except Exception as exc:  # keep one failed lookup from cancelling the batch
+                result = GeocodeResult(canonical, None, None, "fallback estimate", str(exc))
+            results_by_key[key] = result
+            completed += 1
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "completed": completed,
+                        "total": total,
+                        "remaining": total - completed,
+                        "address": canonical,
+                        "source": result.source,
+                        "error": result.error,
+                        "workers": worker_count,
+                    }
+                )
+
+    expanded: dict[str, GeocodeResult] = {}
+    for key, aliases in grouped.items():
+        result = results_by_key[key]
+        for alias in aliases:
+            expanded[alias] = GeocodeResult(
+                alias, result.latitude, result.longitude, result.source, result.error
+            )
+    return expanded
 
 
 def get_stored_geocode(address: str) -> GeocodeResult:
@@ -1034,7 +1185,8 @@ def get_stored_geocode(address: str) -> GeocodeResult:
     if not normalised:
         return GeocodeResult(normalised, None, None, "cache only", "Missing address")
     _load_geocode_disk_cache_once()
-    cached = GEOCODE_MEMORY_CACHE.get(normalised.casefold())
+    canonical = clean_address_for_geocoding(normalised) or normalised
+    cached = GEOCODE_MEMORY_CACHE.get(canonical.casefold())
     if cached is None or not cached.is_available:
         return GeocodeResult(normalised, None, None, "cache only", "No cached coordinates")
     return GeocodeResult(normalised, cached.latitude, cached.longitude, "OneMap cache", cached.error)
@@ -1353,8 +1505,8 @@ def get_fallback_cost(
     if from_text.casefold() == to_text.casefold():
         return TravelCost(0, 0, "exact same location", origin=from_text, destination=to_text, confidence="verified")
 
-    source_zone = from_zone or infer_zone(from_text)
-    destination_zone = to_zone or infer_zone(to_text)
+    source_zone = _fallback_zone(from_zone or infer_zone(from_text))
+    destination_zone = _fallback_zone(to_zone or infer_zone(to_text))
     if source_zone and destination_zone:
         distance = FALLBACK_ZONE_KM.get(source_zone, {}).get(destination_zone, UNKNOWN_DISTANCE_KM)
         duration = FALLBACK_ZONE_MINUTES.get(source_zone, {}).get(destination_zone, UNKNOWN_DURATION_MIN)
@@ -3478,25 +3630,47 @@ def optimise_vehicle_routes(
         return validate_candidate_routes(sequences_by_name, operation_context, constraints).is_valid
 
     if use_onemap:
-        unique_addresses = sorted(
+        all_addresses = [
+            clean_text(address)
+            for address in (
+                list(jobs["Pickup Address"])
+                + list(jobs["Drop-off Address"])
+                + [rider.start_location for rider in riders]
+            )
+            if clean_text(address)
+        ]
+        canonical_place_count = len(
             {
-                clean_text(address)
-                for address in (
-                    list(jobs["Pickup Address"])
-                    + list(jobs["Drop-off Address"])
-                    + [rider.start_location for rider in riders]
-                )
-                if clean_text(address)
+                (clean_address_for_geocoding(address) or address).casefold()
+                for address in all_addresses
             }
         )
-        for index, address in enumerate(unique_addresses, start=1):
+        configured_workers = parse_optional_int(os.getenv("BLUESG_GEOCODE_WORKERS")) or DEFAULT_GEOCODE_WORKERS
+
+        def geocode_progress(event: dict[str, Any]) -> None:
+            completed = int(event["completed"])
             report(
-                f"Geocoding address {index} of {len(unique_addresses)}",
+                f"Cached place {completed} of {event['total']} ({event['remaining']} left)",
                 phase="Geocoding",
-                current_address=address,
-                progress=min(0.2, 0.2 * index / max(1, len(unique_addresses))),
+                event_type="geocode",
+                current_address=event["address"],
+                geocode_source=event["source"],
+                geocode_workers=event["workers"],
+                geocode_original_count=len(all_addresses),
+                geocode_unique_count=canonical_place_count,
+                geocode_completed=completed,
+                geocode_remaining=event["remaining"],
+                progress=min(0.2, 0.2 * completed / max(1, int(event["total"]))),
             )
-            result = get_cached_geocode(address, token=token, use_onemap=True)
+
+        geocode_results = cache_unique_geocodes(
+            all_addresses,
+            token=token,
+            use_onemap=True,
+            max_workers=configured_workers,
+            progress_callback=geocode_progress,
+        )
+        for address, result in geocode_results.items():
             if result.error:
                 lookup_warnings.append(f"{address}: {result.error}")
     else:
@@ -3525,6 +3699,13 @@ def optimise_vehicle_routes(
         )
     all_job_records_by_id = {_job_id(job): job for job in remaining}
 
+    def priority_matching_job_count(rider: RiderState) -> int:
+        return sum(
+            1
+            for assigned_job in rider_sequences[rider_key(rider)]
+            if _priority_rider_matches_job(rider, assigned_job)
+        )
+
     # Semi-optimised greedy assignment: every round compares all remaining fixed
     # pickup-to-drop-off jobs against every rider's real current location.
     assignment_round = 0
@@ -3542,13 +3723,14 @@ def optimise_vehicle_routes(
             )
 
         best_choice: tuple[
-            tuple[float, int, float, float, int, int, str],
+            tuple[int, int, float, int, float, float, int, int, str],
             int,
             RiderState,
             dict[str, Any],
             dict[str, Any],
             dict[str, Any],
             dict[str, Any],
+            str,
         ] | None = None
         feasible_candidates: list[dict[str, Any]] = []
         for rider in riders:
@@ -3635,6 +3817,8 @@ def optimise_vehicle_routes(
                         "starts_dense_cluster": starts_dense_cluster,
                         "continues_cluster": continues_cluster,
                         "candidate_cost": float(inserted_row.get("Empty Duration Min", math.inf) or math.inf),
+                        "priority_match": _priority_rider_matches_job(rider, job),
+                        "priority_balance": priority_matching_job_count(rider),
                     }
                 )
 
@@ -3662,6 +3846,7 @@ def optimise_vehicle_routes(
             rider = candidate["rider"]
             job = candidate["job"]
             job_candidates = candidates_by_job[_job_id(job)]
+            priority_candidates = [item for item in job_candidates if item["priority_match"]]
             best_feasible = min(item["candidate_cost"] for item in job_candidates)
             regional_audit: dict[str, Any] = {}
             regional_penalty = 0.0
@@ -3706,7 +3891,13 @@ def optimise_vehicle_routes(
                     rider.current_zone or infer_zone(rider.current_location) or "unknown",
                     assessment,
                 )
+            # Matching Priority work is allocated before ordinary work so a
+            # priority rider cannot consume their feasible window elsewhere.
+            priority_rank = 0 if candidate["priority_match"] else (2 if priority_candidates else 1)
+            priority_balance = int(candidate["priority_balance"]) if candidate["priority_match"] else 0
             candidate_rank = (
+                priority_rank,
+                priority_balance,
                 float(candidate["greedy_assignment_score"])
                 + regional_penalty
                 + affinity_adjustment
@@ -3718,6 +3909,19 @@ def optimise_vehicle_routes(
                 int(job["_original_order"]),
                 rider.name.casefold(),
             )
+            if candidate["priority_match"]:
+                area = _priority_area_label(rider)
+                decision_reason = (
+                    f"Priority rider for {area}; balanced among {len(priority_candidates)} feasible "
+                    f"Priority rider(s) with {priority_balance} matching job(s) before assignment."
+                )
+            elif regional_audit.get("Reason for Regional Assignment"):
+                decision_reason = clean_text(regional_audit["Reason for Regional Assignment"])
+            else:
+                decision_reason = (
+                    f"Best feasible route score {candidate_rank[2]:.1f}; "
+                    f"empty travel {candidate['candidate_cost']:.1f} min."
+                )
             if best_choice is None or candidate_rank < best_choice[0]:
                 best_choice = (
                     candidate_rank,
@@ -3727,6 +3931,7 @@ def optimise_vehicle_routes(
                     candidate["evaluation"],
                     candidate["inserted_row"],
                     regional_audit,
+                    decision_reason,
                 )
 
         if best_choice is None:
@@ -3740,6 +3945,7 @@ def optimise_vehicle_routes(
             evaluation,
             inserted_row,
             regional_audit,
+            decision_reason,
         ) = best_choice
         pickup_address = clean_text(job["Pickup Address"])
         dropoff_address = clean_text(job["Drop-off Address"])
@@ -3753,6 +3959,15 @@ def optimise_vehicle_routes(
             current_rider=rider.name,
             current_pickup=pickup_address,
             current_dropoff=dropoff_address,
+            current_region=clean_text(
+                regional_audit.get("Operational Subregion")
+                or job.get("Pickup Zone")
+                or classify_job_region(job)[1]
+            ),
+            rider_load_level=normalise_rider_load_level(rider.load_level),
+            rider_assigned_after=rider.assigned_count + 1,
+            assignment_score=round(float(inserted_row.get("Assignment Score", 0) or 0), 1),
+            assignment_reason=decision_reason,
             assigned_jobs=len(route_rows) + 1,
             remaining_jobs=max(0, len(remaining) - 1),
         )
@@ -3782,7 +3997,7 @@ def optimise_vehicle_routes(
             made_assignment = True
             while remaining and made_assignment:
                 made_assignment = False
-                best_insertion: tuple[float, int, float, int, str, RiderState, int, int, dict[str, Any], dict[str, Any], dict[str, Any]] | None = None
+                best_insertion: tuple[Any, ...] | None = None
                 feasible_insertions: list[dict[str, Any]] = []
 
                 current_evaluations = {
@@ -3822,6 +4037,8 @@ def optimise_vehicle_routes(
                                     "evaluation": evaluation,
                                     "candidate_cost": float(inserted_row.get("Empty Duration Min", math.inf) or math.inf),
                                     "current_region": infer_zone(inserted_row.get("Start From")) or rider.current_zone or "unknown",
+                                    "priority_match": _priority_rider_matches_job(rider, job),
+                                    "priority_balance": priority_matching_job_count(rider),
                                 }
                             )
 
@@ -3841,6 +4058,9 @@ def optimise_vehicle_routes(
                 for candidate in feasible_insertions:
                     rider = candidate["rider"]
                     job = candidate["job"]
+                    priority_candidates = [
+                        item for item in rescue_by_job[_job_id(job)] if item["priority_match"]
+                    ]
                     regional_penalty = 0.0
                     audit: dict[str, Any] = {}
                     if regional_context:
@@ -3870,13 +4090,15 @@ def optimise_vehicle_routes(
                             assessment,
                         )
                     candidate_rank = (
+                        0 if candidate["priority_match"] else (2 if priority_candidates else 1),
+                        int(candidate["priority_balance"]) if candidate["priority_match"] else 0,
                         float(candidate["added_duration"]) + regional_penalty,
                         int(candidate["minimum_priority"]),
                         float(candidate["projected_adjusted"]),
                         int(job.get("_original_order", candidate["job_index"])),
                         rider.name.casefold(),
                     )
-                    if best_insertion is None or candidate_rank < best_insertion[:5]:
+                    if best_insertion is None or candidate_rank < best_insertion[:7]:
                         best_insertion = (
                             *candidate_rank,
                             rider,
@@ -3888,7 +4110,7 @@ def optimise_vehicle_routes(
                         )
 
                 if best_insertion is not None:
-                    _, _, _, _, _, rider, insert_at, job_index, job, _, audit = best_insertion
+                    _, _, _, _, _, _, _, rider, insert_at, job_index, job, _, audit = best_insertion
                     if _job_id(job) in assigned_job_ids:
                         remaining.pop(job_index)
                         continue
@@ -3939,6 +4161,10 @@ def optimise_vehicle_routes(
 
                     donor_current_duration = float(current_evaluations[donor_key].get("raw_duration", 0) or 0)
                     for remove_at, job in enumerate(donor_sequence):
+                        # Priority area ownership is intentional and must not be
+                        # undone by the general minimum-workload rebalance.
+                        if _priority_rider_matches_job(donor, job):
+                            continue
                         donor_candidate_sequence = donor_sequence[:remove_at] + donor_sequence[remove_at + 1 :]
                         donor_evaluation = evaluate_rider_sequence(donor, donor_candidate_sequence, cap_used)
                         if not donor_evaluation.get("valid", True):
@@ -4256,7 +4482,16 @@ def optimise_vehicle_routes(
         columns=SUMMARY_COLUMNS,
     )
     summary_df = format_summary_output(summary_df, route_df)
+    riders_by_name = {rider.name: rider for rider in riders}
     for final_index, row in route_df.reset_index(drop=True).iterrows():
+        final_rider = riders_by_name.get(clean_text(row.get("Rider")))
+        final_job = all_job_records_by_id.get(int(row.get("Uploaded Row", -1)))
+        if final_rider is not None and final_job is not None and _priority_rider_matches_job(final_rider, final_job):
+            final_reason = f"Priority rider for {_priority_area_label(final_rider)}."
+        else:
+            final_reason = clean_text(row.get("Reason for Regional Assignment")) or (
+                f"Lowest feasible route score {float(row.get('Assignment Score', 0) or 0):.1f}."
+            )
         report(
             f"Confirmed final assignment {final_index + 1} of {len(route_df)}",
             phase="Finalising",
@@ -4265,6 +4500,12 @@ def optimise_vehicle_routes(
             current_rider=clean_text(row.get("Rider")),
             current_pickup=clean_text(row.get("Pickup Address")),
             current_dropoff=clean_text(row.get("Drop-off Address")),
+            current_region=clean_text(row.get("Operational Subregion") or row.get("Pickup Zone")),
+            rider_load_level=(
+                normalise_rider_load_level(final_rider.load_level) if final_rider is not None else ""
+            ),
+            assignment_score=round(float(row.get("Assignment Score", 0) or 0), 1),
+            assignment_reason=final_reason,
             assigned_jobs=final_index + 1,
             remaining_jobs=max(0, total_jobs - final_index - 1),
             progress=0.99,
