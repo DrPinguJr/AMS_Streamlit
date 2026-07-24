@@ -12,10 +12,19 @@ APP = Path(__file__).parents[1] / "Flexar" / "BlueSG" / "Vehicle_Route_Optimiser
 def test_progress_terminal_keeps_explanatory_scrollable_history() -> None:
     source = APP.read_text(encoding="utf-8")
 
-    assert "ASSIGN explains each routing decision. Latest 60 events." in source
-    assert "del terminal_lines[:-60]" in source
-    assert "height:520px; overflow-y:auto" in source
-    assert 'detail_parts.append(("Why routed", event["assignment_reason"]))' in source
+    assert "Live progress in plain English." in source
+    assert '"\\n\\n".join(reversed(terminal_entries))' in source
+    assert "terminal_output.code(" in source
+    assert "del terminal_entries[:-40]" in source
+    assert "height=560" in source
+    assert '"Writing new location into memory"' in source
+    assert '"Looking for the best driver"' in source
+    assert "geocode_completed % 10 == 0" in source
+    assert "comparison_count % 100 == 0" in source
+    assert 'f"Why this driver: {simple_reason}"' in source
+    assert 'detail_parts.append(("Why this driver", simple_reason))' in source
+    assert 'if not hasattr(_route_optimizer_backend, "cache_unique_geocodes")' in source
+    assert 'batch_geocoder = getattr(_route_optimizer_backend, "cache_unique_geocodes", None)' in source
 
 
 def test_assignment_progress_events_include_car_and_final_rider(monkeypatch) -> None:

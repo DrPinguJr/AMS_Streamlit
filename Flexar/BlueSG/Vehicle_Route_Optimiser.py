@@ -1,5 +1,5 @@
 import os
-import html
+import importlib
 import json
 import sys
 import time
@@ -16,6 +16,13 @@ BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from Flexar.BlueSG import vehicle_route_optimizer as _route_optimizer_backend
+
+# Streamlit can keep the backend module from an earlier hot-reload while
+# re-running only this page. Refresh it when a newly added helper is missing.
+if not hasattr(_route_optimizer_backend, "cache_unique_geocodes"):
+    _route_optimizer_backend = importlib.reload(_route_optimizer_backend)
 
 from Flexar.BlueSG.vehicle_route_optimizer import (
     DEFAULT_DURATION_BUFFER_MULTIPLIER,
@@ -49,7 +56,6 @@ from Flexar.BlueSG.vehicle_route_optimizer import (
     ensure_rider_roster_workbook,
     export_routes_to_excel,
     build_unassigned_jobs_df,
-    cache_unique_geocodes,
     get_cost_explanation,
     get_cached_geocode,
     get_onemap_token,
@@ -82,7 +88,15 @@ def cached_cost_explanation() -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def cached_route_map_geocodes(addresses: tuple[str, ...], token: str | None) -> dict[str, dict[str, object]]:
-    results = cache_unique_geocodes(addresses, token=token, use_onemap=True)
+    batch_geocoder = getattr(_route_optimizer_backend, "cache_unique_geocodes", None)
+    if callable(batch_geocoder):
+        results = batch_geocoder(addresses, token=token, use_onemap=True)
+    else:
+        # Compatibility fallback for a partially reloaded Streamlit session.
+        results = {
+            address: get_cached_geocode(address, token=token, use_onemap=True)
+            for address in addresses
+        }
     geocodes: dict[str, dict[str, object]] = {}
     for address, result in results.items():
         geocodes[address] = {
@@ -1615,39 +1629,52 @@ if optimise_clicked or optimise_new_route_clicked:
 
         progress_panel = st.container(border=True)
         with progress_panel:
-            st.markdown("**Optimisation in progress**")
+            st.markdown("**Building the routes**")
             metric_cols = st.columns(5)
             phase_metric = metric_cols[0].empty()
             assigned_metric = metric_cols[1].empty()
             remaining_metric = metric_cols[2].empty()
             elapsed_metric = metric_cols[3].empty()
             checks_metric = metric_cols[4].empty()
-            progress_bar = st.progress(0, text="Preparing optimisation...")
+            progress_bar = st.progress(0, text="Getting ready...")
             activity_text = st.empty()
             detail_text = st.empty()
             st.caption(
-                "Live routing terminal · GEO shows cache warm-up; CHECK shows comparisons; "
-                "ASSIGN explains each routing decision. Latest 60 events."
+                "Live progress in plain English. Newest update appears first. "
+                "Saved locations are summarised to keep this readable."
             )
             terminal_output = st.empty()
         started_at = time.monotonic()
         last_progress_event: dict = {}
-        terminal_lines = ["[   0.0s] START  Preparing route optimisation..."]
+        terminal_entries = ["[   0.0s] Getting everything ready..."]
         terminal_state = {"last_signature": None}
 
         def render_terminal() -> None:
-            safe_output = html.escape("\n".join(terminal_lines))
-            terminal_output.markdown(
-                (
-                    '<pre style="margin:0; height:520px; overflow-y:auto; box-sizing:border-box; '
-                    'padding:12px 14px; border:1px solid #334155; border-radius:8px; '
-                    'background:#07111f; color:#d1fae5; font:13px/1.35 Consolas, Monaco, monospace; '
-                    f'white-space:pre-wrap; overflow-wrap:anywhere;">{safe_output}</pre>'
-                ),
-                unsafe_allow_html=True,
+            terminal_output.code(
+                "\n\n".join(reversed(terminal_entries)),
+                language=None,
+                wrap_lines=True,
+                height=560,
             )
 
         render_terminal()
+
+        def simple_area_name(region: str) -> str:
+            area = region.replace("_core", "").replace("_", " ").strip()
+            return area.title() if area else "this area"
+
+        def simple_routing_reason(reason: str, load_level: str, region: str) -> str:
+            reason_lower = reason.casefold()
+            area = simple_area_name(region)
+            if load_level.casefold() == "priority" or "priority rider" in reason_lower:
+                return f"They are the Priority driver for {area}."
+            if "primary" in reason_lower:
+                return f"They normally cover {area}."
+            if "support" in reason_lower:
+                return f"They are helping a nearby area because its usual drivers need support."
+            if "cluster" in reason_lower:
+                return "This keeps nearby jobs together and reduces extra travel."
+            return "This driver was the best available match."
 
         def show_progress(event: dict) -> None:
             last_progress_event.clear()
@@ -1671,53 +1698,113 @@ if optimise_clicked or optimise_new_route_clicked:
             region = clean_text(event.get("current_region"))
             assignment_reason = clean_text(event.get("assignment_reason"))
             rider_load_level = clean_text(event.get("rider_load_level"))
+            simple_reason = simple_routing_reason(
+                assignment_reason, rider_load_level, region
+            )
+            show_terminal_entry = True
             if event_type in {"assignment", "final_assignment"}:
-                label = "FINAL " if event_type == "final_assignment" else "ASSIGN"
-                terminal_message = (
-                    f"{label} [{assigned_jobs}/{total_jobs}, {remaining_jobs} left] "
-                    f"Car {car_plate or '(no plate)'} -> {rider_name or '(no rider)'}"
-                    f" ({rider_load_level or 'standard'}) | {pickup or '?'} -> {dropoff or '?'}"
-                    f" | area={region or '?'} | score={event.get('assignment_score', '?')}"
-                    f" | why: {assignment_reason or 'best feasible route'}"
+                first_line = (
+                    "Final route confirmed"
+                    if event_type == "final_assignment"
+                    else "Planning this route"
+                )
+                terminal_message = "\n".join(
+                    [
+                        f"{first_line} ({assigned_jobs} of {total_jobs})",
+                        f"Driver: {rider_name or 'Not selected yet'}",
+                        f"Car: {car_plate or 'No plate provided'}",
+                        f"Pick up from: {pickup or 'Unknown location'}",
+                        f"Drop off at: {dropoff or 'Unknown location'}",
+                        f"Why this driver: {simple_reason}",
+                        f"Jobs still left: {remaining_jobs}",
+                    ]
                 )
             elif event_type == "geocode" or address:
                 geocode_completed = int(event.get("geocode_completed", 0) or 0)
                 geocode_unique = int(event.get("geocode_unique_count", 0) or 0)
                 geocode_remaining = int(event.get("geocode_remaining", 0) or 0)
-                geocode_original = int(event.get("geocode_original_count", 0) or 0)
                 geocode_source = clean_text(event.get("geocode_source")) or "unknown"
-                workers = int(event.get("geocode_workers", 1) or 1)
-                terminal_message = (
-                    f"GEO    [{geocode_completed}/{geocode_unique}, {geocode_remaining} left] "
-                    f"{address} | {geocode_source} | {workers} parallel worker(s) | "
-                    f"{geocode_original} input addresses -> {geocode_unique} unique places"
+                if "cache" in geocode_source.casefold():
+                    # Do not print one block for every cache hit. A summary every
+                    # ten locations is enough to show that work is progressing.
+                    show_terminal_entry = (
+                        geocode_completed == 1
+                        or geocode_completed == geocode_unique
+                        or geocode_completed % 10 == 0
+                    )
+                    location_action = "Reading locations already saved"
+                elif "fallback" in geocode_source.casefold():
+                    location_action = "Could not confirm this location yet"
+                else:
+                    location_action = "Writing new location into memory"
+                location_lines = [location_action]
+                if "cache" not in geocode_source.casefold():
+                    location_lines.append(f"Location: {address}")
+                location_lines.extend(
+                    [
+                        f"Locations ready: {geocode_completed} of {geocode_unique}",
+                        f"Locations still left: {geocode_remaining}",
+                    ]
                 )
+                terminal_message = "\n".join(location_lines)
             elif rider_name or pickup:
-                terminal_message = (
-                    f"CHECK  {comparison_count:,}/{estimated_comparisons:,}"
-                    f" | {assigned_jobs}/{total_jobs} assigned, {remaining_jobs} left"
-                    f" | rider={rider_name or '?'} | pickup={pickup or '?'}"
+                show_terminal_entry = (
+                    comparison_count <= 1 or comparison_count % 100 == 0
+                )
+                terminal_message = "\n".join(
+                    [
+                        "Looking for the best driver",
+                        f"Routes checked: {comparison_count:,} of about {estimated_comparisons:,}",
+                        f"Jobs still left: {remaining_jobs}",
+                    ]
                 )
             else:
-                terminal_message = f"{phase.upper()[:6]:<6} {status}"
+                simple_phase_status = {
+                    "Geocoding": "Saving locations into memory...",
+                    "Comparing": "Checking who should receive each job...",
+                    "Routing": "Checking possible routes...",
+                    "Assigning": "Giving jobs to drivers...",
+                    "Finalising": "Confirming the final routes...",
+                    "Finished": "All routes are ready.",
+                    "Fallback": "Estimating travel times...",
+                }.get(phase, "Working on the routes...")
+                terminal_message = simple_phase_status
 
             signature = (
                 event_type, phase, status, car_plate, rider_name, pickup, dropoff,
                 address, assignment_reason, event.get("geocode_completed"),
             )
-            if signature != terminal_state["last_signature"]:
+            if show_terminal_entry and signature != terminal_state["last_signature"]:
                 terminal_state["last_signature"] = signature
-                terminal_lines.append(f"[{elapsed:6.1f}s] {terminal_message}")
-                del terminal_lines[:-60]
+                message_lines = terminal_message.splitlines()
+                terminal_entry = f"[{elapsed:6.1f}s] {message_lines[0]}"
+                if len(message_lines) > 1:
+                    terminal_entry += "\n" + "\n".join(
+                        f"          {line}" for line in message_lines[1:]
+                    )
+                terminal_entries.append(terminal_entry)
+                del terminal_entries[:-40]
                 render_terminal()
 
-            phase_metric.metric("Phase", phase)
-            assigned_metric.metric("Assigned", f"{assigned_jobs}/{total_jobs}")
-            remaining_metric.metric("Remaining", remaining_jobs)
-            elapsed_metric.metric("Elapsed", f"{elapsed:,.1f}s")
-            checks_metric.metric("Checks", f"{comparison_count:,}/{estimated_comparisons:,}")
-            progress_bar.progress(progress_value, text=f"{status} ({progress_value * 100:.0f}%)")
-            activity_text.info(status)
+            phase_name = {
+                "Geocoding": "Saving locations",
+                "Comparing": "Choosing drivers",
+                "Routing": "Checking routes",
+                "Assigning": "Building routes",
+                "Finalising": "Confirming routes",
+                "Finished": "Done",
+                "Fallback": "Estimating travel",
+            }.get(phase, "Working")
+            phase_metric.metric("What is happening", phase_name)
+            assigned_metric.metric("Jobs given", f"{assigned_jobs}/{total_jobs}")
+            remaining_metric.metric("Jobs left", remaining_jobs)
+            elapsed_metric.metric("Time used", f"{elapsed:,.1f}s")
+            checks_metric.metric("Routes checked", f"{comparison_count:,}/{estimated_comparisons:,}")
+            progress_bar.progress(
+                progress_value,
+                text=f"{phase_name} ({progress_value * 100:.0f}% done)",
+            )
+            activity_text.info(terminal_message.splitlines()[0])
 
             detail_parts = []
             if event.get("current_address"):
@@ -1733,7 +1820,7 @@ if optimise_clicked or optimise_new_route_clicked:
             if event.get("rider_load_level"):
                 detail_parts.append(("Rider mode", event["rider_load_level"]))
             if event.get("assignment_reason"):
-                detail_parts.append(("Why routed", event["assignment_reason"]))
+                detail_parts.append(("Why this driver", simple_reason))
 
             if detail_parts:
                 detail_text.dataframe(
@@ -1742,7 +1829,7 @@ if optimise_clicked or optimise_new_route_clicked:
                     hide_index=True,
                 )
             else:
-                detail_text.caption("Warming up caches and preparing route checks...")
+                detail_text.caption("Getting locations and routes ready...")
 
         hard_constraints: list[Constraint] = []
         if hard_max_jobs_enabled:
