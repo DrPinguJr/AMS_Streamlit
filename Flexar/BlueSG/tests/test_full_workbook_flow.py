@@ -72,7 +72,11 @@ def test_full_parse_optimise_validate_and_export_flow() -> None:
         "Run Metadata",
     } <= set(workbook.sheetnames)
     rider_text = "\n".join(str(cell.value or "") for row in workbook["Rider Instructions"].iter_rows() for cell in row)
-    assert "LOW-CONFIDENCE ROUTE" in rider_text
+    manager_review_text = "\n".join(
+        str(cell.value or "") for row in workbook["Manual Review"].iter_rows() for cell in row
+    )
+    assert "LOW-CONFIDENCE ROUTE" not in rider_text
+    assert "LOW-CONFIDENCE ROUTE" in manager_review_text
     assert route_df["Assignment Tier"].isin(["primary", "support", "exceptional"]).all()
 
 

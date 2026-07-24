@@ -316,6 +316,11 @@ def test_classification_prefers_explicit_and_coordinates_over_address() -> None:
     assert classify_job_region({"Pickup Latitude": 1.40, "Pickup Longitude": 103.76, "Pickup Address": "Tuas"})[1] == "north_west"
 
 
+def test_yew_tee_and_tengah_are_classified_as_north_west() -> None:
+    assert classify_job_region({"Pickup Address": "Yew Tee MRT"})[1] == "north_west"
+    assert classify_job_region({"Pickup Address": "322 Tengah Drive"})[1] == "north_west"
+
+
 def test_regional_fixture_beats_unprotected_baseline(monkeypatch) -> None:
     _patch_travel(monkeypatch)
     context = OperationContext.for_window(date(2026, 7, 17), time(14), time(17))

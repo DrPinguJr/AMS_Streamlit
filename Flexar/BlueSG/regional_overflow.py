@@ -174,7 +174,14 @@ _SUBREGION_ALIASES = {
 
 _ADDRESS_KEYWORDS: list[tuple[str, tuple[str, ...]]] = [
     ("west_core", ("tuas", "pioneer", "boon lay", "jurong west", "jurong island", "gul circle", "joo koon", "teban", "toh guan")),
-    ("north_west", ("choa chu kang", "bukit panjang", "hillview", "dairy farm", "cashew", "segar", "senja", "keat hong", "bukit batok")),
+    (
+        "north_west",
+        (
+            "yew tee", "choa chu kang", "bukit panjang", "hillview", "dairy farm",
+            "cashew", "segar", "senja", "keat hong", "bukit batok", "tengah",
+            "plantation", "brickland", "fajar", "jelebu", "petir",
+        ),
+    ),
     ("south_west", ("clementi", "west coast", "dover", "buona vista", "queenstown", "pasir panjang", "telok blangah", "one north")),
     ("east_north_east", ("punggol", "sengkang", "buangkok", "hougang", "serangoon", "kovan")),
     ("north_east_core", ("seletar", "anchorvale", "rivervale", "fernvale")),

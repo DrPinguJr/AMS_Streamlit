@@ -225,10 +225,14 @@ MAP_LOADER_COLUMNS = [
 
 ZONE_KEYWORDS = {
     "North": ["Woodlands", "Admiralty", "Yishun", "Sembawang", "Canberra"],
+    "North-West": [
+        "Yew Tee", "Choa Chu Kang", "Bukit Panjang", "Bukit Batok", "Tengah",
+        "Plantation", "Brickland", "Fajar", "Segar", "Senja", "Jelebu", "Petir",
+    ],
     "North-East": ["Sengkang", "Punggol", "Hougang", "Serangoon"],
     "East": ["Pasir Ris", "Tampines", "Simei", "Bedok", "Paya Lebar", "PLQ"],
     "Central": ["Toa Payoh", "Bishan", "Ang Mo Kio", "Novena", "Kallang"],
-    "West": ["Jurong", "Bukit Batok", "Choa Chu Kang", "Clementi", "Bukit Panjang"],
+    "West": ["Jurong", "Boon Lay", "Pioneer", "Tuas", "Clementi", "Teban", "Pandan"],
     "South/CBD": ["Orchard", "Marina", "Raffles", "Tanjong Pagar", "HarbourFront"],
 }
 
@@ -5275,9 +5279,9 @@ def _build_whatsapp_message(rider: str, rider_routes: pd.DataFrame) -> str:
             job_lines.append(f"Lot Range: {lot_range}")
         if zone != "-":
             job_lines.append(f"Zone: {zone}")
-        travel_warning = _route_value(route, "Travel Warning", "")
-        if travel_warning:
-            job_lines.append(f"⚠ {travel_warning}")
+        # Confidence warnings are operational diagnostics for managers. Keep
+        # them out of copy-ready rider messages while retaining them in the
+        # technical output and Manual Review worksheet.
         message_parts.extend(["", *job_lines])
 
     message_parts.extend(
