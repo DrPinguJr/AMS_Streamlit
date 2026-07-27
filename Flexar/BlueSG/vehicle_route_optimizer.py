@@ -50,7 +50,8 @@ OPTIONAL_JOB_HEADERS = ["Date", "Fuel %", "Pickup Time", "Notes"]
 RIDER_COLUMNS = ["Rider Name", "Start Location", "Start Zone", "Max Jobs", "Rider Load"]
 RIDER_LOAD_LEVELS = ["Low", "Medium", "High", "Very High", "Priority"]
 RIDER_LOAD_ALIASES = {
-    "Normal": "Medium",
+    "normal": "Medium",
+    "piority": "Priority",
 }
 RIDER_LOAD_POLICIES = {
     "Low": {
@@ -476,7 +477,7 @@ def parse_optional_int(value: Any) -> int | None:
 
 def normalise_rider_load_level(value: Any) -> str:
     text = clean_text(value)
-    text = RIDER_LOAD_ALIASES.get(text, text)
+    text = RIDER_LOAD_ALIASES.get(text.casefold(), text)
     for level in RIDER_LOAD_LEVELS:
         if text.casefold() == level.casefold():
             return level

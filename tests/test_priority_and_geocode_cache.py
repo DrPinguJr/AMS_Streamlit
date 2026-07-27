@@ -75,6 +75,26 @@ def test_two_priority_riders_evenly_split_matching_area_jobs(monkeypatch) -> Non
     }
 
 
+def test_pasted_piority_load_is_normalised_to_priority() -> None:
+    rider_df = pd.DataFrame(
+        [
+            {
+                "Rider Name": "Chen Yen Zong (El-Tian)",
+                "Start Location": "Whampoa",
+                "Start Zone": "Central",
+                "Max Jobs": 4,
+                "Rider Load": "Piority",
+            }
+        ]
+    )
+
+    riders, errors = optimizer.validate_riders(rider_df)
+
+    assert errors == []
+    assert riders[0].load_level == "Priority"
+    assert optimizer.normalise_rider_load_level(" PIORITY ") == "Priority"
+
+
 def test_geocode_batch_deduplicates_places_and_runs_distinct_places_in_parallel(monkeypatch) -> None:
     state_lock = Lock()
     active = 0
