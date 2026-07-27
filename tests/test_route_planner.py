@@ -6,8 +6,8 @@ import json
 import pandas as pd
 import pytest
 
-from Flexar.BlueSG import vehicle_route_optimizer as optimizer
-from Flexar.BlueSG.route_planner import (
+from Flexar.BlueSG import build_optimised_vehicle_routes as optimizer
+from Flexar.BlueSG.manual_route_assignment_editing_and_recalculation import (
     UNASSIGNED_LANE,
     RESHUFFLE_POOL_LANE,
     assignment_from_routes,
@@ -44,7 +44,7 @@ from Flexar.BlueSG.route_planner import (
     validate_assignment_board,
     validate_locked_rider_change,
 )
-from Flexar.BlueSG.vehicle_route_optimizer import (
+from Flexar.BlueSG.build_optimised_vehicle_routes import (
     GeocodeResult,
     RiderState,
     SUMMARY_COLUMNS,

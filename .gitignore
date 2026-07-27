@@ -1,4 +1,9 @@
-.env
+# Secrets must stay local at every folder depth.
+**/.env
+**/.env.*
+!**/.env.example
+**/.streamlit/secrets.toml
+
 .venv/
 .pytest_cache/
 **/__pycache__/
@@ -10,7 +15,6 @@ Lance/Tender/Excel Sheets/*.xlsx
 
 streamlit.err.log
 streamlit.out.log
-.streamlit/secrets.toml
 
 *.db
 *.sqlite
@@ -21,12 +25,24 @@ streamlit.out.log
 chrome_profiles/
 data/whatsapp_messages.sqlite
 data/whatsapp_images/
-Flexar/BlueSG/cache/runtime/
 
-# Local downloads and portable applications (thousands of generated files).
+# BlueSG runtime state. Streamlit Community Cloud storage is temporary, and
+# live rider data must never be committed.
+Flexar/BlueSG/data/weekday_rider_availability_and_capacity_roster.xlsx
+Flexar/BlueSG/data/cache/runtime/
+/runs/
+/artifacts/
+
+# Local downloads and portable applications.
 tools/_downloads/
-tools/LibreOfficePortable*/
-tools/PortableApps/
 
+# Staff, candidate, uploaded-report, and business export data.
+Streamlit Version/Hiring Folder.xlsx
+Streamlit Version/resumes/
+Streamlit Version/jd/
+Streamlit Version/exports/
+HR/RDL/uploaded_rdl/
+HR/RDL/parsed_json/
 HR/RDL_Parsed/
+Lance/Sesami/Excel Sheets/
 Lance/HRIQ_Report_Tool/logs/*.log*

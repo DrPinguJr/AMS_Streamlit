@@ -37,9 +37,9 @@ Lance-owned tools live under `Lance/`, including:
 
 Flexar-specific tools live under `Flexar/`.
 
-- BlueSG Vehicle Route Optimiser: `Flexar/BlueSG/Vehicle_Route_Optimiser.py`
+- BlueSG Vehicle Route Optimiser: `Flexar/BlueSG/pages/create_optimised_vehicle_routes_page.py`
 
-BlueSG OneMap credentials are read from Streamlit secrets in deployment and from the local `.env` file in development. Runtime cache files are written under `Flexar/BlueSG/cache/runtime/`.
+BlueSG OneMap credentials are read from Streamlit secrets in deployment and from the local `.env` file in development. Runtime cache files are written under `Flexar/BlueSG/data/cache/runtime/`.
 
 ### Contracts Tools
 
@@ -51,9 +51,9 @@ Contract generators live under `Contracts/`.
 
 ## Streamlit Community Cloud Deployment
 
-Streamlit Community Cloud installs Python packages from `requirements.txt` and Linux system packages from `packages.txt`. Reboot the Streamlit app after adding or changing `packages.txt` so the system packages are installed.
+Streamlit Community Cloud installs Python packages from `requirements.txt`.
 
-Contract PDF generation uses headless LibreOffice rather than Microsoft Word. The Liberation and DejaVu font packages provide Linux-compatible fallbacks for fonts referenced by the existing DOCX templates; the source templates are left unchanged.
+Contract PDF generation uses an invisible Microsoft Word instance on Windows. DOCX generation remains available on systems without Microsoft Word.
 
 ## Useful Commands
 

@@ -2,148 +2,163 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-MISSING_LIBREOFFICE_MESSAGE = (
-    'LibreOffice was not found. Add "libreoffice" to packages.txt and reboot the Streamlit app.'
+PDF_CONVERTER_NAME = "Microsoft Word"
+MISSING_PDF_CONVERTER_MESSAGE = (
+    "Contract PDF generation requires Microsoft Word on Windows. "
+    "Microsoft Word was not found; use a DOCX download where one is offered."
+)
+MISSING_WORD_AUTOMATION_MESSAGE = (
+    "Contract PDF generation requires the Windows Word automation package. "
+    "Install the project requirements and restart the app."
 )
 
 
-class LibreOfficeNotFoundError(RuntimeError):
-    """Raised when no supported LibreOffice executable is available."""
+class PdfConverterUnavailableError(RuntimeError):
+    """Raised when Microsoft Word PDF conversion is unavailable."""
 
 
 class DocxToPdfConversionError(RuntimeError):
-    """Raised when LibreOffice cannot produce a valid PDF from a DOCX file."""
+    """Raised when Microsoft Word cannot produce a valid PDF from a DOCX file."""
 
 
 @dataclass(frozen=True)
-class LibreOfficeStatus:
-    """Availability and version details for the configured PDF converter."""
+class PdfConverterStatus:
+    """Availability details for the configured PDF converter."""
 
     available: bool
+    converter: str
     executable: str | None
-    version: str | None
     error: str | None = None
 
 
-def _standard_libreoffice_paths() -> tuple[Path, ...]:
-    """Return common LibreOffice locations not normally covered by PATH."""
-    return (
-        Path("/usr/bin/libreoffice"),
-        Path("/usr/bin/soffice"),
-        Path("/usr/lib/libreoffice/program/soffice"),
-        Path("/snap/bin/libreoffice"),
-        Path("/Applications/LibreOffice.app/Contents/MacOS/soffice"),
-        Path("C:/Program Files/LibreOffice/program/soffice.exe"),
-        Path("C:/Program Files (x86)/LibreOffice/program/soffice.exe"),
-        PROJECT_ROOT
-        / "tools"
-        / "LibreOfficePortable"
-        / "App"
-        / "libreoffice"
-        / "program"
-        / "soffice.exe",
-        PROJECT_ROOT
-        / "tools"
-        / "LibreOfficePortable"
-        / "LibreOfficePortable"
-        / "App"
-        / "libreoffice"
-        / "program"
-        / "soffice.exe",
-        PROJECT_ROOT
-        / "tools"
-        / "PortableApps"
-        / "LibreOfficePortable"
-        / "App"
-        / "libreoffice"
-        / "program"
-        / "soffice.exe",
+def _standard_microsoft_word_paths() -> tuple[Path, ...]:
+    """Return common Microsoft Word executable locations."""
+    roots = [
+        os.getenv("ProgramFiles", ""),
+        os.getenv("ProgramFiles(x86)", ""),
+        os.getenv("ProgramW6432", ""),
+    ]
+    office_directories = (
+        Path("Microsoft Office") / "root" / "Office16",
+        Path("Microsoft Office") / "Office16",
+        Path("Microsoft Office") / "Office15",
+        Path("Microsoft Office") / "Office14",
     )
 
+    candidates: list[Path] = []
+    for root in roots:
+        if not root:
+            continue
+        for office_directory in office_directories:
+            candidates.append(Path(root) / office_directory / "WINWORD.EXE")
+    return tuple(dict.fromkeys(candidates))
 
-def find_libreoffice() -> str | None:
-    """Find a usable LibreOffice executable, preferring normal system installs."""
-    configured_path = os.getenv("LIBREOFFICE_PATH", "").strip()
+
+def _registered_microsoft_word_paths() -> tuple[Path, ...]:
+    """Return Word paths registered with Windows, when available."""
+    if os.name != "nt":
+        return ()
+
+    try:
+        import winreg
+    except ImportError:
+        return ()
+
+    key_names = (
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\WINWORD.EXE",
+        r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\WINWORD.EXE",
+    )
+    candidates: list[Path] = []
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        for key_name in key_names:
+            try:
+                with winreg.OpenKey(hive, key_name) as key:
+                    value, _ = winreg.QueryValueEx(key, "")
+            except OSError:
+                continue
+            if value:
+                candidates.append(Path(str(value).strip().strip('"')))
+    return tuple(dict.fromkeys(candidates))
+
+
+def find_microsoft_word() -> str | None:
+    """Find the Microsoft Word executable without starting another process."""
+    configured_path = os.getenv("MICROSOFT_WORD_PATH", "").strip()
     if configured_path:
         configured_command = shutil.which(configured_path)
         configured_candidate = Path(configured_command or configured_path).expanduser()
         if configured_candidate.is_file():
             return str(configured_candidate.resolve())
 
-    for executable_name in ("libreoffice", "soffice"):
-        executable = shutil.which(executable_name)
-        if executable:
-            return str(Path(executable).resolve())
+    executable = shutil.which("winword")
+    if executable:
+        return str(Path(executable).resolve())
 
-    for candidate in _standard_libreoffice_paths():
+    for candidate in (
+        *_registered_microsoft_word_paths(),
+        *_standard_microsoft_word_paths(),
+    ):
         if candidate.is_file():
             return str(candidate.resolve())
     return None
 
 
-def get_libreoffice_status(timeout_seconds: float = 10) -> LibreOfficeStatus:
-    """Report LibreOffice availability, executable path, and installed version."""
-    executable = find_libreoffice()
-    if executable is None:
-        return LibreOfficeStatus(
+def _load_word_automation() -> tuple[Any, Any]:
+    """Load pywin32 lazily so DOCX generation remains cross-platform."""
+    try:
+        import pythoncom
+        import win32com.client
+    except ImportError as exc:
+        raise PdfConverterUnavailableError(MISSING_WORD_AUTOMATION_MESSAGE) from exc
+    return pythoncom, win32com.client
+
+
+def get_pdf_converter_status() -> PdfConverterStatus:
+    """Report Word PDF-conversion availability without launching Word."""
+    if os.name != "nt":
+        return PdfConverterStatus(
             available=False,
+            converter=PDF_CONVERTER_NAME,
             executable=None,
-            version=None,
-            error=MISSING_LIBREOFFICE_MESSAGE,
+            error=MISSING_PDF_CONVERTER_MESSAGE,
         )
 
     try:
-        result = subprocess.run(
-            [executable, "--version"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=timeout_seconds,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return LibreOfficeStatus(
-            available=True,
-            executable=executable,
-            version=None,
-            error=f"LibreOffice version check failed: {type(exc).__name__}: {exc}",
+        _load_word_automation()
+    except PdfConverterUnavailableError as exc:
+        return PdfConverterStatus(
+            available=False,
+            converter=PDF_CONVERTER_NAME,
+            executable=find_microsoft_word(),
+            error=str(exc),
         )
 
-    version = (result.stdout.strip() or result.stderr.strip()) if result.returncode == 0 else None
-    error = None
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or "No diagnostic output was returned."
-        error = f"LibreOffice version check exited with code {result.returncode}: {detail}"
-    return LibreOfficeStatus(
+    executable = find_microsoft_word()
+    if executable is None:
+        return PdfConverterStatus(
+            available=False,
+            converter=PDF_CONVERTER_NAME,
+            executable=None,
+            error=MISSING_PDF_CONVERTER_MESSAGE,
+        )
+
+    return PdfConverterStatus(
         available=True,
+        converter=PDF_CONVERTER_NAME,
         executable=executable,
-        version=version,
-        error=error,
     )
-
-
-def _conversion_failure_detail(result: subprocess.CompletedProcess[str]) -> str:
-    details = []
-    if result.stdout.strip():
-        details.append(f"stdout: {result.stdout.strip()}")
-    if result.stderr.strip():
-        details.append(f"stderr: {result.stderr.strip()}")
-    return " | ".join(details) or "LibreOffice returned no diagnostic output."
 
 
 def convert_docx_to_pdf(
     docx_path: str | Path,
     output_directory: str | Path | None = None,
-    *,
-    timeout_seconds: float = 120,
 ) -> Path:
-    """Convert one DOCX to PDF with headless LibreOffice and an isolated profile."""
+    """Convert one DOCX to PDF through an invisible Microsoft Word instance."""
     source = Path(docx_path).expanduser().resolve()
     if not source.exists():
         raise FileNotFoundError(f"DOCX file was not found: {source}")
@@ -161,9 +176,9 @@ def convert_docx_to_pdf(
         raise ValueError(f"PDF output directory is not a directory: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    executable = find_libreoffice()
-    if executable is None:
-        raise LibreOfficeNotFoundError(MISSING_LIBREOFFICE_MESSAGE)
+    status = get_pdf_converter_status()
+    if not status.available:
+        raise PdfConverterUnavailableError(status.error or MISSING_PDF_CONVERTER_MESSAGE)
 
     expected_pdf = output_dir / f"{source.stem}.pdf"
     if expected_pdf.exists():
@@ -174,57 +189,50 @@ def convert_docx_to_pdf(
                 f"Could not replace the existing PDF file: {expected_pdf}"
             ) from exc
 
-    with tempfile.TemporaryDirectory(prefix="libreoffice_profile_") as profile_dir_name:
-        profile_dir = Path(profile_dir_name).resolve()
-        profile_uri = profile_dir.as_uri()
-        command = [
-            executable,
-            f"-env:UserInstallation={profile_uri}",
-            "--headless",
-            "--nologo",
-            "--nodefault",
-            "--nofirststartwizard",
-            "--convert-to",
-            "pdf:writer_pdf_Export",
-            "--outdir",
-            str(output_dir),
+    pythoncom, word_client = _load_word_automation()
+    word = None
+    document = None
+    pythoncom.CoInitialize()
+    try:
+        word = word_client.DispatchEx("Word.Application")
+        word.Visible = False
+        word.DisplayAlerts = 0
+        document = word.Documents.Open(
             str(source),
-        ]
-
-        try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=timeout_seconds,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise DocxToPdfConversionError(
-                f"LibreOffice timed out after {timeout_seconds:g} seconds while converting {source.name}."
-            ) from exc
-        except OSError as exc:
-            raise DocxToPdfConversionError(
-                f"LibreOffice could not be started from {executable}: {type(exc).__name__}: {exc}"
-            ) from exc
-
-    if result.returncode != 0:
-        raise DocxToPdfConversionError(
-            f"LibreOffice failed to convert {source.name} (exit code {result.returncode}). "
-            f"{_conversion_failure_detail(result)}"
+            ReadOnly=True,
+            AddToRecentFiles=False,
+            Visible=False,
         )
+        document.ExportAsFixedFormat(str(expected_pdf), 17)
+    except Exception as exc:
+        raise DocxToPdfConversionError(
+            f"Microsoft Word could not convert {source.name}: {type(exc).__name__}: {exc}"
+        ) from exc
+    finally:
+        if document is not None:
+            try:
+                document.Close(False)
+            except Exception:
+                pass
+        if word is not None:
+            try:
+                word.Quit(False)
+            except Exception:
+                pass
+        pythoncom.CoUninitialize()
+
     if not expected_pdf.is_file():
         raise DocxToPdfConversionError(
-            f"LibreOffice reported success but did not create the expected PDF: {expected_pdf}"
+            f"Microsoft Word did not create the expected PDF: {expected_pdf}"
         )
     if expected_pdf.stat().st_size == 0:
         raise DocxToPdfConversionError(
-            f"LibreOffice created an empty PDF file: {expected_pdf}"
+            f"Microsoft Word created an empty PDF file: {expected_pdf}"
         )
     with expected_pdf.open("rb") as pdf_file:
         signature = pdf_file.read(4)
     if signature != b"%PDF":
         raise DocxToPdfConversionError(
-            f"LibreOffice output is not a valid PDF file: {expected_pdf}"
+            f"Microsoft Word output is not a valid PDF file: {expected_pdf}"
         )
     return expected_pdf

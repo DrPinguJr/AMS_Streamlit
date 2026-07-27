@@ -5,8 +5,8 @@ import time
 
 import pandas as pd
 
-from Flexar.BlueSG import vehicle_route_optimizer as optimizer
-from Flexar.BlueSG.vehicle_route_optimizer import GeocodeResult, RiderState, TravelCost
+from Flexar.BlueSG import build_optimised_vehicle_routes as optimizer
+from Flexar.BlueSG.build_optimised_vehicle_routes import GeocodeResult, RiderState, TravelCost
 
 
 def _east_jobs(count: int) -> pd.DataFrame:
@@ -75,24 +75,59 @@ def test_two_priority_riders_evenly_split_matching_area_jobs(monkeypatch) -> Non
     }
 
 
-def test_pasted_piority_load_is_normalised_to_priority() -> None:
+def test_full_pasted_roster_load_aliases_are_accepted_and_normalised() -> None:
+    pasted_roster = """\
+Chen Yen Zong (El-Tian)\tWhampoa\tCentral\t4\tPiority
+Raihan\tCommon Wealth\tCentral\t2\tNormal
+Zhi Ming\tTampaines\tEast\t3\tPiority
+Matthias Laurence\tTampaines\tEast\t2\tNormal
+Chean Zheng Tao Clifford\tTampaines\tEast\t1\tLow
+Safuwan\tWoodlands\tNorth\t4\tPiority
+Ooi Kin Soon\tWoodlands\tNorth\t2\tNormal
+Syed Muhammad Faiq Bin Bagal\tMarsiling \tNorth\t2\tNormal
+Sufi\tYishun\tNorth\t2\tNormal
+Chong Zhen Yang (Michael)\tCompassvale\tNorth-East\t2\tNormal
+Asiah\tSkengkang\tNorth-East\t2\tNormal
+Arin Joshua Daniel\tAng Mo Kio\tNorth-East\t2\tNormal
+Gary Koh Foo Choy \tSkengkang\tNorth-East\t3\tPiority
+Raymond\tYew Tee\tNorth-West\t2\tNormal
+Lim Choon Yong Lester\tJurong\tWest\t5\tPiority"""
     rider_df = pd.DataFrame(
-        [
-            {
-                "Rider Name": "Chen Yen Zong (El-Tian)",
-                "Start Location": "Whampoa",
-                "Start Zone": "Central",
-                "Max Jobs": 4,
-                "Rider Load": "Piority",
-            }
-        ]
+        [line.split("\t") for line in pasted_roster.splitlines()],
+        columns=optimizer.RIDER_COLUMNS,
     )
 
     riders, errors = optimizer.validate_riders(rider_df)
 
     assert errors == []
-    assert riders[0].load_level == "Priority"
+    assert [rider.load_level for rider in riders] == [
+        "Priority",
+        "Medium",
+        "Priority",
+        "Medium",
+        "Low",
+        "Priority",
+        "Medium",
+        "Medium",
+        "Medium",
+        "Medium",
+        "Medium",
+        "Medium",
+        "Priority",
+        "Medium",
+        "Priority",
+    ]
+    assert {"Normal", "Piority"} <= set(optimizer.RIDER_LOAD_INPUT_OPTIONS)
+    assert all(
+        optimizer.normalise_rider_load_level(value) in optimizer.RIDER_LOAD_LEVELS
+        for value in optimizer.RIDER_LOAD_INPUT_OPTIONS
+    )
     assert optimizer.normalise_rider_load_level(" PIORITY ") == "Priority"
+
+    app_source = (
+        optimizer.BASE_DIR / "pages" / "create_optimised_vehicle_routes_page.py"
+    ).read_text(encoding="utf-8")
+    assert "options=RIDER_LOAD_INPUT_OPTIONS" in app_source
 
 
 def test_geocode_batch_deduplicates_places_and_runs_distinct_places_in_parallel(monkeypatch) -> None:
@@ -130,7 +165,7 @@ def test_geocode_batch_deduplicates_places_and_runs_distinct_places_in_parallel(
 
 def test_north_west_is_available_as_a_rider_zone() -> None:
     app_source = (
-        optimizer.BASE_DIR / "Vehicle_Route_Optimiser.py"
+        optimizer.BASE_DIR / "pages" / "create_optimised_vehicle_routes_page.py"
     ).read_text(encoding="utf-8")
 
     assert '"North-West"' in app_source

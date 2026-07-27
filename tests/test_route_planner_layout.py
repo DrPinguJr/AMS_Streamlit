@@ -6,7 +6,18 @@ from pathlib import Path
 import streamlit as st
 
 
-VIEWER = Path(__file__).parents[1] / "Flexar" / "BlueSG" / "Route_Map_Viewer.py"
+BLUESG_DIR = Path(__file__).parents[1] / "Flexar" / "BlueSG"
+VIEWER = (
+    BLUESG_DIR
+    / "pages"
+    / "review_map_and_manually_adjust_route_assignments_page.py"
+)
+ROUTE_BOARD_COMPONENT = (
+    BLUESG_DIR
+    / "components"
+    / "drag_and_drop_route_assignment_board"
+    / "index.html"
+)
 
 
 def current_focus_source() -> str:
@@ -43,7 +54,7 @@ def test_focus_map_and_panel_use_stretch_height_and_stable_keys() -> None:
 
 
 def test_sortable_focus_styles_force_one_full_width_vertical_stack() -> None:
-    component = (VIEWER.parent / "route_board_component" / "index.html").read_text(encoding="utf-8")
+    component = ROUTE_BOARD_COMPONENT.read_text(encoding="utf-8")
     assert '#board { width: 100%' in component
     assert '.lane { width: 100%' in component
     assert "boardElement.appendChild(laneElement)" in component
@@ -51,7 +62,7 @@ def test_sortable_focus_styles_force_one_full_width_vertical_stack() -> None:
 
 def test_sortable_panel_uses_parent_scroll_without_resize_feedback_loop() -> None:
     viewer = VIEWER.read_text(encoding="utf-8")
-    component = (VIEWER.parent / "route_board_component" / "index.html").read_text(encoding="utf-8")
+    component = ROUTE_BOARD_COMPONENT.read_text(encoding="utf-8")
     assert "height: calc(100dvh - 238px)" not in component
     assert "window.parent.innerHeight - top" in component
     assert "React" not in component
@@ -64,7 +75,7 @@ def test_sortable_panel_uses_parent_scroll_without_resize_feedback_loop() -> Non
 def test_focus_layout_exposes_locking_reshuffle_and_three_route_colours() -> None:
     source = current_focus_source()
     assert "Riders start locked" in source
-    component = (VIEWER.parent / "route_board_component" / "index.html").read_text(encoding="utf-8")
+    component = ROUTE_BOARD_COMPONENT.read_text(encoding="utf-8")
     assert 'label.className = "lock"' in component
     assert 'checkbox.type = "checkbox"' in component
     assert "reshuffle_unlocked_assignments" in source
@@ -79,7 +90,7 @@ def test_focus_layout_exposes_locking_reshuffle_and_three_route_colours() -> Non
 
 def test_rider_panel_is_wide_and_pool_has_local_reshuffle_action() -> None:
     source = current_focus_source()
-    component = (VIEWER.parent / "route_board_component" / "index.html").read_text(encoding="utf-8")
+    component = ROUTE_BOARD_COMPONENT.read_text(encoding="utf-8")
     assert "st.columns([1.2, 1]" in source
     assert "Reshuffle into unlocked riders" in component
     assert 'emit("reshuffle")' in component
@@ -97,7 +108,7 @@ def test_rider_headers_include_exact_start_location() -> None:
 
 
 def test_clicking_unlocked_order_adds_it_to_pool_without_scrolling() -> None:
-    component = (VIEWER.parent / "route_board_component" / "index.html").read_text(encoding="utf-8")
+    component = ROUTE_BOARD_COMPONENT.read_text(encoding="utf-8")
     assert 'card.addEventListener("click"' in component
     assert "poolLane.items.push(selected)" in component
     assert 'locked.has(lane.lane_id)' in component
@@ -105,7 +116,7 @@ def test_clicking_unlocked_order_adds_it_to_pool_without_scrolling() -> None:
 
 
 def test_rider_header_has_default_off_view_highlight_control() -> None:
-    component = (VIEWER.parent / "route_board_component" / "index.html").read_text(encoding="utf-8")
+    component = ROUTE_BOARD_COMPONENT.read_text(encoding="utf-8")
     assert 'focusCheckbox.type = "checkbox"' in component
     assert "focusCheckbox.checked = highlighted.has(lane.lane_id)" in component
     assert 'emit("highlight")' in component

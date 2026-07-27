@@ -14,12 +14,12 @@ recruitment = st.Page(
 converter = st.Page("Lance/Converter/Converter.py", title="Converter", icon=":material/transform:")
 whatsapp = st.Page("Lance/whatsapp/WhatsApp.py", title="WhatsApp Monitor", icon=":material/chat:")
 bluesg = st.Page(
-    "Flexar/BlueSG/Vehicle_Route_Optimiser.py",
+    "Flexar/BlueSG/pages/create_optimised_vehicle_routes_page.py",
     title="Vehicle Route Optimiser",
     icon=":material/route:",
 )
 bluesg_map = st.Page(
-    "Flexar/BlueSG/Route_Map_Viewer.py",
+    "Flexar/BlueSG/pages/review_map_and_manually_adjust_route_assignments_page.py",
     title="Route Planner",
     icon=":material/map:",
 )

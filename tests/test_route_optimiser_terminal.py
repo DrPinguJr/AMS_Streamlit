@@ -2,11 +2,17 @@ from pathlib import Path
 
 import pandas as pd
 
-from Flexar.BlueSG import vehicle_route_optimizer as optimizer
-from Flexar.BlueSG.vehicle_route_optimizer import RiderState, TravelCost
+from Flexar.BlueSG import build_optimised_vehicle_routes as optimizer
+from Flexar.BlueSG.build_optimised_vehicle_routes import RiderState, TravelCost
 
 
-APP = Path(__file__).parents[1] / "Flexar" / "BlueSG" / "Vehicle_Route_Optimiser.py"
+APP = (
+    Path(__file__).parents[1]
+    / "Flexar"
+    / "BlueSG"
+    / "pages"
+    / "create_optimised_vehicle_routes_page.py"
+)
 
 
 def test_progress_terminal_keeps_explanatory_scrollable_history() -> None:
@@ -23,6 +29,9 @@ def test_progress_terminal_keeps_explanatory_scrollable_history() -> None:
     assert "comparison_count % 100 == 0" in source
     assert 'f"Why this driver: {simple_reason}"' in source
     assert 'detail_parts.append(("Why this driver", simple_reason))' in source
+    assert "Driver's route order" in source
+    assert "Driver starts this order from" in source
+    assert "Starting point type" in source
     assert 'if not hasattr(_route_optimizer_backend, "cache_unique_geocodes")' in source
     assert 'batch_geocoder = getattr(_route_optimizer_backend, "cache_unique_geocodes", None)' in source
 
@@ -69,3 +78,76 @@ def test_assignment_progress_events_include_car_and_final_rider(monkeypatch) -> 
     assert assignment["current_region"] == "east_core"
     assert final["current_car_plate"] == "SBA1234A"
     assert final["current_rider"] == "Rider One"
+    assert final["driver_order_number"] == 1
+    assert final["driver_total_orders"] == 1
+    assert final["driver_orders_before_this"] == 0
+    assert final["driver_location_before_order"] == "Tampines"
+    assert final["driver_location_source"] == "Driver's starting location"
+
+
+def test_final_progress_explains_second_order_and_previous_dropoff(monkeypatch) -> None:
+    jobs = pd.DataFrame(
+        [
+            {
+                "Uploaded Row": 2,
+                "_original_order": 0,
+                "Car Plate": "SBA1234A",
+                "Pickup Address": "Tampines",
+                "Pickup Lot": "A1",
+                "Drop-off Address": "Bedok",
+                "Pickup Zone": "East",
+                "Drop-off Zone": "East",
+            },
+            {
+                "Uploaded Row": 3,
+                "_original_order": 1,
+                "Car Plate": "SBB5678B",
+                "Pickup Address": "Bedok",
+                "Pickup Lot": "B2",
+                "Drop-off Address": "Kallang",
+                "Pickup Zone": "East",
+                "Drop-off Zone": "Central",
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        optimizer,
+        "get_empty_travel_cost",
+        lambda *args, **kwargs: TravelCost(1, 5, "test"),
+    )
+    monkeypatch.setattr(
+        optimizer,
+        "get_travel_cost",
+        lambda *args, **kwargs: TravelCost(2, 8, "test"),
+    )
+    events = []
+
+    route_df, _, _ = optimizer.optimise_vehicle_routes(
+        jobs,
+        [RiderState("Rider One", "Tampines", "East")],
+        use_onemap=False,
+        progress_callback=events.append,
+    )
+
+    final_events = [
+        event for event in events if event.get("event_type") == "final_assignment"
+    ]
+    assert len(final_events) == 2
+
+    first_order, second_order = final_events
+    assert first_order["driver_order_number"] == 1
+    assert first_order["driver_total_orders"] == 2
+    assert first_order["driver_orders_before_this"] == 0
+    assert first_order["driver_location_before_order"] == "Tampines"
+    assert first_order["driver_location_source"] == "Driver's starting location"
+
+    assert second_order["driver_order_number"] == 2
+    assert second_order["driver_total_orders"] == 2
+    assert second_order["driver_orders_before_this"] == 1
+    assert second_order["driver_location_before_order"] == first_order["current_dropoff"]
+    assert second_order["driver_location_source"] == "Previous order's drop-off location"
+
+    ordered_routes = route_df.sort_values("Sequence", kind="stable").reset_index(drop=True)
+    for event, (_, route_row) in zip(final_events, ordered_routes.iterrows(), strict=True):
+        assert event["driver_order_number"] == int(route_row["Sequence"])
+        assert event["driver_location_before_order"] == route_row["Start From"]

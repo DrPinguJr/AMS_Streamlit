@@ -14,8 +14,8 @@ st.page_link("Lance/whatsapp/WhatsApp.py", label="WhatsApp Monitor", icon=":mate
 
 st.subheader("Flexar")
 
-st.page_link("Flexar/BlueSG/Vehicle_Route_Optimiser.py", label="Vehicle Route Optimiser", icon=":material/route:")
-st.page_link("Flexar/BlueSG/Route_Map_Viewer.py", label="Route Map Viewer", icon=":material/map:")
+st.page_link("Flexar/BlueSG/pages/create_optimised_vehicle_routes_page.py", label="Vehicle Route Optimiser", icon=":material/route:")
+st.page_link("Flexar/BlueSG/pages/review_map_and_manually_adjust_route_assignments_page.py", label="Route Map Viewer", icon=":material/map:")
 st.page_link("Flexar/whatsapp_request_processor/app.py", label="WhatsApp Request Processor", icon=":material/forum:")
 
 st.subheader("Contracts")

@@ -5,8 +5,8 @@ from datetime import date, time
 import pandas as pd
 import pytest
 
-from Flexar.BlueSG.operation_context import OperationContext
-from Flexar.BlueSG.vehicle_route_optimizer import RiderState
+from Flexar.BlueSG.route_operation_time_window_settings import OperationContext
+from Flexar.BlueSG.build_optimised_vehicle_routes import RiderState
 
 
 @pytest.fixture
@@ -46,4 +46,3 @@ def regression_riders() -> list[RiderState]:
         RiderState("East Rider", "Tampines", "East", max_jobs=1),
         RiderState("West Rider", "Jurong", "West", max_jobs=1),
     ]
-

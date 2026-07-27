@@ -13,7 +13,7 @@ from Contracts.generators.cfs_generator import (
 )
 from Contracts.shared.batch_utils import normalize_dataframe
 from Contracts.shared.file_utils import sanitize_filename_for_legacy_docx
-from Contracts.shared.pdf_utils import get_libreoffice_status
+from Contracts.shared.pdf_utils import get_pdf_converter_status
 
 # Ensure page configuration is set (if not already set by app.py)
 try:
@@ -407,7 +407,7 @@ def render_bulk_contract_generator() -> None:
             )
             st.dataframe(row_errors, hide_index=True, width="stretch")
 
-        converter_status = get_libreoffice_status()
+        converter_status = get_pdf_converter_status()
         debug_converter = os.getenv("PDF_CONVERTER_DEBUG", "").strip().casefold() in {
             "1",
             "true",
@@ -419,8 +419,8 @@ def render_bulk_contract_generator() -> None:
         if debug_converter or not converter_status.available:
             with st.expander("PDF converter diagnostics", expanded=False):
                 st.write(f"Available: {'Yes' if converter_status.available else 'No'}")
+                st.write(f"Converter: {converter_status.converter}")
                 st.write(f"Executable: {converter_status.executable or 'Not found'}")
-                st.write(f"Version: {converter_status.version or 'Unavailable'}")
                 if converter_status.error:
                     st.write(f"Diagnostic: {converter_status.error}")
 
@@ -458,7 +458,7 @@ def render_bulk_contract_generator() -> None:
                     progress.empty()
                     st.error(
                         "No PDF contracts were generated. Review the failure summary below "
-                        "and the LibreOffice diagnostics above."
+                        "and the PDF converter diagnostics above."
                     )
                 else:
                     st.session_state["bulk_contract_gen_zip_bytes"] = result.zip_bytes

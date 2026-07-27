@@ -2,7 +2,7 @@ import unittest
 
 import pandas as pd
 
-from Flexar.BlueSG.vehicle_route_optimizer import (
+from Flexar.BlueSG.build_optimised_vehicle_routes import (
     RiderState,
     build_jobs_by_stable_id,
     find_best_selective_reshuffle,
