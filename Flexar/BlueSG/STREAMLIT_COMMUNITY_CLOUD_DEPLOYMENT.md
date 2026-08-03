@@ -1,18 +1,18 @@
-# BlueSG Optimiser: Streamlit Community Cloud Deployment
+# AMS / BlueSG: Streamlit Community Cloud Deployment
 
-This deployment runs only the BlueSG optimiser. The repository's root `app.py`
-is for local use and includes Windows-only and local-service features. **Do not
-select the root `app.py` when creating the Cloud app.**
+The repository supports two authenticated Cloud entrypoints:
 
-As a defence-in-depth measure, the root `app.py` detects Linux and hands off to
-the same authenticated BlueSG-only router. This protects an existing app that
-was accidentally configured with the root entrypoint. The dedicated entrypoint
-below remains the supported deployment because it also selects the minimal
-pinned dependency file beside it.
+- `app.py` exposes the complete AMS navigation after the shared password login.
+- `Flexar/BlueSG/streamlit_app.py` exposes only the BlueSG route tools.
+
+Both entrypoints use the existing `APP_PASSWORD` gate on Linux. Select `app.py`
+when the deployed app must include Home, Lance, Flexar, Contracts, and HR. Some
+desktop integrations may still require Windows or a local service even though
+their navigation entries remain available on Community Cloud.
 
 ## Deployment settings
 
-Use these exact values in Streamlit Community Cloud:
+Use these values for a BlueSG-only deployment:
 
 | Setting | Value |
 | --- | --- |
@@ -88,7 +88,7 @@ Confirm that:
 - the app reports no exception in the terminal or browser.
 
 Stop this local check before deploying. Never use the root `app.py` for this
-test.
+BlueSG-only test; use it when testing the complete AMS workspace.
 
 ## Deploy
 
@@ -140,10 +140,11 @@ not a file left inside the app, is the durable output.
 
 ## Troubleshooting
 
-### The app opens the full AMS system
+### Choosing between the full workspace and BlueSG only
 
-The wrong entrypoint was selected. Change the main file path to
-`Flexar/BlueSG/streamlit_app.py`. Do not use `app.py` or `Home.py`.
+Use `app.py` for the complete authenticated AMS navigation. Use
+`Flexar/BlueSG/streamlit_app.py` when the deployment should expose only the
+BlueSG optimiser and route planner. Do not use `Home.py` as the entrypoint.
 
 ### The app says deployment is locked
 

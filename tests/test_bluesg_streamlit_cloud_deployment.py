@@ -4,7 +4,9 @@ import ast
 import importlib
 import os
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+
+import pytest
 
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
@@ -52,30 +54,19 @@ def test_cloud_entrypoint_exposes_only_existing_bluesg_pages() -> None:
         assert (BLUESG_DIR / "pages" / target).is_file()
 
 
-def test_both_entrypoints_use_the_shared_cloud_router() -> None:
+def test_dedicated_entrypoint_uses_the_bluesg_router() -> None:
     dedicated_source = STREAMLIT_ENTRYPOINT.read_text(encoding="utf-8")
-    root_source = ROOT_ENTRYPOINT.read_text(encoding="utf-8")
 
     assert "run_bluesg_cloud_app" in dedicated_source
-    assert "should_use_bluesg_cloud_entrypoint" in root_source
-    assert "run_bluesg_cloud_app" in root_source
 
 
-def test_root_entrypoint_guard_cannot_be_disabled_on_linux() -> None:
-    guard = importlib.import_module("Flexar.BlueSG.cloud_deployment_guard")
+def test_root_entrypoint_keeps_full_navigation_behind_cloud_access() -> None:
+    root_source = ROOT_ENTRYPOINT.read_text(encoding="utf-8")
 
-    assert guard.should_use_bluesg_cloud_entrypoint(
-        platform_name="posix",
-        environment={"BLUESG_FORCE_CLOUD_ENTRYPOINT": "false"},
-    ) is True
-    assert guard.should_use_bluesg_cloud_entrypoint(
-        platform_name="nt",
-        environment={},
-    ) is False
-    assert guard.should_use_bluesg_cloud_entrypoint(
-        platform_name="nt",
-        environment={"BLUESG_FORCE_CLOUD_ENTRYPOINT": "true"},
-    ) is True
+    assert "require_cloud_access()" in root_source
+    assert "run_bluesg_cloud_app" not in root_source
+    for navigation_group in ("Home", "Lance", "Flexar", "Contracts", "HR"):
+        assert f'"{navigation_group}"' in root_source
 
 
 def test_cloud_preflight_smoke_imports_the_deployment_stack() -> None:
@@ -103,6 +94,54 @@ def test_cloud_preflight_sanitises_missing_dependency_errors() -> None:
         "sensitive arbitrary exception text" not in failure.display_detail
         for failure in failures
     )
+
+
+def test_cloud_preflight_reloads_a_module_missing_required_exports() -> None:
+    preflight = importlib.import_module("Flexar.BlueSG.cloud_deployment_preflight")
+    stale_module = ModuleType("example_module")
+    refreshed_module = ModuleType("example_module")
+    refreshed_module.required_symbol = object()
+    reload_calls: list[ModuleType] = []
+
+    def importer(module_name: str) -> ModuleType:
+        assert module_name == "example_module"
+        return stale_module
+
+    def reloader(module: ModuleType) -> ModuleType:
+        reload_calls.append(module)
+        return refreshed_module
+
+    loaded_module = preflight.import_module_with_required_exports(
+        "example_module",
+        ("required_symbol",),
+        importer=importer,
+        reloader=reloader,
+    )
+
+    assert loaded_module is refreshed_module
+    assert reload_calls == [stale_module]
+
+
+def test_cloud_preflight_rejects_exports_still_missing_after_reload() -> None:
+    preflight = importlib.import_module("Flexar.BlueSG.cloud_deployment_preflight")
+    stale_module = ModuleType("example_module")
+
+    with pytest.raises(ImportError, match="required_symbol"):
+        preflight.import_module_with_required_exports(
+            "example_module",
+            ("required_symbol",),
+            importer=lambda module_name: stale_module,
+            reloader=lambda module: module,
+        )
+
+
+def test_optimizer_page_guards_named_imports_against_stale_modules() -> None:
+    page_source = (
+        BLUESG_DIR / "pages" / "create_optimised_vehicle_routes_page.py"
+    ).read_text(encoding="utf-8")
+
+    assert "import_module_with_required_exports" in page_source
+    assert "REQUIRED_MODULE_EXPORTS[_module_name]" in page_source
 
 
 def test_cloud_requirements_are_minimal_and_exactly_pinned() -> None:

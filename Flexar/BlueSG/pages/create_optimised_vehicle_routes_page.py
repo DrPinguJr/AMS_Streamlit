@@ -26,6 +26,30 @@ if not hasattr(_route_optimizer_backend, "cache_unique_geocodes"):
 if not hasattr(_route_optimizer_backend, "RIDER_LOAD_INPUT_OPTIONS"):
     _route_optimizer_backend = importlib.reload(_route_optimizer_backend)
 
+from Flexar.BlueSG import cloud_deployment_preflight as _deployment_preflight
+
+if not hasattr(_deployment_preflight, "import_module_with_required_exports"):
+    _deployment_preflight = importlib.reload(_deployment_preflight)
+
+REQUIRED_MODULE_EXPORTS = _deployment_preflight.REQUIRED_MODULE_EXPORTS
+import_module_with_required_exports = (
+    _deployment_preflight.import_module_with_required_exports
+)
+
+# Streamlit hot updates can retain an older imported module even when the page
+# file has already updated. Verify the exact symbols used below and refresh any
+# stale module before Python evaluates the named imports.
+for _module_name in (
+    "Flexar.BlueSG.optimiser_config",
+    "Flexar.BlueSG.vehicle_route_optimiser_v2",
+    "Flexar.BlueSG.v2_daily_roster_source",
+    "Flexar.BlueSG.optimiser_workflow_state",
+):
+    import_module_with_required_exports(
+        _module_name,
+        REQUIRED_MODULE_EXPORTS[_module_name],
+    )
+
 from Flexar.BlueSG.build_optimised_vehicle_routes import (
     DEFAULT_DURATION_BUFFER_MULTIPLIER,
     DEFAULT_DURATION_PENALTY_PER_MIN,
