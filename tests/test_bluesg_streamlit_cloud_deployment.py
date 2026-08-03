@@ -138,7 +138,9 @@ def test_onemap_token_widgets_never_prefill_configured_secrets() -> None:
                 for value in value_keywords
             ), f"{page_path.name} must leave OneMap token inputs blank"
 
-    assert token_widgets >= 2
+    # The optimiser now authenticates automatically from secrets. A manual
+    # token field remains only where an operational page still supports it.
+    assert token_widgets >= 1
 
 
 def test_cloud_login_policy_defaults_by_platform_and_accepts_override(

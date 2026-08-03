@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 import time
 
 import pandas as pd
+from streamlit.runtime import scriptrunner
 
 from Flexar.BlueSG import build_optimised_vehicle_routes as optimizer
 from Flexar.BlueSG.build_optimised_vehicle_routes import GeocodeResult, RiderState, TravelCost
@@ -161,6 +163,33 @@ def test_geocode_batch_deduplicates_places_and_runs_distinct_places_in_parallel(
     assert len(results) == 4
     assert peak_active > 1
     assert sum("313@somerset" in address for address in calls) == 1
+
+
+def test_streamlit_context_probe_is_silent_in_geocode_workers(monkeypatch) -> None:
+    suppress_warning_values: list[bool] = []
+    state_lock = Lock()
+
+    def fake_get_script_run_ctx(suppress_warning: bool = False):
+        with state_lock:
+            suppress_warning_values.append(suppress_warning)
+        return None
+
+    monkeypatch.setattr(
+        scriptrunner,
+        "get_script_run_ctx",
+        fake_get_script_run_ctx,
+    )
+
+    with ThreadPoolExecutor(
+        max_workers=4,
+        thread_name_prefix="bluesg-geocode",
+    ) as pool:
+        context_available = list(
+            pool.map(lambda _: optimizer._streamlit_context_available(), range(4))
+        )
+
+    assert context_available == [False, False, False, False]
+    assert suppress_warning_values == [True, True, True, True]
 
 
 def test_north_west_is_available_as_a_rider_zone() -> None:

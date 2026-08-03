@@ -31,10 +31,14 @@ from Flexar.BlueSG.route_optimisation_result_models import OptimisationRunResult
 from Flexar.BlueSG.route_operation_time_window_settings import OperationContext
 from Flexar.BlueSG.convert_results_to_output_safe_values import sanitize_for_output
 from Flexar.BlueSG.regional_capacity_and_cross_region_assignment_rules import (
+    MAX_ADJACENT_ZONE_TRAVEL_MINUTES,
     RegionalOverflowConfig,
+    SIDE_BY_SIDE_MAX_MINUTES,
+    assess_geographic_assignment,
     build_regional_overflow_context,
     classify_job_region,
     normalize_region,
+    normalize_operational_zone,
     regional_audit_fields,
 )
 from Flexar.BlueSG.travel_cache_keys_and_route_confidence import (
@@ -185,6 +189,12 @@ ROUTE_COLUMNS = [
     "Total Duty Time Min",
     "Adjusted Duty Time Min",
     "Route Validation Status",
+    "Rider Home Zone",
+    "Current Operational Zone",
+    "Pickup Operational Zone",
+    "Geographic Assignment Rank",
+    "Geographic Assignment Status",
+    "Geographic Exception Reason",
     "Job Region",
     "Operational Subregion",
     "Region Confidence",
@@ -656,7 +666,7 @@ def _streamlit_context_available() -> bool:
     try:
         from streamlit.runtime.scriptrunner import get_script_run_ctx
 
-        return get_script_run_ctx() is not None
+        return get_script_run_ctx(suppress_warning=True) is not None
     except Exception:
         return False
 
@@ -2408,6 +2418,12 @@ def evaluate_explicit_rider_sequence(
             if route_lookup_stats is not None:
                 bucket = "cache_hits" if "cache" in empty_cost.source.casefold() else "onemap_requests" if "onemap" in empty_cost.source.casefold() else "fallback_routes"
                 route_lookup_stats[bucket] = route_lookup_stats.get(bucket, 0) + 1
+        geographic_assessment = assess_geographic_assignment(
+            rider.start_zone or rider.start_location,
+            current_zone or current_location,
+            pickup_zone or pickup_address,
+            empty_cost.duration_min,
+        )
         precomputed_loaded = (precomputed_loaded_costs or {}).get(job_id)
         if precomputed_loaded is not None:
             loaded_cost = precomputed_loaded
@@ -2573,6 +2589,16 @@ def evaluate_explicit_rider_sequence(
                     1,
                 ),
                 "Route Validation Status": "",
+                "Rider Home Zone": geographic_assessment.home_zone,
+                "Current Operational Zone": geographic_assessment.current_zone,
+                "Pickup Operational Zone": geographic_assessment.pickup_zone,
+                "Geographic Assignment Rank": geographic_assessment.rank,
+                "Geographic Assignment Status": geographic_assessment.status,
+                "Geographic Exception Reason": (
+                    "Explicit route sequence requires a geographic exception review."
+                    if geographic_assessment.rank >= 3
+                    else ""
+                ),
             }
         )
 
@@ -2728,6 +2754,16 @@ def rebuild_outputs_from_sequences(
         for constraint in constraints
     ]
     route_df.attrs["rider_max_jobs"] = {name: rider.max_jobs for name, rider in rider_by_name.items()}
+    geographic_validation = validate_final_route_geography(route_df)
+    route_df.attrs["geographic_validation"] = sanitize_for_output(geographic_validation)
+    route_df.attrs["geographic_exception_count"] = sum(
+        int(issue["severity"] in {"warning", "error"})
+        for issue in geographic_validation["issues"]
+    )
+    lookup_warnings.extend(
+        f"Geographic assignment warning for {issue.get('car_plate') or issue.get('job_id')}: {issue['reason']}"
+        for issue in geographic_validation["issues"]
+    )
     if regional_context:
         route_df.attrs["regional_capacity"] = sanitize_for_output(regional_context.capacity_rows())
         route_df.attrs["regional_overflow_config"] = regional_overflow_config.to_dict()
@@ -2737,6 +2773,8 @@ def rebuild_outputs_from_sequences(
         )
     if not hard_validation.is_valid:
         raise ValueError("Rebuilt route violates a hard constraint.")
+    if not geographic_validation["valid"]:
+        raise ValueError("Rebuilt route violates a geographic assignment constraint.")
     if jobs_df is not None:
         validate_optimisation_integrity(route_df, jobs_df)
 
@@ -3243,6 +3281,74 @@ def _job_window_status(
     return True, "OK"
 
 
+def validate_final_route_geography(route_df: pd.DataFrame) -> dict[str, Any]:
+    """Validate and explain final cross-zone route decisions."""
+
+    issues: list[dict[str, Any]] = []
+    if route_df is None or route_df.empty:
+        return {"valid": True, "issues": [], "warning_count": 0, "error_count": 0}
+
+    ordered = route_df.sort_values(["Rider", "Sequence"], kind="stable")
+    for _, row in ordered.iterrows():
+        rank_value = pd.to_numeric(
+            row.get("Geographic Assignment Rank"), errors="coerce"
+        )
+        rank = 3 if pd.isna(rank_value) else int(rank_value)
+        if rank < 3:
+            continue
+        exception_reason = clean_text(row.get("Geographic Exception Reason"))
+        justified = bool(exception_reason)
+        issues.append(
+            {
+                "valid": justified,
+                "severity": "warning" if justified else "error",
+                "reason": exception_reason or "Non-adjacent or over-threshold zone assignment",
+                "rider": clean_text(row.get("Rider")),
+                "from_zone": clean_text(row.get("Current Operational Zone")),
+                "pickup_zone": clean_text(row.get("Pickup Operational Zone")),
+                "job_id": row.get("Uploaded Row"),
+                "car_plate": clean_text(row.get("Car Plate")),
+                "travel_minutes": row.get("Empty Duration Min"),
+            }
+        )
+
+    for rider, rider_rows in ordered.groupby("Rider", sort=False):
+        rows = rider_rows.reset_index(drop=True)
+        zones = rows["Pickup Operational Zone"].apply(clean_text).tolist()
+        for index in range(2, len(rows)):
+            if zones[index - 2] and zones[index - 2] == zones[index] != zones[index - 1]:
+                transition_minutes = pd.to_numeric(
+                    rows.loc[[index - 1, index], "Empty Duration Min"],
+                    errors="coerce",
+                ).fillna(math.inf)
+                if float(transition_minutes.max()) <= SIDE_BY_SIDE_MAX_MINUTES:
+                    continue
+                issues.append(
+                    {
+                        "valid": True,
+                        "severity": "warning",
+                        "reason": "Route alternates between operational zones beyond the side-by-side threshold.",
+                        "rider": clean_text(rider),
+                        "from_zone": zones[index - 1],
+                        "pickup_zone": zones[index],
+                        "job_id": rows.loc[index, "Uploaded Row"],
+                        "car_plate": clean_text(rows.loc[index, "Car Plate"]),
+                        "travel_minutes": float(transition_minutes.max()),
+                    }
+                )
+
+    error_count = sum(issue["severity"] == "error" for issue in issues)
+    warning_count = sum(issue["severity"] == "warning" for issue in issues)
+    return {
+        "valid": error_count == 0,
+        "issues": issues,
+        "warning_count": warning_count,
+        "error_count": error_count,
+        "max_adjacent_zone_travel_minutes": MAX_ADJACENT_ZONE_TRAVEL_MINUTES,
+        "side_by_side_max_minutes": SIDE_BY_SIDE_MAX_MINUTES,
+    }
+
+
 def _route_zone_for_job(job: dict[str, Any], key: str) -> str | None:
     address = clean_text(job.get(key))
     zone_key = "Pickup Zone" if key == "Pickup Address" else "Drop-off Zone"
@@ -3387,6 +3493,7 @@ def optimise_vehicle_routes(
         for rider in riders
     }
     assigned_job_ids: set[int] = set()
+    geographic_exception_reasons: dict[int, str] = {}
     regional_config = RegionalOverflowConfig.from_value(regional_overflow_config)
     regional_context = None
     rejected_candidate_audit: list[dict[str, Any]] = []
@@ -3462,6 +3569,12 @@ def optimise_vehicle_routes(
                 empty_cost,
                 duration_multiplier=empty_travel_duration_multiplier,
                 wait_buffer_min=empty_travel_wait_buffer_min,
+            )
+            geographic_assessment = assess_geographic_assignment(
+                base_rider_state[key]["start_zone"] or base_rider_state[key]["start_location"],
+                current_zone or current_location,
+                pickup_zone or pickup_address,
+                empty_cost.duration_min,
             )
             loaded_cost = get_travel_cost(
                 pickup_address,
@@ -3621,6 +3734,12 @@ def optimise_vehicle_routes(
                         1,
                     ),
                     "Route Validation Status": "",
+                    "Rider Home Zone": geographic_assessment.home_zone,
+                    "Current Operational Zone": geographic_assessment.current_zone,
+                    "Pickup Operational Zone": geographic_assessment.pickup_zone,
+                    "Geographic Assignment Rank": geographic_assessment.rank,
+                    "Geographic Assignment Status": geographic_assessment.status,
+                    "Geographic Exception Reason": "",
                 }
             )
 
@@ -3772,16 +3891,7 @@ def optimise_vehicle_routes(
                 remaining_specific_cluster_counts.get(specific_cluster, 0) + 1
             )
 
-        best_choice: tuple[
-            tuple[int, int, float, int, float, float, int, int, str],
-            int,
-            RiderState,
-            dict[str, Any],
-            dict[str, Any],
-            dict[str, Any],
-            dict[str, Any],
-            str,
-        ] | None = None
+        best_choice: tuple[Any, ...] | None = None
         feasible_candidates: list[dict[str, Any]] = []
         for rider in riders:
             for job_index, job in enumerate(remaining):
@@ -3867,6 +3977,8 @@ def optimise_vehicle_routes(
                         "starts_dense_cluster": starts_dense_cluster,
                         "continues_cluster": continues_cluster,
                         "candidate_cost": float(inserted_row.get("Empty Duration Min", math.inf) or math.inf),
+                        "geographic_rank": int(inserted_row.get("Geographic Assignment Rank", 3) or 0),
+                        "geographic_status": clean_text(inserted_row.get("Geographic Assignment Status")),
                         "priority_match": _priority_rider_matches_job(rider, job),
                         "priority_balance": priority_matching_job_count(rider),
                     }
@@ -3896,6 +4008,17 @@ def optimise_vehicle_routes(
             rider = candidate["rider"]
             job = candidate["job"]
             job_candidates = candidates_by_job[_job_id(job)]
+            normal_geographic_candidates = [
+                item for item in job_candidates if int(item["geographic_rank"]) < 3
+            ]
+            if normal_geographic_candidates and int(candidate["geographic_rank"]) >= 3:
+                continue
+            geographic_exception_reason = ""
+            if int(candidate["geographic_rank"]) >= 3:
+                geographic_exception_reason = (
+                    "No same-zone or short adjacent-zone rider could take this job "
+                    "within the configured capacity and operating window."
+                )
             priority_candidates = [item for item in job_candidates if item["priority_match"]]
             best_feasible = min(item["candidate_cost"] for item in job_candidates)
             regional_audit: dict[str, Any] = {}
@@ -3946,8 +4069,10 @@ def optimise_vehicle_routes(
             priority_rank = 0 if candidate["priority_match"] else (2 if priority_candidates else 1)
             priority_balance = int(candidate["priority_balance"]) if candidate["priority_match"] else 0
             candidate_rank = (
+                int(candidate["geographic_rank"]),
                 priority_rank,
                 priority_balance,
+                float(candidate["candidate_cost"]),
                 float(candidate["greedy_assignment_score"])
                 + regional_penalty
                 + affinity_adjustment
@@ -3969,9 +4094,11 @@ def optimise_vehicle_routes(
                 decision_reason = clean_text(regional_audit["Reason for Regional Assignment"])
             else:
                 decision_reason = (
-                    f"Best feasible route score {candidate_rank[2]:.1f}; "
+                    f"Best feasible route score {candidate_rank[4]:.1f}; "
                     f"empty travel {candidate['candidate_cost']:.1f} min."
                 )
+            if geographic_exception_reason:
+                decision_reason = geographic_exception_reason
             if best_choice is None or candidate_rank < best_choice[0]:
                 best_choice = (
                     candidate_rank,
@@ -3982,6 +4109,7 @@ def optimise_vehicle_routes(
                     candidate["inserted_row"],
                     regional_audit,
                     decision_reason,
+                    geographic_exception_reason,
                 )
 
         if best_choice is None:
@@ -3996,6 +4124,7 @@ def optimise_vehicle_routes(
             inserted_row,
             regional_audit,
             decision_reason,
+            geographic_exception_reason,
         ) = best_choice
         pickup_address = clean_text(job["Pickup Address"])
         dropoff_address = clean_text(job["Drop-off Address"])
@@ -4031,6 +4160,12 @@ def optimise_vehicle_routes(
         )
 
         inserted_row.update(regional_audit)
+        if geographic_exception_reason:
+            inserted_row["Geographic Assignment Status"] = "exceptional_no_local_feasible"
+            inserted_row["Geographic Exception Reason"] = geographic_exception_reason
+            geographic_exception_reasons[_job_id(job)] = geographic_exception_reason
+        else:
+            geographic_exception_reasons.pop(_job_id(job), None)
         route_rows.append(inserted_row)
         if regional_context:
             regional_context.record_assignment(job, rider.name, regional_audit)
@@ -4094,6 +4229,8 @@ def optimise_vehicle_routes(
                                     "job": job,
                                     "evaluation": evaluation,
                                     "candidate_cost": float(inserted_row.get("Empty Duration Min", math.inf) or math.inf),
+                                    "geographic_rank": int(inserted_row.get("Geographic Assignment Rank", 3) or 0),
+                                    "geographic_status": clean_text(inserted_row.get("Geographic Assignment Status")),
                                     "current_region": infer_zone(inserted_row.get("Start From")) or rider.current_zone or "unknown",
                                     "priority_match": _priority_rider_matches_job(rider, job),
                                     "priority_balance": priority_matching_job_count(rider),
@@ -4116,13 +4253,24 @@ def optimise_vehicle_routes(
                 for candidate in feasible_insertions:
                     rider = candidate["rider"]
                     job = candidate["job"]
+                    peers = rescue_by_job[_job_id(job)]
+                    normal_geographic_candidates = [
+                        item for item in peers if int(item["geographic_rank"]) < 3
+                    ]
+                    if normal_geographic_candidates and int(candidate["geographic_rank"]) >= 3:
+                        continue
+                    geographic_exception_reason = ""
+                    if int(candidate["geographic_rank"]) >= 3:
+                        geographic_exception_reason = (
+                            "No same-zone or short adjacent-zone rider could take this job "
+                            "within the configured capacity and operating window."
+                        )
                     priority_candidates = [
-                        item for item in rescue_by_job[_job_id(job)] if item["priority_match"]
+                        item for item in peers if item["priority_match"]
                     ]
                     regional_penalty = 0.0
                     audit: dict[str, Any] = {}
                     if regional_context:
-                        peers = rescue_by_job[_job_id(job)]
                         best_feasible = min(item["candidate_cost"] for item in peers)
                         meta = regional_context.metadata(job)
                         rules = regional_context.support_rules[meta["operational_subregion"]]
@@ -4148,15 +4296,17 @@ def optimise_vehicle_routes(
                             assessment,
                         )
                     candidate_rank = (
+                        int(candidate["geographic_rank"]),
                         0 if candidate["priority_match"] else (2 if priority_candidates else 1),
                         int(candidate["priority_balance"]) if candidate["priority_match"] else 0,
+                        float(candidate["candidate_cost"]),
                         float(candidate["added_duration"]) + regional_penalty,
                         int(candidate["minimum_priority"]),
                         float(candidate["projected_adjusted"]),
                         int(job.get("_original_order", candidate["job_index"])),
                         rider.name.casefold(),
                     )
-                    if best_insertion is None or candidate_rank < best_insertion[:7]:
+                    if best_insertion is None or candidate_rank < best_insertion[:9]:
                         best_insertion = (
                             *candidate_rank,
                             rider,
@@ -4165,16 +4315,21 @@ def optimise_vehicle_routes(
                             job,
                             candidate["evaluation"],
                             audit,
+                            geographic_exception_reason,
                         )
 
                 if best_insertion is not None:
-                    _, _, _, _, _, _, _, rider, insert_at, job_index, job, _, audit = best_insertion
+                    _, _, _, _, _, _, _, _, _, rider, insert_at, job_index, job, _, audit, geographic_exception_reason = best_insertion
                     if _job_id(job) in assigned_job_ids:
                         remaining.pop(job_index)
                         continue
                     rider_sequences[rider_key(rider)].insert(insert_at, job)
                     if regional_context:
                         regional_context.record_assignment(job, rider.name, audit)
+                    if geographic_exception_reason:
+                        geographic_exception_reasons[_job_id(job)] = geographic_exception_reason
+                    else:
+                        geographic_exception_reasons.pop(_job_id(job), None)
                     assigned_job_ids.add(_job_id(job))
                     remaining.pop(job_index)
                     made_assignment = True
@@ -4223,6 +4378,14 @@ def optimise_vehicle_routes(
                         # undone by the general minimum-workload rebalance.
                         if _priority_rider_matches_job(donor, job):
                             continue
+                        donor_rows = [
+                            row for row in current_evaluations[donor_key].get("rows", [])
+                            if int(row.get("Uploaded Row", -1)) == _job_id(job)
+                        ]
+                        donor_row = donor_rows[0] if donor_rows else {}
+                        donor_geographic_rank = int(
+                            donor_row.get("Geographic Assignment Rank", 3) or 0
+                        )
                         donor_candidate_sequence = donor_sequence[:remove_at] + donor_sequence[remove_at + 1 :]
                         donor_evaluation = evaluate_rider_sequence(donor, donor_candidate_sequence, cap_used)
                         if not donor_evaluation.get("valid", True):
@@ -4239,6 +4402,27 @@ def optimise_vehicle_routes(
                             ):
                                 continue
 
+                            inserted_rows = [
+                                row for row in receiver_evaluation.get("rows", [])
+                                if int(row.get("Uploaded Row", -1)) == _job_id(job)
+                            ]
+                            inserted_row = inserted_rows[0] if inserted_rows else {}
+                            receiver_geographic_rank = int(
+                                inserted_row.get("Geographic Assignment Rank", 3) or 0
+                            )
+                            # Workload equalisation must never make geography worse.
+                            if receiver_geographic_rank > donor_geographic_rank:
+                                continue
+                            if receiver_geographic_rank == donor_geographic_rank == 3:
+                                receiver_empty = float(
+                                    inserted_row.get("Empty Duration Min", math.inf) or math.inf
+                                )
+                                donor_empty = float(
+                                    donor_row.get("Empty Duration Min", math.inf) or math.inf
+                                )
+                                if receiver_empty + SIDE_BY_SIDE_MAX_MINUTES >= donor_empty:
+                                    continue
+
                             receiver_added_duration = (
                                 float(receiver_evaluation.get("raw_duration", math.inf)) - receiver_current_duration
                             )
@@ -4246,11 +4430,6 @@ def optimise_vehicle_routes(
                             regional_audit: dict[str, Any] = {}
                             protected_primary_transfer = False
                             if regional_context:
-                                inserted_rows = [
-                                    row for row in receiver_evaluation.get("rows", [])
-                                    if int(row.get("Uploaded Row", -1)) == _job_id(job)
-                                ]
-                                inserted_row = inserted_rows[0] if inserted_rows else {}
                                 candidate_cost = float(inserted_row.get("Empty Duration Min", math.inf) or math.inf)
                                 assessment = regional_context.assess_candidate(
                                     job,
@@ -4315,14 +4494,186 @@ def optimise_vehicle_routes(
             rider_sequences[receiver_key] = receiver_sequence[:insert_at] + [job] + receiver_sequence[insert_at:]
             if regional_context:
                 regional_context.assignments[_job_id(job)] = regional_audit
+            receiver_evaluation = evaluate_rider_sequence(
+                receiver,
+                rider_sequences[receiver_key],
+                cap_used,
+            )
+            moved_rows = [
+                row for row in receiver_evaluation.get("rows", [])
+                if int(row.get("Uploaded Row", -1)) == _job_id(job)
+            ]
+            moved_rank = int(
+                (moved_rows[0] if moved_rows else {}).get("Geographic Assignment Rank", 3) or 0
+            )
+            if moved_rank >= 3:
+                geographic_exception_reasons[_job_id(job)] = (
+                    "No same-zone or short adjacent-zone rider could take this job "
+                    "within the configured capacity and operating window."
+                )
+            else:
+                geographic_exception_reasons.pop(_job_id(job), None)
             moved_job = True
 
     rebalance_minimum_jobs()
+
+    def final_geographic_re_evaluation() -> list[dict[str, Any]]:
+        """Move geographically weak jobs to a closer feasible rider before output."""
+
+        moves: list[dict[str, Any]] = []
+        max_moves = max(1, len(assigned_job_ids) * max(1, len(riders)))
+        for _ in range(max_moves):
+            current_evaluations = {
+                rider_key(rider): evaluate_rider_sequence(
+                    rider,
+                    rider_sequences[rider_key(rider)],
+                    cap_used,
+                )
+                for rider in riders
+            }
+            best_move: tuple[Any, ...] | None = None
+            for donor in riders:
+                donor_key = rider_key(donor)
+                donor_sequence = rider_sequences[donor_key]
+                donor_evaluation = current_evaluations[donor_key]
+                for remove_at, job in enumerate(donor_sequence):
+                    current_rows = [
+                        row for row in donor_evaluation.get("rows", [])
+                        if int(row.get("Uploaded Row", -1)) == _job_id(job)
+                    ]
+                    if not current_rows:
+                        continue
+                    current_row = current_rows[0]
+                    current_rank = int(
+                        current_row.get("Geographic Assignment Rank", 3) or 0
+                    )
+                    if current_rank <= 0:
+                        continue
+                    current_empty = float(
+                        current_row.get("Empty Duration Min", math.inf) or math.inf
+                    )
+                    donor_candidate_sequence = (
+                        donor_sequence[:remove_at] + donor_sequence[remove_at + 1 :]
+                    )
+                    donor_candidate_evaluation = evaluate_rider_sequence(
+                        donor,
+                        donor_candidate_sequence,
+                        cap_used,
+                    )
+                    if not donor_candidate_evaluation.get("valid", True):
+                        continue
+
+                    for receiver in riders:
+                        if receiver.name == donor.name:
+                            continue
+                        receiver_key = rider_key(receiver)
+                        receiver_sequence = rider_sequences[receiver_key]
+                        if (
+                            receiver.max_jobs is not None
+                            and len(receiver_sequence) >= int(receiver.max_jobs)
+                        ):
+                            continue
+                        receiver_current_duration = float(
+                            current_evaluations[receiver_key].get("raw_duration", 0) or 0
+                        )
+                        for insert_at in range(len(receiver_sequence) + 1):
+                            receiver_candidate_sequence = (
+                                receiver_sequence[:insert_at]
+                                + [job]
+                                + receiver_sequence[insert_at:]
+                            )
+                            receiver_evaluation = evaluate_rider_sequence(
+                                receiver,
+                                receiver_candidate_sequence,
+                                cap_used,
+                            )
+                            if not receiver_evaluation.get("valid") or not candidate_hard_valid(
+                                {
+                                    donor.name: donor_candidate_sequence,
+                                    receiver.name: receiver_candidate_sequence,
+                                }
+                            ):
+                                continue
+                            inserted_rows = [
+                                row for row in receiver_evaluation.get("rows", [])
+                                if int(row.get("Uploaded Row", -1)) == _job_id(job)
+                            ]
+                            if not inserted_rows:
+                                continue
+                            inserted_row = inserted_rows[0]
+                            replacement_rank = int(
+                                inserted_row.get("Geographic Assignment Rank", 3) or 0
+                            )
+                            if replacement_rank >= current_rank or replacement_rank >= 3:
+                                continue
+                            replacement_empty = float(
+                                inserted_row.get("Empty Duration Min", math.inf) or math.inf
+                            )
+                            added_duration = float(
+                                receiver_evaluation.get("raw_duration", math.inf)
+                            ) - receiver_current_duration
+                            move_rank = (
+                                replacement_rank,
+                                replacement_empty,
+                                added_duration,
+                                int(job.get("_original_order", remove_at)),
+                                receiver.name.casefold(),
+                            )
+                            if best_move is None or move_rank < best_move[0]:
+                                best_move = (
+                                    move_rank,
+                                    donor,
+                                    receiver,
+                                    remove_at,
+                                    insert_at,
+                                    job,
+                                    current_rank,
+                                    replacement_rank,
+                                    current_empty,
+                                    replacement_empty,
+                                )
+            if best_move is None:
+                break
+
+            (
+                _, donor, receiver, remove_at, insert_at, job,
+                old_rank, new_rank, old_empty, new_empty,
+            ) = best_move
+            donor_key = rider_key(donor)
+            receiver_key = rider_key(receiver)
+            moved_job = rider_sequences[donor_key].pop(remove_at)
+            rider_sequences[receiver_key].insert(insert_at, moved_job)
+            geographic_exception_reasons.pop(_job_id(job), None)
+            if regional_context:
+                regional_context.assignments.pop(_job_id(job), None)
+            moves.append(
+                {
+                    "job_id": _job_id(job),
+                    "car_plate": clean_text(job.get("Car Plate")),
+                    "from_rider": donor.name,
+                    "to_rider": receiver.name,
+                    "old_geographic_rank": old_rank,
+                    "new_geographic_rank": new_rank,
+                    "old_empty_travel_min": round(old_empty, 1),
+                    "new_empty_travel_min": round(new_empty, 1),
+                }
+            )
+        return moves
+
+    geographic_re_evaluation_moves = final_geographic_re_evaluation()
 
     final_evaluations = {
         rider_key(rider): evaluate_rider_sequence(rider, rider_sequences[rider_key(rider)], cap_used)
         for rider in riders
     }
+    for evaluation in final_evaluations.values():
+        for row in evaluation.get("rows", []):
+            if int(row.get("Geographic Assignment Rank", 3) or 0) >= 3:
+                geographic_exception_reasons.setdefault(
+                    int(row.get("Uploaded Row", -1)),
+                    "No same-zone or short adjacent-zone rider could take this job "
+                    "within the configured capacity and operating window.",
+                )
     route_rows = []
     if regional_context:
         for capacity_item in regional_context.capacity_summary.values():
@@ -4373,6 +4724,16 @@ def optimise_vehicle_routes(
                         capacity_item.jobs_assigned_to_support_riders += 1
                     else:
                         capacity_item.exceptional_unsupported_assignments += 1
+            job_id = int(route_row.get("Uploaded Row", -1))
+            geographic_rank = int(
+                route_row.get("Geographic Assignment Rank", 3) or 0
+            )
+            exception_reason = geographic_exception_reasons.get(job_id, "")
+            if geographic_rank >= 3:
+                route_row["Geographic Assignment Status"] = "exceptional_no_local_feasible"
+                route_row["Geographic Exception Reason"] = exception_reason
+            else:
+                route_row["Geographic Exception Reason"] = ""
             route_rows.append(route_row)
         rider.assigned_count = len(rider_sequences[key])
         rider.empty_distance_km = float(evaluation.get("empty_distance", 0) or 0)
@@ -4469,6 +4830,20 @@ def optimise_vehicle_routes(
         for constraint in constraints
     ]
     route_df.attrs["rider_max_jobs"] = {rider.name: rider.max_jobs for rider in riders}
+    geographic_validation = validate_final_route_geography(route_df)
+    route_df.attrs["geographic_validation"] = sanitize_for_output(geographic_validation)
+    route_df.attrs["geographic_exception_count"] = sum(
+        int(issue["severity"] in {"warning", "error"})
+        for issue in geographic_validation["issues"]
+    )
+    route_df.attrs["geographic_re_evaluation_moves"] = sanitize_for_output(
+        geographic_re_evaluation_moves
+    )
+    lookup_warnings.extend(
+        f"Geographic assignment warning for {issue.get('car_plate') or issue.get('job_id')}: {issue['reason']}"
+        for issue in geographic_validation["issues"]
+        if issue["severity"] == "warning"
+    )
     if regional_context:
         route_df.attrs["regional_capacity"] = sanitize_for_output(regional_context.capacity_rows())
         regional_audit_columns = [
@@ -4498,6 +4873,15 @@ def optimise_vehicle_routes(
         raise ValueError(
             "Invalid optimisation result: hard constraint violation(s): "
             + "; ".join(item["message"] for item in hard_validation.violations)
+        )
+    if not geographic_validation["valid"]:
+        raise ValueError(
+            "Invalid optimisation result: geographic assignment violation(s): "
+            + "; ".join(
+                issue["reason"]
+                for issue in geographic_validation["issues"]
+                if issue["severity"] == "error"
+            )
         )
     if use_onemap and verify_fallbacks_after_solve:
         route_df, verification_warnings = verify_fallback_travel_legs(
@@ -4687,6 +5071,7 @@ def improve_route_dataframe(
             "route_df": candidate_route,
             "summary_df": candidate_summary,
             "lookup_warnings": candidate_warnings,
+            "geographic_exception_count": int(candidate_route.attrs.get("geographic_exception_count", 0)),
             "regional_exception_count": int(candidate_route.attrs.get("regional_exception_count", 0)),
             "protected_job_misassignment_count": int(candidate_route.attrs.get("protected_job_misassignment_count", 0)),
         }
@@ -5587,6 +5972,101 @@ def _write_map_loader_sheet(writer: pd.ExcelWriter, route_df: pd.DataFrame) -> N
     _autosize_columns(ws, 45)
 
 
+def _build_flexar_assignment_list(
+    route_df: pd.DataFrame,
+    jobs_df: pd.DataFrame | None,
+) -> pd.DataFrame:
+    columns = [
+        "Sequence",
+        "Rider",
+        "Car Plate",
+        "Job ID",
+        "Pickup Address",
+        "Pickup Lot",
+        "Drop-off Address",
+        "Drop-off Lot",
+        "Deadline",
+        "Status",
+        "Operator Confirmation",
+        "Remarks",
+    ]
+    if route_df is None or route_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    jobs_by_uploaded_row: dict[int, dict[str, Any]] = {}
+    jobs_by_identity: dict[tuple[str, str, str], dict[str, Any]] = {}
+    if jobs_df is not None and not jobs_df.empty:
+        for _, job in jobs_df.iterrows():
+            job_dict = job.to_dict()
+            uploaded_row = pd.to_numeric(
+                job.get("Uploaded Row", job.get("_uploaded_row")),
+                errors="coerce",
+            )
+            if pd.notna(uploaded_row):
+                jobs_by_uploaded_row[int(uploaded_row)] = job_dict
+            identity = (
+                clean_text(job.get("Car Plate")).casefold(),
+                clean_text(job.get("Pickup Address")).casefold(),
+                clean_text(job.get("Drop-off Address")).casefold(),
+            )
+            jobs_by_identity.setdefault(identity, job_dict)
+
+    rows: list[dict[str, Any]] = []
+    for _, route in _sort_routes_for_export(route_df).iterrows():
+        uploaded_row = pd.to_numeric(route.get("Uploaded Row"), errors="coerce")
+        source_job = (
+            jobs_by_uploaded_row.get(int(uploaded_row))
+            if pd.notna(uploaded_row)
+            else None
+        )
+        if source_job is None:
+            identity = (
+                clean_text(route.get("Car Plate")).casefold(),
+                clean_text(route.get("Pickup Address")).casefold(),
+                clean_text(route.get("Drop-off Address")).casefold(),
+            )
+            source_job = jobs_by_identity.get(identity, {})
+        rows.append(
+            {
+                "Sequence": route.get("Sequence"),
+                "Rider": clean_text(route.get("Rider")),
+                "Car Plate": clean_text(route.get("Car Plate")),
+                "Job ID": clean_text(source_job.get("Job ID")),
+                "Pickup Address": clean_text(route.get("Pickup Address")),
+                "Pickup Lot": clean_text(route.get("Pickup Lot")),
+                "Drop-off Address": clean_text(route.get("Drop-off Address")),
+                "Drop-off Lot": clean_text(source_job.get("Drop-off Lot")),
+                "Deadline": source_job.get("Deadline", ""),
+                "Status": clean_text(source_job.get("Status")),
+                "Operator Confirmation": "",
+                "Remarks": "",
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _write_flexar_assignment_list_sheet(
+    writer: pd.ExcelWriter,
+    route_df: pd.DataFrame,
+    jobs_df: pd.DataFrame | None,
+) -> None:
+    assignment_df = _excel_safe_dataframe(
+        _build_flexar_assignment_list(route_df, jobs_df)
+    )
+    assignment_df.to_excel(
+        writer,
+        sheet_name="Flexar Assignment List",
+        index=False,
+        startrow=2,
+    )
+    ws = writer.sheets["Flexar Assignment List"]
+    _write_title(ws, "Flexar Assignment List", 1)
+    _style_header_row(ws, 3, len(assignment_df.columns))
+    ws.freeze_panes = "A4"
+    ws.auto_filter.ref = f"A3:{get_column_letter(len(assignment_df.columns))}{max(3, 3 + len(assignment_df))}"
+    _autosize_columns(ws, 45)
+
+
 def _write_manual_review_sheet(writer: pd.ExcelWriter, route_df: pd.DataFrame) -> None:
     ws = writer.book.create_sheet("Manual Review")
     _write_title(ws, "Manual Review Warnings", 1)
@@ -5740,6 +6220,7 @@ def export_routes_to_excel(
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         _write_how_to_read_sheet(writer)
+        _write_flexar_assignment_list_sheet(writer, route_df, jobs_df)
 
         route_note = (
             "Follow each rider's rows in sequence order. For each row, the rider first travels from "

@@ -1,4 +1,3 @@
-import os
 import importlib
 import json
 import sys
@@ -6,6 +5,7 @@ import time
 import copy
 import hashlib
 from datetime import time as clock_time
+from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
@@ -43,11 +43,10 @@ from Flexar.BlueSG.build_optimised_vehicle_routes import (
     DEFAULT_SELECTIVE_CHANGED_RIDER_PENALTY,
     DEFAULT_SELECTIVE_MOVED_JOB_PENALTY,
     DEFAULT_SELECTIVE_SEQUENCE_CHANGE_PENALTY,
-    REQUIRED_JOB_HEADERS,
     RIDER_COLUMNS,
     RIDER_LOAD_INPUT_OPTIONS,
     RIDER_LOAD_LEVELS,
-    ROSTER_FILE,
+    SUMMARY_COLUMNS,
     build_jobs_by_stable_id,
     build_rider_sequences_from_route_df,
     find_best_selective_reshuffle,
@@ -58,14 +57,12 @@ from Flexar.BlueSG.build_optimised_vehicle_routes import (
     dedupe_rider_roster,
     ensure_rider_roster_workbook,
     export_routes_to_excel,
+    format_summary_output,
     build_unassigned_jobs_df,
     get_cost_explanation,
     get_cached_geocode,
-    get_onemap_token,
-    load_and_validate_jobs,
     load_rider_roster,
     normalise_rider_load_level,
-    onemap_credentials_configured,
     optimisation_integrity_report,
     optimise_vehicle_routes,
     improve_route_dataframe,
@@ -73,13 +70,39 @@ from Flexar.BlueSG.build_optimised_vehicle_routes import (
     save_rider_roster,
     validate_riders,
 )
+from Flexar.BlueSG.manual_route_assignment_editing_and_recalculation import (
+    UNASSIGNED_LANE,
+    assignment_from_routes,
+    clone_assignment,
+    incremental_recalculate,
+)
 from Flexar.BlueSG.validate_route_assignment_hard_constraints import Constraint
 from Flexar.BlueSG.route_operation_time_window_settings import EMPTY_TRAVEL_MODES, OperationContext
 from Flexar.BlueSG.convert_results_to_output_safe_values import sanitize_for_output
 from Flexar.BlueSG.route_optimisation_metrics_and_run_summary import (
     create_run_result,
     save_run_artifact,
-    sha256_bytes,
+)
+from Flexar.BlueSG.job_import_staging import (
+    ImportResult,
+    parse_job_source,
+    validate_staged_jobs,
+)
+from Flexar.BlueSG.optimiser_workflow_state import (
+    begin_rider_draft,
+    cancel_rider_draft,
+    clear_import,
+    commit_optimiser_result,
+    initialise_workflow_state,
+    normalise_riders,
+    refresh_stale_flag,
+    riders_for_optimizer,
+    save_rider_draft,
+    normalise_assignment_sequences,
+    streamlit_key_value_table,
+    validate_and_commit_job_import,
+    validate_assignment_draft,
+    validate_rider_draft,
 )
 
 try:
@@ -1095,35 +1118,536 @@ def render_route_editor(route_df: pd.DataFrame, summary_df: pd.DataFrame, result
         st.rerun()
 
 
-st.title("Vehicle Route Optimiser")
-st.caption("Upload vehicle relocation jobs, confirm riders, optimise routes, and download dispatch instructions.")
+@st.cache_data(show_spinner=False)
+def cached_parse_job_upload(payload: bytes, filename: str) -> ImportResult:
+    class NamedBytesIO(BytesIO):
+        pass
 
-st.info(
-    "How to use:\n"
-    "1. Upload the job Excel file.\n"
-    "2. Check the rider roster.\n"
-    "3. Click Optimise Routes.\n"
-    "4. Review the map and download the output."
-)
+    uploaded = NamedBytesIO(payload)
+    uploaded.name = filename
+    return parse_job_source(uploaded_file=uploaded)
 
-with st.expander("How the route optimiser works", expanded=False):
-    st.write(
-        "Each job is a fixed pickup-to-drop-off vehicle relocation. The rider first travels "
-        "to the pickup location without the car, then drives the car to the drop-off location. "
-        "The empty travel duration is adjusted upward to allow for public transport, walking, and waiting time. "
-        "After each drop-off, that drop-off becomes the rider's next starting point. OneMap is "
-        "used where available; fallback zone estimates are used when a lookup is unavailable."
+
+@st.cache_data(show_spinner=False)
+def cached_parse_pasted_jobs(pasted_text: str) -> ImportResult:
+    return parse_job_source(pasted_text=pasted_text)
+
+
+def show_import_report(report) -> None:
+    labels = [
+        ("Rows detected", report.rows_detected),
+        ("Rows accepted", report.rows_accepted),
+        ("Need correction", report.rows_requiring_correction),
+        ("Rows excluded", report.rows_excluded),
+        ("Duplicate rows", report.duplicate_rows),
+        ("Missing locations", report.missing_location_rows),
+    ]
+    for column, (label, value) in zip(st.columns(6), labels):
+        column.metric(label, value)
+
+
+def render_job_importer() -> None:
+    st.subheader("1. Upload jobs")
+    upload_epoch = int(st.session_state.setdefault("bluesg_upload_epoch", 0))
+    source_columns = st.columns([1, 1.4])
+    uploaded = source_columns[0].file_uploader(
+        "Upload Excel or CSV",
+        type=["xlsx", "xls", "xlsm", "csv"],
+        key=f"bluesg_jobs_upload_{upload_epoch}",
+        help="Flexar workbooks with title rows and repeated lot columns remain supported.",
+    )
+    pasted = source_columns[1].text_area(
+        "Paste Flexar data",
+        height=100,
+        key=f"bluesg_jobs_paste_{upload_epoch}",
+        placeholder="Paste a Flexar table, tab-separated rows, CSV text, or HTML.",
     )
 
-jobs_df = pd.DataFrame()
+    source_signature = ""
+    parse_source = None
+    if uploaded is not None:
+        payload = uploaded.getvalue()
+        source_signature = hashlib.sha256(
+            b"upload|" + uploaded.name.encode("utf-8", errors="replace") + b"|" + payload
+        ).hexdigest()
+        parse_source = lambda: cached_parse_job_upload(payload, uploaded.name)
+    elif pasted.strip():
+        source_signature = hashlib.sha256(
+            ("paste|" + pasted.strip()).encode("utf-8")
+        ).hexdigest()
+        parse_source = lambda: cached_parse_pasted_jobs(pasted)
+
+    if source_signature and source_signature != st.session_state.get("bluesg_import_source_signature"):
+        try:
+            parsed = parse_source()
+            validation, changed = validate_and_commit_job_import(
+                st.session_state,
+                parsed.dataframe,
+            )
+        except Exception as exc:
+            st.session_state.bluesg_import_error = f"Could not import jobs: {exc}"
+            st.session_state.bluesg_job_validation = None
+        else:
+            st.session_state.imported_source_data = parsed
+            st.session_state.bluesg_job_validation = validation
+            st.session_state.bluesg_import_error = ""
+            if validation.is_valid and changed and st.session_state.result_is_stale:
+                st.session_state.bluesg_import_notice = "The previous optimisation is now stale."
+            else:
+                st.session_state.bluesg_import_notice = ""
+        finally:
+            st.session_state.bluesg_import_source_signature = source_signature
+
+    if st.session_state.get("bluesg_import_error"):
+        st.error(st.session_state.bluesg_import_error)
+
+    validation = st.session_state.get("bluesg_job_validation")
+    if validation is None:
+        st.caption("Upload a file or paste Flexar data. Valid jobs are committed automatically.")
+        return
+
+    report = validation.report
+    if validation.is_valid:
+        committed_count = len(st.session_state.committed_jobs)
+        st.success(f"{committed_count} jobs uploaded successfully")
+        st.caption(
+            f"{committed_count} accepted · 0 rejected · {report.duplicate_rows} duplicates"
+        )
+        if st.session_state.get("bluesg_import_notice"):
+            st.warning(st.session_state.bluesg_import_notice)
+        with st.expander("View imported jobs", expanded=False, icon=":material/table_view:"):
+            st.dataframe(validation.dataframe, width="stretch", hide_index=True, height=300)
+    else:
+        st.error(
+            f"{report.rows_requiring_correction} row(s) require correction. "
+            "This source was not committed."
+        )
+        affected_rows = sorted(
+            {row for issue in validation.errors for row in issue.rows}
+        )
+        for issue in validation.issues:
+            row_suffix = f" Rows: {', '.join(map(str, issue.rows[:12]))}" if issue.rows else ""
+            if issue.severity == "error":
+                st.error(issue.message + row_suffix)
+            else:
+                st.warning(issue.message + row_suffix)
+        if affected_rows:
+            affected_index = [row - 1 for row in affected_rows if 0 < row <= len(validation.dataframe)]
+            st.dataframe(
+                validation.dataframe.iloc[affected_index],
+                width="stretch",
+                hide_index=True,
+                height=min(300, 70 + 35 * len(affected_index)),
+            )
+        if isinstance(st.session_state.get("committed_jobs"), pd.DataFrame) and not st.session_state.committed_jobs.empty:
+            st.caption("The previously committed job list remains unchanged.")
+
+    if st.button("Replace file", icon=":material/refresh:", type="tertiary"):
+        clear_import(st.session_state)
+        st.session_state.bluesg_job_validation = None
+        st.session_state.bluesg_import_source_signature = ""
+        st.session_state.bluesg_import_error = ""
+        st.session_state.bluesg_upload_epoch = upload_epoch + 1
+        st.rerun()
+
+
+@st.dialog("Today's riders", width="large")
+def configure_riders_dialog(default_roster_day: str) -> None:
+    default_index = (
+        WEEKDAY_SHEETS.index(default_roster_day)
+        if default_roster_day in WEEKDAY_SHEETS
+        else 0
+    )
+    roster_day = st.selectbox(
+        "Roster day",
+        WEEKDAY_SHEETS,
+        index=default_index,
+        key="bluesg_drawer_roster_day",
+    )
+    roster_actions = st.columns(2)
+    if roster_actions[0].button(
+        "Reload roster as draft",
+        icon=":material/refresh:",
+        width="stretch",
+    ):
+        st.session_state.rider_draft = normalise_riders(
+            add_session_rider_load_column(load_rider_roster(roster_day))
+        )
+        st.rerun(scope="fragment")
+    roster_actions[1].download_button(
+        "Download roster workbook",
+        data=read_rider_roster_file(),
+        file_name="weekday_rider_availability_and_capacity_roster.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        icon=":material/download:",
+        width="stretch",
+    )
+    st.caption(f"Roster workbook: {ensure_rider_roster_workbook()}")
+
+    if st.session_state.get("rider_draft") is None:
+        begin_rider_draft(st.session_state)
+    draft = normalise_riders(st.session_state.rider_draft)
+    with st.form("bluesg_v2_rider_form", border=False):
+        edited = st.data_editor(
+            draft,
+            num_rows="dynamic",
+            hide_index=True,
+            width="stretch",
+            height=360,
+            column_config={
+                "Rider Name": st.column_config.TextColumn(required=True),
+                "Start Location": st.column_config.TextColumn(required=True),
+                "Start Zone": st.column_config.SelectboxColumn(
+                    options=["", "North", "North-West", "North-East", "East", "Central", "West", "South/CBD"]
+                ),
+                "Maximum Jobs": st.column_config.NumberColumn(min_value=1, step=1),
+                "Rider Load": st.column_config.SelectboxColumn(options=RIDER_LOAD_INPUT_OPTIONS),
+                "Active": st.column_config.CheckboxColumn(),
+            },
+        )
+        utility_columns = st.columns(3)
+        duplicate_name = utility_columns[0].selectbox(
+            "Duplicate rider",
+            [""] + [name for name in edited["Rider Name"].apply(clean_text).tolist() if name],
+        )
+        bulk_max_jobs = utility_columns[1].number_input(
+            "Bulk maximum jobs", min_value=1, value=5, step=1
+        )
+        bulk_load = utility_columns[2].selectbox(
+            "Bulk rider load", RIDER_LOAD_LEVELS, index=1
+        )
+        action_columns = st.columns(5)
+        duplicate_clicked = action_columns[0].form_submit_button("Duplicate Row")
+        bulk_jobs_clicked = action_columns[1].form_submit_button("Set Max Jobs")
+        bulk_load_clicked = action_columns[2].form_submit_button("Set Rider Load")
+        save_clicked = action_columns[3].form_submit_button("Save Riders", type="primary")
+        cancel_clicked = action_columns[4].form_submit_button("Cancel")
+
+    if cancel_clicked:
+        cancel_rider_draft(st.session_state)
+        st.rerun()
+    if duplicate_clicked:
+        source = edited[edited["Rider Name"].apply(clean_text).eq(duplicate_name)]
+        if source.empty:
+            st.error("Choose a rider row to duplicate.")
+        else:
+            duplicate = source.iloc[[0]].copy()
+            duplicate["Rider Name"] = duplicate["Rider Name"].apply(lambda value: f"{clean_text(value)} Copy")
+            st.session_state.rider_draft = pd.concat([edited, duplicate], ignore_index=True)
+            st.rerun(scope="fragment")
+    if bulk_jobs_clicked:
+        edited["Maximum Jobs"] = int(bulk_max_jobs)
+        st.session_state.rider_draft = edited
+        st.rerun(scope="fragment")
+    if bulk_load_clicked:
+        edited["Rider Load"] = bulk_load
+        st.session_state.rider_draft = edited
+        st.rerun(scope="fragment")
+    if save_clicked:
+        validation = validate_rider_draft(edited)
+        if not validation.is_valid:
+            for error in validation.errors:
+                st.error(error)
+        else:
+            try:
+                changed = save_rider_draft(st.session_state, edited)
+                save_rider_roster(
+                    roster_day,
+                    persistent_roster_columns(riders_for_optimizer(st.session_state.committed_riders)),
+                )
+            except Exception as exc:
+                st.error(f"Could not save riders: {exc}")
+            else:
+                st.session_state.bluesg_rider_save_message = (
+                    "Riders saved."
+                    + (" The previous optimisation is now stale." if changed and st.session_state.result_is_stale else "")
+                )
+                st.rerun()
+
+
+def build_summary_from_route_rows(route_df: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    if route_df is None or route_df.empty:
+        return pd.DataFrame(columns=SUMMARY_COLUMNS)
+    working = sort_routes_for_map(route_df)
+    for rider, rider_routes in working.groupby("Rider", sort=False):
+        numeric = lambda column: float(
+            pd.to_numeric(rider_routes.get(column), errors="coerce").fillna(0).sum()
+        )
+        total_duration = numeric("Total Duration Min")
+        adjusted_values = pd.to_numeric(
+            rider_routes.get("Projected Adjusted Duration Min"), errors="coerce"
+        ).dropna()
+        adjusted = (
+            float(adjusted_values.iloc[-1])
+            if not adjusted_values.empty
+            else total_duration * DEFAULT_DURATION_BUFFER_MULTIPLIER
+        )
+        rows.append(
+            {
+                "Rider": clean_text(rider),
+                "Total Jobs": len(rider_routes),
+                "Total Empty Distance KM": round(numeric("Empty Distance KM"), 2),
+                "Total Empty Duration Min": round(numeric("Empty Duration Min"), 1),
+                "Total Loaded Distance KM": round(numeric("Loaded Distance KM"), 2),
+                "Total Loaded Duration Min": round(numeric("Loaded Duration Min"), 1),
+                "Total Route Distance KM": round(numeric("Total Distance KM"), 2),
+                "Total Route Duration Min": round(total_duration, 1),
+                "Adjusted Route Duration Min": round(adjusted, 1),
+                "Within 3 Hours": "OK" if adjusted <= 180 else "Fail",
+                "Final Location": clean_text(rider_routes.iloc[-1].get("Drop-off Address")),
+            }
+        )
+    summary = pd.DataFrame(rows)
+    for column in SUMMARY_COLUMNS:
+        if column not in summary.columns:
+            summary[column] = 0 if any(token in column for token in ("Distance", "Duration", "Count", "Jobs")) else ""
+    return format_summary_output(summary[SUMMARY_COLUMNS], route_df)
+
+
+def assignment_review_table(route_df: pd.DataFrame, jobs_df: pd.DataFrame) -> pd.DataFrame:
+    jobs_by_id = build_jobs_by_stable_id(jobs_df)
+    rows: list[dict[str, object]] = []
+    for _, route in sort_routes_for_map(route_df).iterrows():
+        stable_id = stable_job_id_from_route_row(route)
+        job = jobs_by_id.get(stable_id, {})
+        rows.append(
+            {
+                "Rider": clean_text(route.get("Rider")),
+                "Sequence": route.get("Sequence"),
+                "Car Plate": clean_text(route.get("Car Plate")),
+                "Job ID": clean_text(job.get("Job ID")) or stable_id,
+                "Pickup": clean_text(route.get("Pickup Address")),
+                "Pickup Lot": clean_text(route.get("Pickup Lot")),
+                "Drop-off": clean_text(route.get("Drop-off Address")),
+                "Drop-off Lot": clean_text(job.get("Drop-off Lot")),
+                "Deadline": job.get("Deadline", ""),
+                "Empty Travel Min": route.get("Empty Duration Min"),
+                "Loaded Travel Min": route.get("Loaded Duration Min"),
+                "Pickup Zone": clean_text(job.get("Pickup Zone")),
+                "Drop-off Zone": clean_text(job.get("Drop-off Zone")),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def render_operator_assignment_review(
+    route_df: pd.DataFrame,
+    summary_df: pd.DataFrame,
+    jobs_df: pd.DataFrame,
+    rider_df: pd.DataFrame,
+    unassigned_jobs_df: pd.DataFrame,
+) -> None:
+    st.subheader("Who takes each car")
+    assignment_table = assignment_review_table(route_df, jobs_df)
+    rider_options = ["All riders"] + sorted(assignment_table["Rider"].dropna().unique().tolist())
+    with st.container(horizontal=True, vertical_alignment="bottom"):
+        rider_filter = st.selectbox(
+            "Rider",
+            rider_options,
+            key="bluesg_v2_result_rider_filter",
+            width=220,
+        )
+        plate_search = st.text_input(
+            "Licence plate",
+            key="bluesg_v2_plate_search",
+            placeholder="Search LP",
+            icon=":material/search:",
+            width=280,
+        ).strip()
+    filtered = assignment_table.copy()
+    if rider_filter != "All riders":
+        filtered = filtered[filtered["Rider"] == rider_filter]
+    if plate_search:
+        filtered = filtered[
+            filtered["Car Plate"].str.contains(plate_search, case=False, regex=False, na=False)
+        ]
+    visible = pd.DataFrame(
+        {
+            "Rider": filtered["Rider"].apply(clean_text),
+            "Job": pd.to_numeric(filtered["Sequence"], errors="coerce").astype("Int64"),
+            "Licence plate": filtered["Car Plate"].apply(clean_text),
+            "Task ID": filtered["Job ID"].apply(clean_text),
+            "Pickup → drop-off": filtered.apply(
+                lambda row: f"{clean_text(row['Pickup'])} → {clean_text(row['Drop-off'])}",
+                axis=1,
+            ),
+            "Deadline": filtered["Deadline"].apply(clean_text),
+        }
+    )
+    st.caption(
+        f"{len(visible)} assignment(s). Copy an LP from the Licence plate column, search it in Flexar, then assign it to the rider in the first column."
+    )
+    table_height = min(1100, 42 + max(1, len(visible)) * 34)
+    st.dataframe(
+        visible,
+        width="stretch",
+        height=table_height,
+        row_height=32,
+        hide_index=True,
+        column_config={
+            "Rider": st.column_config.TextColumn(pinned=True, width="small"),
+            "Job": st.column_config.NumberColumn(pinned=True, width="small", format="%d"),
+            "Licence plate": st.column_config.TextColumn(pinned=True, width="small"),
+            "Task ID": st.column_config.TextColumn(width="small"),
+            "Pickup → drop-off": st.column_config.TextColumn(width="large"),
+            "Deadline": st.column_config.TextColumn(width="medium"),
+        },
+    )
+
+    if unassigned_jobs_df is not None and not unassigned_jobs_df.empty:
+        st.subheader("Unassigned jobs")
+        st.dataframe(unassigned_jobs_df, width="stretch", hide_index=True)
+    else:
+        st.caption("All committed jobs are assigned.")
+
+
+def build_assignment_editor_dataframe(
+    route_df: pd.DataFrame,
+    jobs_df: pd.DataFrame,
+    rider_names: list[str],
+) -> pd.DataFrame:
+    jobs_by_id = build_jobs_by_stable_id(jobs_df)
+    assignment = assignment_from_routes(route_df, jobs_df, rider_names)
+    route_lookup = {
+        stable_job_id_from_route_row(row): row
+        for _, row in route_df.iterrows()
+    }
+    rows: list[dict[str, object]] = []
+    for rider, job_ids in assignment.items():
+        display_rider = "Unassigned" if rider == UNASSIGNED_LANE else rider
+        for sequence, stable_id in enumerate(job_ids, start=1):
+            job = jobs_by_id[stable_id]
+            original = route_lookup.get(stable_id, {})
+            rows.append(
+                {
+                    "_Stable Job Key": stable_id,
+                    "Job ID": clean_text(job.get("Job ID")) or stable_id,
+                    "Car Plate": clean_text(job.get("Car Plate")),
+                    "Pickup": clean_text(job.get("Pickup Address")),
+                    "Drop-off": clean_text(job.get("Drop-off Address")),
+                    "Original Rider": clean_text(original.get("Rider")) or "Unassigned",
+                    "Original Sequence": original.get("Sequence", sequence),
+                    "Rider": display_rider,
+                    "Sequence": sequence,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+@st.dialog("Edit Assignments", width="large")
+def edit_assignments_dialog() -> None:
+    latest = st.session_state.get("optimiser_result")
+    if not latest:
+        st.error("Run the optimiser before editing assignments.")
+        return
+    route_df = latest["route_df"]
+    jobs_df = latest["jobs_df"]
+    rider_df = latest["rider_df"]
+    rider_names = rider_df["Rider Name"].apply(clean_text).tolist()
+    if st.session_state.get("assignment_draft") is None:
+        st.session_state.assignment_draft = build_assignment_editor_dataframe(
+            route_df, jobs_df, rider_names
+        )
+    with st.form("bluesg_v2_assignment_form"):
+        edited = st.data_editor(
+            st.session_state.assignment_draft,
+            hide_index=True,
+            width="stretch",
+            height=430,
+            disabled=[
+                "_Stable Job Key",
+                "Job ID",
+                "Car Plate",
+                "Pickup",
+                "Drop-off",
+                "Original Rider",
+                "Original Sequence",
+            ],
+            column_config={
+                "_Stable Job Key": None,
+                "Rider": st.column_config.SelectboxColumn(
+                    options=[*rider_names, "Unassigned"], required=True
+                ),
+                "Sequence": st.column_config.NumberColumn(min_value=1, step=1, required=True),
+            },
+        )
+        action_columns = st.columns(2)
+        apply_clicked = action_columns[0].form_submit_button(
+            "Apply Assignment Changes", type="primary"
+        )
+        cancel_clicked = action_columns[1].form_submit_button("Cancel")
+    if cancel_clicked:
+        st.session_state.assignment_draft = None
+        st.rerun()
+    if apply_clicked:
+        expected = list(build_jobs_by_stable_id(jobs_df))
+        validation_frame = edited[["_Stable Job Key", "Rider", "Sequence"]].rename(
+            columns={"_Stable Job Key": "Job ID"}
+        ).copy()
+        validation_frame["Rider"] = validation_frame["Rider"].replace(
+            {"Unassigned": UNASSIGNED_LANE}
+        )
+        validation = validate_assignment_draft(
+            validation_frame,
+            expected,
+            [*rider_names, UNASSIGNED_LANE],
+        )
+        if not validation.is_valid:
+            for error in validation.errors:
+                st.error(error)
+            return
+        normalised = normalise_assignment_sequences(validation_frame)
+        proposed = {
+            rider: group["Job ID"].tolist()
+            for rider, group in normalised.groupby("Rider", sort=False)
+        }
+        proposed = {rider: proposed.get(rider, []) for rider in rider_names} | {
+            UNASSIGNED_LANE: proposed.get(UNASSIGNED_LANE, [])
+        }
+        confirmed = assignment_from_routes(route_df, jobs_df, rider_names)
+        try:
+            with st.status("Recalculating affected rider routes", expanded=True):
+                result = incremental_recalculate(
+                    confirmed_routes=route_df,
+                    confirmed_assignment=confirmed,
+                    draft_assignment=proposed,
+                    rider_df=rider_df,
+                    jobs_df=jobs_df,
+                    settings=latest.get("optimisation_settings", {}),
+                    summary_builder=build_summary_from_route_rows,
+                )
+        except Exception as exc:
+            st.error(f"No changes were committed: {exc}")
+            return
+        st.session_state.setdefault("v2_assignment_undo", []).append(copy.deepcopy(latest))
+        st.session_state.v2_assignment_undo = st.session_state.v2_assignment_undo[-10:]
+        updated = copy.deepcopy(latest)
+        updated["route_df"] = result.route_df.copy()
+        updated["summary_df"] = result.summary_df.copy()
+        updated["lookup_warnings"] = sorted(set([*updated.get("lookup_warnings", []), *result.warnings]))
+        updated["integrity_report"] = optimisation_integrity_report(result.route_df, jobs_df)
+        updated["run_result"] = None
+        st.session_state.setdefault("original_optimiser_result", copy.deepcopy(latest))
+        commit_optimiser_result(
+            st.session_state,
+            updated,
+            jobs=st.session_state.committed_jobs,
+            riders=st.session_state.committed_riders,
+        )
+        st.session_state.bluesg_latest_optimisation = updated
+        st.session_state.assignment_draft = None
+        st.session_state.bluesg_assignment_message = (
+            f"Assignment changes applied atomically; recalculated {len(result.affected_riders)} rider(s)."
+        )
+        st.rerun()
+
+
 selected_job_date = pd.Timestamp.now(tz="Asia/Singapore").date()
 input_filename = ""
 input_sha256 = ""
-file_is_valid = False
-missing_headers: list[str] = []
 validation_warnings: list[str] = []
-upload_error = ""
-roster_path = ensure_rider_roster_workbook()
+ensure_rider_roster_workbook()
 scoring_defaults = {
     "empty_weight": DEFAULT_EMPTY_WEIGHT,
     "loaded_weight": DEFAULT_LOADED_WEIGHT,
@@ -1140,271 +1664,102 @@ scoring_defaults = {
     "fallback_penalty": DEFAULT_FALLBACK_PENALTY,
 }
 
-upload_col, riders_col = st.columns(2, gap="large")
+today_name = pd.Timestamp.now(tz="Asia/Singapore").day_name()
+initial_riders = add_session_rider_load_column(load_rider_roster(today_name))
+initialise_workflow_state(st.session_state, initial_riders)
+refresh_stale_flag(st.session_state)
 
-with upload_col:
-    st.subheader("1. Upload Job List")
-    uploaded_file = st.file_uploader("Upload vehicle jobs Excel file", type=["xlsx", "xls"])
+header_columns = st.columns([5, 1.25], vertical_alignment="center")
+header_columns[0].title("Vehicle Route Optimiser")
+if header_columns[1].button(
+    "Today's riders",
+    icon=":material/menu:",
+    width="stretch",
+):
+    begin_rider_draft(st.session_state)
+    configure_riders_dialog(today_name)
 
-    if uploaded_file is None:
-        st.caption("Upload an Excel file to begin.")
-    else:
-        try:
-            input_filename = clean_text(getattr(uploaded_file, "name", "uploaded_jobs.xlsx"))
-            input_sha256 = sha256_bytes(uploaded_file.getvalue())
-            jobs_df, missing_headers, validation_warnings = load_and_validate_jobs(uploaded_file)
-        except ValueError as exc:
-            upload_error = str(exc)
-            st.error(upload_error)
-        else:
-            if missing_headers:
-                st.error("Missing required header(s): " + ", ".join(missing_headers))
-            else:
-                file_is_valid = True
-                skipped_rows = int(jobs_df.attrs.get("blank_address_rows_dropped", 0))
-                if "Date" in jobs_df.columns:
-                    parsed_dates = pd.to_datetime(jobs_df["Date"], errors="coerce").dt.date
-                    available_dates = sorted(parsed_dates.dropna().unique())
-                    if available_dates:
-                        today = pd.Timestamp.now(tz="Asia/Singapore").date()
-                        default_date_index = (
-                            available_dates.index(today)
-                            if today in available_dates
-                            else len(available_dates) - 1
-                        )
-                        selected_job_date = st.selectbox(
-                            "Job date",
-                            available_dates,
-                            index=default_date_index,
-                            format_func=lambda value: value.strftime("%d/%m/%Y"),
-                            help="Only jobs for the selected date are sent into the optimiser.",
-                        )
-                        all_date_jobs_count = len(jobs_df)
-                        jobs_df = jobs_df.loc[parsed_dates == selected_job_date].copy()
-                        jobs_df.attrs.update(
-                            {
-                                "uploaded_count": all_date_jobs_count,
-                                "blank_address_rows_dropped": skipped_rows,
-                            }
-                        )
-                        st.caption(
-                            f"Showing {len(jobs_df)} of {all_date_jobs_count} valid job(s) "
-                            f"for {selected_job_date.strftime('%d/%m/%Y')}."
-                        )
-                status_cols = st.columns(2)
-                status_cols[0].metric("Valid Jobs", len(jobs_df))
-                status_cols[1].metric("Skipped Rows", skipped_rows)
-                preview_columns = [
-                    "Date",
-                    "Car Plate",
-                    "Pickup Address",
-                    "Pickup Lot",
-                    "Drop-off Address",
-                    "Pickup Zone",
-                    "Drop-off Zone",
-                ]
-                preview_columns = [column for column in preview_columns if column in jobs_df.columns]
-                with st.expander("Preview uploaded jobs", expanded=True):
-                    st.dataframe(
-                        jobs_df[preview_columns],
-                        width="stretch",
-                        hide_index=True,
-                        height=220,
-                    )
+active_count = int(normalise_riders(st.session_state.committed_riders)["Active"].sum())
+st.caption(f"{active_count} active rider{'s' if active_count != 1 else ''}")
+if st.session_state.get("bluesg_rider_save_message"):
+    st.success(st.session_state.pop("bluesg_rider_save_message"))
 
-    with st.expander("Excel format and data checks", expanded=False):
-        st.write("Required headers:")
-        st.write(", ".join(REQUIRED_JOB_HEADERS))
-        st.write("Optional headers: Date, Fuel %, Pickup Time, Notes")
-        if upload_error:
-            st.error(upload_error)
-        if missing_headers:
-            st.error("Missing required header(s): " + ", ".join(missing_headers))
-        for warning in validation_warnings:
-            st.warning(warning)
-
-with riders_col:
-    st.subheader("2. Confirm Riders")
-    roster_header_cols = st.columns([2, 1])
-    with roster_header_cols[0]:
-        selected_roster_day = st.selectbox("Roster day", WEEKDAY_SHEETS)
-    with roster_header_cols[1]:
-        st.caption("Max Jobs is a soft guide.")
-
-    if st.session_state.get("bluesg_roster_day") != selected_roster_day:
-        st.session_state.bluesg_roster_day = selected_roster_day
-        st.session_state.bluesg_riders = add_session_rider_load_column(load_rider_roster(selected_roster_day))
-
-    if "bluesg_riders" not in st.session_state:
-        st.session_state.bluesg_riders = add_session_rider_load_column(load_rider_roster(selected_roster_day))
-    else:
-        st.session_state.bluesg_riders = add_session_rider_load_column(st.session_state.bluesg_riders)
-
-    rider_df = st.data_editor(
-        st.session_state.bluesg_riders,
-        num_rows="dynamic",
-        width="stretch",
-        hide_index=True,
-        height=330,
-        column_config={
-            "Rider Name": st.column_config.TextColumn(required=True),
-            "Start Location": st.column_config.TextColumn(required=True),
-            "Start Zone": st.column_config.SelectboxColumn(
-                options=["", "North", "North-West", "North-East", "East", "Central", "West", "South/CBD"],
-                help="Used for regional ownership, the initial fallback estimate, and tie-breaking.",
-            ),
-            "Max Jobs": st.column_config.NumberColumn(
-                min_value=1,
-                step=1,
-                help="Soft preference only. A rider can exceed it if they are still the best nearby match.",
-            ),
-            "Rider Load": st.column_config.SelectboxColumn(
-                options=RIDER_LOAD_INPUT_OPTIONS,
-                help=(
-                    "Session-only priority. Low keeps PT/empty travel and area changes low; "
-                    "Medium is balanced; High and Very High prefer clustered work. Priority owns "
-                    "matching-area jobs; multiple Priority riders in one area split them evenly. "
-                    "Pasted Normal becomes Medium, and Piority becomes Priority."
-                ),
-            ),
-        },
+with st.expander("How the route optimiser works", expanded=False):
+    st.write(
+        "Upload or paste the Flexar jobs, check today's riders, then run the optimiser. "
+        "Each rider travels to a pickup, moves the vehicle to its drop-off, and continues "
+        "from there. Same-zone work is preferred; short adjacent-zone work is allowed."
     )
-    rider_df = add_session_rider_load_column(rider_df)
-    st.session_state.bluesg_riders = rider_df
-    st.caption("Paste aliases supported: Normal → Medium; Piority → Priority.")
 
-    roster_action_cols = st.columns([1, 1, 1])
-    with roster_action_cols[0]:
-        if st.button("Save Roster", type="secondary", width="stretch"):
-            try:
-                saved_path = save_rider_roster(selected_roster_day, persistent_roster_columns(rider_df))
-            except PermissionError:
-                st.error("Could not save roster. Close the Excel workbook if it is open, then try again.")
-            except Exception as exc:
-                st.error(f"Could not save roster: {exc}")
-            else:
-                if os.name == "nt":
-                    st.success(f"Saved {selected_roster_day} roster to {saved_path}")
-                else:
-                    st.success(
-                        f"Saved {selected_roster_day} for this running Cloud session. "
-                        "Download the roster workbook below for a persistent copy."
-                    )
-    with roster_action_cols[1]:
-        if st.button("Reload From Excel", width="stretch"):
-            try:
-                st.session_state.bluesg_riders = add_session_rider_load_column(load_rider_roster(selected_roster_day))
-            except Exception as exc:
-                st.error(f"Could not reload roster: {exc}")
-            else:
-                st.rerun()
-    with roster_action_cols[2]:
-        if hasattr(os, "startfile"):
-            if st.button("Open Excel File", width="stretch"):
-                try:
-                    os.startfile(ROSTER_FILE)
-                except Exception as exc:
-                    st.error(f"Could not open roster workbook: {exc}")
-        else:
-            st.caption("Download the workbook below to edit it locally.")
+render_job_importer()
 
-    with st.expander("Roster file options", expanded=False):
-        st.caption(f"Persistent roster workbook: {roster_path}")
-        st.download_button(
-            "Download Roster Workbook",
-            data=read_rider_roster_file(),
-            file_name="weekday_rider_availability_and_capacity_roster.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+jobs_df = st.session_state.committed_jobs.copy(deep=True)
+rider_df = riders_for_optimizer(st.session_state.committed_riders)
+file_is_valid = not jobs_df.empty and validate_staged_jobs(jobs_df).is_valid
+source_result = st.session_state.get("imported_source_data")
+if source_result is not None:
+    input_filename = clean_text(source_result.metadata.get("filename")) or f"{source_result.source_type}-jobs"
+input_sha256 = hashlib.sha256(
+    jobs_df.astype("string").fillna("").to_csv(index=False).encode("utf-8")
+).hexdigest()
+date_values = None
+for date_column in ("Date", "Created At"):
+    if date_column in jobs_df.columns:
+        candidate = pd.to_datetime(jobs_df[date_column], errors="coerce")
+        if candidate.notna().any():
+            date_values = candidate
+            break
+if date_values is not None:
+    selected_job_date = date_values.dropna().max().date()
 
-action_col, review_col = st.columns([1, 2], gap="large")
+if st.session_state.result_is_stale:
+    st.warning(
+        "The committed jobs or riders changed. The displayed optimisation is stale; run it again before dispatch or export."
+    )
+
+action_col = st.container()
+review_col = st.container()
 
 with action_col:
-    st.subheader("3. Optimise Routes")
+    st.subheader("2. Run optimiser")
+    optimise_by = "duration"
+    use_onemap = True
+    onemap_token = ""
+    operation_date = selected_job_date
+    operation_start_time = clock_time(14, 0)
+    operation_end_time = clock_time(17, 0)
+    empty_travel_mode_label = next(iter(EMPTY_TRAVEL_MODES))
+    operation_context = OperationContext.for_window(
+        operation_date,
+        operation_start_time,
+        operation_end_time,
+        empty_travel_mode=EMPTY_TRAVEL_MODES[empty_travel_mode_label],
+    )
     with st.container(border=True):
-        optimise_by_label = st.radio(
-            "Optimise by",
-            ["Duration", "Distance"],
-            horizontal=True,
-            captions=["Lowest total minutes", "Lowest total kilometres"],
-        )
-        optimise_by = optimise_by_label.lower()
-
-        use_onemap = st.toggle("Use OneMap distance/time", value=True)
-        onemap_token = st.text_input(
-            "OneMap access token",
-            value="",
-            type="password",
-            help=(
-                "Optional manual token. Leave blank to use ONEMAP_EMAIL and "
-                "ONEMAP_PASSWORD from the configured secrets. If neither works, "
-                "the app uses fallback estimates."
-            ),
-            disabled=not use_onemap,
+        st.markdown(
+            f"**{len(jobs_df)} committed jobs · {active_count} active riders**  \n"
+            "Operating window: 2:00 PM–5:00 PM  \n"
+            f"Travel mode: {empty_travel_mode_label}"
         )
 
-        if use_onemap and not onemap_token and not onemap_credentials_configured():
-            st.warning(
-                "OneMap is enabled but no token or OneMap credentials are configured. "
-                "Fallback estimates will be used where needed."
-            )
-
-        st.markdown("**Overnight operating window**")
-        operation_date = st.date_input(
-            "Operation date",
-            value=selected_job_date,
-            help="The date on which rider duty begins.",
+        ready_to_optimise = file_is_valid and active_count > 0
+        if not file_is_valid:
+            st.warning("Upload at least one valid job before running the optimiser.")
+        elif active_count <= 0:
+            st.warning("Activate at least one rider in Today's riders before running the optimiser.")
+        optimise_clicked = st.button(
+            "Run optimiser",
+            type="primary",
+            icon=":material/play_arrow:",
+            disabled=not ready_to_optimise,
         )
-        window_cols = st.columns(2)
-        operation_start_time = window_cols[0].time_input("Duty start", value=clock_time(14, 0))
-        operation_end_time = window_cols[1].time_input("Duty end", value=clock_time(17, 0))
-        empty_travel_mode_label = st.selectbox(
-            "Empty-travel mode",
-            list(EMPTY_TRAVEL_MODES),
-            index=0,
-            help="Stored in the run record and route-cache context. Overnight transit is not reused from daytime.",
-        )
-        operation_context = OperationContext.for_window(
-            operation_date,
-            operation_start_time,
-            operation_end_time,
-            empty_travel_mode=EMPTY_TRAVEL_MODES[empty_travel_mode_label],
-        )
-        st.caption(
-            f"Window: {operation_context.operation_start.isoformat(timespec='minutes')} → "
-            f"{operation_context.operation_end.isoformat(timespec='minutes')} "
-            f"({operation_context.window_duration_min:.0f} min)"
-        )
-
-        ready_text = "Ready to optimise" if file_is_valid else "Upload a valid job file first"
-        st.caption(ready_text)
-        optimise_cols = st.columns(2)
-        with optimise_cols[0]:
-            optimise_clicked = st.button(
-                "Optimise Routes",
-                type="primary",
-                disabled=not file_is_valid,
-                width="stretch",
-            )
-        with optimise_cols[1]:
-            optimise_new_route_clicked = st.button(
-                "Optimise New Route",
-                disabled=not file_is_valid,
-                width="stretch",
-                help="Generate an alternate valid route plan by nudging assignment choices.",
-            )
-
+        optimise_new_route_clicked = False
         if optimise_clicked:
             st.session_state.bluesg_route_variant_index = 0
-        elif optimise_new_route_clicked:
-            st.session_state.bluesg_route_variant_index = int(
-                st.session_state.get("bluesg_route_variant_index", 0)
-            ) + 1
-        route_variant_index = int(st.session_state.get("bluesg_route_variant_index", 0))
-        if route_variant_index > 0:
-            st.caption(f"Alternate route variant #{route_variant_index}")
+        route_variant_index = 0
 
-    with st.expander("Advanced Settings", expanded=False):
+    with st.expander("Advanced settings", expanded=False, icon=":material/tune:"):
+        st.caption("Travel times use OneMap where available and fallback estimates when needed.")
         st.write("Fallback travel cost table")
         st.dataframe(cached_cost_explanation(), width="stretch", hide_index=True, height=180)
 
@@ -1503,9 +1858,6 @@ with action_col:
             value=True,
             help="If enabled, the optimiser retries unassigned jobs in different route positions, but never exceeds the max adjusted minutes cap.",
         )
-        if st.button("Reset to Recommended Defaults", width="stretch"):
-            for key, value in scoring_defaults.items():
-                st.session_state[f"bluesg_{key}"] = value
 
         score_col_a, score_col_b = st.columns(2)
         with score_col_a:
@@ -1872,7 +2224,7 @@ if optimise_clicked or optimise_new_route_clicked:
 
             if detail_parts:
                 detail_text.dataframe(
-                    pd.DataFrame(detail_parts, columns=["Current item", "Value"]),
+                    streamlit_key_value_table(detail_parts),
                     width="stretch",
                     hide_index=True,
                 )
@@ -2006,6 +2358,8 @@ if optimise_clicked or optimise_new_route_clicked:
         elapsed_total = time.monotonic() - started_at
         if route_df.empty:
             st.session_state.bluesg_latest_optimisation = None
+            st.session_state.optimiser_result = None
+            st.session_state.result_is_stale = False
             st.warning("No jobs could be assigned. Check rider roster and input data.")
         else:
             integrity_json = {key: value for key, value in integrity_report.items() if key != "unassigned_df"}
@@ -2075,8 +2429,19 @@ if optimise_clicked or optimise_new_route_clicked:
                     "elapsed_seconds": elapsed_total,
                 }),
             }
+            commit_optimiser_result(
+                st.session_state,
+                st.session_state.bluesg_latest_optimisation,
+                jobs=jobs_df,
+                riders=st.session_state.committed_riders,
+            )
+            st.session_state.original_optimiser_result = copy.deepcopy(
+                st.session_state.bluesg_latest_optimisation
+            )
+            st.session_state.v2_assignment_undo = []
+            st.session_state.assignment_draft = None
 
-latest_optimisation = st.session_state.get("bluesg_latest_optimisation")
+latest_optimisation = st.session_state.get("optimiser_result")
 if latest_optimisation:
     route_df = latest_optimisation["route_df"]
     summary_df = latest_optimisation["summary_df"]
@@ -2094,6 +2459,7 @@ if latest_optimisation:
     result_move_audit = latest_optimisation.get("move_audit", [])
     run_artifact_path = latest_optimisation.get("run_artifact_path", "")
     unassigned_jobs_df = result_integrity["unassigned_df"]
+    result_is_stale = bool(st.session_state.get("result_is_stale"))
 
     if not result_integrity["is_valid"]:
         st.error(result_integrity["message"])
@@ -2102,24 +2468,28 @@ if latest_optimisation:
         st.stop()
 
     with review_col:
-        st.subheader("4. Review Results")
+        st.subheader("3. Review results")
+        if result_is_stale:
+            st.error("Stale result — shown for reference only. Run the optimiser again before assigning jobs.")
         canonical_summary = result_run.summary if result_run is not None else {}
         assigned_jobs = int(canonical_summary.get("jobs_assigned", result_integrity["assigned_unique_jobs"]))
         assigned_route_rows = int(result_integrity["assigned_route_rows"])
         total_jobs_uploaded = int(result_integrity["total_valid_jobs"])
         unassigned_jobs = int(result_integrity["unassigned_jobs"])
-        riders_used = int(canonical_summary.get("riders_used", 0)) or (
-            int((summary_df["Total Jobs"].fillna(0).astype(int) > 0).sum())
-            if "Total Jobs" in summary_df.columns
-            else 0
+        active_riders = len(result_rider_df)
+        empty_travel = float(pd.to_numeric(route_df.get("Empty Duration Min"), errors="coerce").fillna(0).sum())
+        loaded_travel = float(pd.to_numeric(route_df.get("Loaded Duration Min"), errors="coerce").fillna(0).sum())
+        warning_count = len(result_lookup_warnings) + len(result_validation_warnings)
+        metric_cols = st.columns(4)
+        metric_cols[0].metric("Total jobs", total_jobs_uploaded)
+        metric_cols[1].metric("Assigned", assigned_jobs)
+        metric_cols[2].metric("Unassigned", unassigned_jobs)
+        metric_cols[3].metric("Riders", active_riders)
+        st.caption(
+            f"Empty travel {empty_travel:.1f} min\n\n"
+            f"Loaded travel {loaded_travel:.1f} min\n\n"
+            f"Warnings {warning_count}"
         )
-        total_duration = float(canonical_summary.get("total_duty_time_min", 0.0))
-        metric_cols = st.columns(5)
-        metric_cols[0].metric("Jobs Assigned", f"{assigned_jobs}/{total_jobs_uploaded}")
-        metric_cols[1].metric("Riders Used", riders_used)
-        metric_cols[2].metric("Total Rider Duty", f"{total_duration:.1f} min")
-        metric_cols[3].metric("Unassigned Jobs", unassigned_jobs)
-        metric_cols[4].metric("Fallback Legs", int(canonical_summary.get("fallback_leg_count", 0)))
 
         if baseline_run_summary:
             comparison_fields = [
@@ -2181,8 +2551,13 @@ if latest_optimisation:
             st.warning("Some rider route rows did not chain correctly. Open Data and route warnings for details.")
 
         with st.expander("Data and route warnings", expanded=False):
+            geographic_validation = route_df.attrs.get("geographic_validation", {})
+            for issue in geographic_validation.get("issues", []):
+                st.warning(
+                    f"{issue.get('car_plate') or issue.get('job_id')}: {issue.get('reason')}"
+                )
             if result_lookup_warnings:
-                st.write("OneMap lookups that used fallback estimates:")
+                st.write("Travel and assignment warnings:")
                 for warning in result_lookup_warnings[:100]:
                     st.warning(warning)
                 if len(result_lookup_warnings) > 100:
@@ -2227,7 +2602,63 @@ if latest_optimisation:
             else:
                 st.caption("Regional overflow diagnostics were not enabled for this run.")
 
-    render_route_editor(route_df, summary_df, result_jobs_df, result_rider_df)
+    render_operator_assignment_review(
+        route_df,
+        summary_df,
+        result_jobs_df,
+        result_rider_df,
+        unassigned_jobs_df,
+    )
+
+    st.subheader("Batch Manual Reassignment")
+    if st.session_state.get("bluesg_assignment_message"):
+        st.success(st.session_state.pop("bluesg_assignment_message"))
+    assignment_actions = st.columns(3)
+    if assignment_actions[0].button(
+        "Edit Assignments",
+        type="primary",
+        disabled=result_is_stale,
+        width="stretch",
+    ):
+        st.session_state.assignment_draft = build_assignment_editor_dataframe(
+            route_df,
+            result_jobs_df,
+            result_rider_df["Rider Name"].apply(clean_text).tolist(),
+        )
+        edit_assignments_dialog()
+    if assignment_actions[1].button(
+        "Undo Assignment Change",
+        disabled=not st.session_state.get("v2_assignment_undo") or result_is_stale,
+        width="stretch",
+    ):
+        history = st.session_state.get("v2_assignment_undo", [])
+        restored = history.pop()
+        st.session_state.v2_assignment_undo = history
+        commit_optimiser_result(
+            st.session_state,
+            restored,
+            jobs=st.session_state.committed_jobs,
+            riders=st.session_state.committed_riders,
+        )
+        st.session_state.bluesg_latest_optimisation = restored
+        st.session_state.bluesg_assignment_message = "Previous assignment restored."
+        st.rerun()
+    if assignment_actions[2].button(
+        "Reset to Optimiser Result",
+        disabled=not st.session_state.get("original_optimiser_result") or result_is_stale,
+        width="stretch",
+    ):
+        restored = copy.deepcopy(st.session_state.original_optimiser_result)
+        commit_optimiser_result(
+            st.session_state,
+            restored,
+            jobs=st.session_state.committed_jobs,
+            riders=st.session_state.committed_riders,
+        )
+        st.session_state.bluesg_latest_optimisation = restored
+        st.session_state.v2_assignment_undo = []
+        st.session_state.bluesg_assignment_message = "Original optimiser result restored."
+        st.rerun()
 
     show_route_map(route_df, result_jobs_df, result_rider_df, result_token)
 
@@ -2281,10 +2712,10 @@ if latest_optimisation:
     with st.expander("Detailed summary columns", expanded=False):
         st.dataframe(summary_df[detail_summary_columns], width="stretch", hide_index=True)
 
-    st.subheader("5. Download")
-    st.download_button(
-        "Download Excel Output",
-        data=export_routes_to_excel(
+    st.subheader("Download")
+    export_bytes = None
+    if not result_is_stale:
+        export_bytes = export_routes_to_excel(
             route_df,
             summary_df,
             jobs_df=result_jobs_df,
@@ -2292,11 +2723,15 @@ if latest_optimisation:
             lookup_warnings=result_lookup_warnings,
             run_result=result_run,
             move_audit=result_move_audit,
-        ),
+        )
+    st.download_button(
+        "Download Excel Output",
+        data=export_bytes or b"",
         file_name="vehicle_route_optimisation.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        disabled=export_bytes is None,
     )
 else:
     with review_col:
-        st.subheader("4. Review Results")
-        st.caption("Optimised routes will appear here after you run step 3.")
+        st.subheader("3. Review results")
+        st.caption("Optimised routes will appear here after the optimiser is run.")

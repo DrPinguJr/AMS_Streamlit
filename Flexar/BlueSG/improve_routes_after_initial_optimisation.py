@@ -225,6 +225,7 @@ def improve_assigned_routes(
                 and candidate_evaluation.get("unassigned_job_count", 0) <= current_evaluation.get("unassigned_job_count", 0)
                 and candidate_evaluation.get("hard_constraint_violation_count", 0) == 0
                 and candidate_evaluation.get("fallback_leg_count", 0) <= current_evaluation.get("fallback_leg_count", 0)
+                and candidate_evaluation.get("geographic_exception_count", 0) <= current_evaluation.get("geographic_exception_count", 0)
                 and candidate_evaluation.get("regional_exception_count", 0) <= current_evaluation.get("regional_exception_count", 0)
                 and candidate_evaluation.get("protected_job_misassignment_count", 0) <= current_evaluation.get("protected_job_misassignment_count", 0)
                 and after < before
@@ -236,6 +237,8 @@ def improve_assigned_routes(
                 reasons.append("hard constraint violation")
             if candidate_evaluation.get("fallback_leg_count", 0) > current_evaluation.get("fallback_leg_count", 0):
                 reasons.append("would replace verified travel with fallback")
+            if candidate_evaluation.get("geographic_exception_count", 0) > current_evaluation.get("geographic_exception_count", 0):
+                reasons.append("would create an additional geographic assignment exception")
             if candidate_evaluation.get("regional_exception_count", 0) > current_evaluation.get("regional_exception_count", 0):
                 reasons.append("would create an additional unsupported regional exception")
             if candidate_evaluation.get("protected_job_misassignment_count", 0) > current_evaluation.get("protected_job_misassignment_count", 0):

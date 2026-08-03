@@ -214,7 +214,7 @@ def test_clustered_cross_region_trip_has_zero_penalty_but_singleton_does_not() -
     assert "clustered trip" in clustered.reason
 
 
-def test_lester_takes_five_job_west_cluster_before_isolated_east_jobs(monkeypatch) -> None:
+def test_home_zone_jobs_are_kept_before_exceptional_cross_zone_cluster(monkeypatch) -> None:
     _patch_travel(monkeypatch)
     jobs = pd.DataFrame(
         [_job(index, "west_core") for index in range(5)]
@@ -241,8 +241,15 @@ def test_lester_takes_five_job_west_cluster_before_isolated_east_jobs(monkeypatc
 
     lester = route[route["Rider"] == "Lester"].sort_values("Sequence")
     assert len(lester) == 5
-    assert lester["Operational Subregion"].eq("west_core").all()
-    assert lester["Unsupported Region Penalty"].eq(0).all()
+    assert lester["Operational Subregion"].eq("east_core").sum() == 2
+    assert lester["Operational Subregion"].eq("west_core").sum() == 3
+    west_rows = lester[lester["Operational Subregion"].eq("west_core")]
+    assert west_rows["Geographic Assignment Status"].eq(
+        "exceptional_no_local_feasible"
+    ).all()
+    assert west_rows["Geographic Exception Reason"].str.contains(
+        "No same-zone or short adjacent-zone rider"
+    ).all()
 
 
 def test_regional_protection_recalculates_after_assignment() -> None:

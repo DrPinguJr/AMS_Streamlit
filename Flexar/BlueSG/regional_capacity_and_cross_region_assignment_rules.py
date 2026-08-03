@@ -28,6 +28,140 @@ OperationalSubregion = Literal[
 ]
 
 
+MAX_ADJACENT_ZONE_TRAVEL_MINUTES = 25.0
+SIDE_BY_SIDE_MAX_MINUTES = 15.0
+
+# Operational zones are deliberately more specific than the broad regions used
+# by the existing capacity model. Keep this policy here so the solver, final
+# validation, and tests all use one source of truth.
+ZONE_ADJACENCY: dict[str, frozenset[str]] = {
+    "west": frozenset({"west", "south_west", "north_west"}),
+    "north_west": frozenset({"north_west", "west", "north"}),
+    "north": frozenset({"north", "north_west", "north_east"}),
+    "north_east": frozenset({"north_east", "north", "east", "central"}),
+    "east": frozenset({"east", "north_east", "central"}),
+    "central": frozenset({"central", "east", "north_east", "south_west"}),
+    "south_west": frozenset({"south_west", "west", "central"}),
+}
+
+
+@dataclass(frozen=True)
+class GeographicAssignmentAssessment:
+    home_zone: str
+    current_zone: str
+    pickup_zone: str
+    travel_minutes: float
+    rank: int
+    status: str
+    is_normal: bool
+    is_side_by_side: bool
+    reason: str
+
+
+def normalize_operational_zone(value: Any) -> str:
+    """Return one of the seven route-policy zones, or ``unknown``."""
+
+    text = re.sub(r"[^a-z]+", "_", str(value or "").strip().lower()).strip("_")
+    aliases = {
+        "northwest": "north_west",
+        "north_west": "north_west",
+        "northeast": "north_east",
+        "north_east": "north_east",
+        "southwest": "south_west",
+        "south_west": "south_west",
+        "south_cbd": "south_west",
+        "cbd": "south_west",
+        "centre": "central",
+        "center": "central",
+    }
+    if text in aliases:
+        return aliases[text]
+    if text in ZONE_ADJACENCY:
+        return text
+
+    lowered = str(value or "").casefold()
+    address_zone_keywords = {
+        "north_west": (
+            "choa chu kang", "yew tee", "bukit panjang", "bukit batok",
+            "tengah", "hillview", "segar", "senja", "fajar", "petir",
+        ),
+        "north_east": ("punggol", "sengkang", "hougang", "serangoon", "buangkok", "kovan"),
+        "north": ("woodlands", "yishun", "sembawang", "admiralty", "marsiling", "mandai"),
+        "east": ("tampines", "pasir ris", "changi", "bedok", "simei", "tanah merah"),
+        "south_west": (
+            "clementi", "west coast", "dover", "buona vista", "queenstown",
+            "pasir panjang", "telok blangah", "harbourfront", "tanjong pagar",
+        ),
+        "west": ("tuas", "jurong", "boon lay", "pioneer", "joo koon", "teban", "pandan"),
+        "central": (
+            "orchard", "novena", "newton", "bishan", "toa payoh", "ang mo kio",
+            "kallang", "geylang", "paya lebar", "bugis", "marina", "raffles",
+        ),
+    }
+    for zone, keywords in address_zone_keywords.items():
+        if any(keyword in lowered for keyword in keywords):
+            return zone
+    return "unknown"
+
+
+def assess_geographic_assignment(
+    rider_home_zone: Any,
+    rider_current_zone: Any,
+    pickup_zone: Any,
+    travel_minutes: float | int | None,
+    *,
+    max_adjacent_minutes: float = MAX_ADJACENT_ZONE_TRAVEL_MINUTES,
+    side_by_side_minutes: float = SIDE_BY_SIDE_MAX_MINUTES,
+) -> GeographicAssignmentAssessment:
+    """Classify one rider-to-pickup edge before optimiser scoring."""
+
+    home = normalize_operational_zone(rider_home_zone)
+    current = normalize_operational_zone(rider_current_zone)
+    pickup = normalize_operational_zone(pickup_zone)
+    try:
+        minutes = float(travel_minutes)
+    except (TypeError, ValueError):
+        minutes = math.inf
+    if not math.isfinite(minutes):
+        minutes = math.inf
+
+    if "unknown" in {home, current, pickup}:
+        return GeographicAssignmentAssessment(
+            home, current, pickup, minutes, 3, "exceptional", False, False,
+            "Operational zone could not be established for the rider-to-pickup journey.",
+        )
+
+    home_allows = pickup in ZONE_ADJACENCY[home]
+    current_allows = pickup in ZONE_ADJACENCY[current]
+    if not home_allows or not current_allows:
+        return GeographicAssignmentAssessment(
+            home, current, pickup, minutes, 3, "non_adjacent", False, False,
+            f"Non-adjacent zone assignment ({home} / {current} to {pickup}).",
+        )
+
+    same_home_zone = pickup == home
+    if same_home_zone and minutes <= max_adjacent_minutes:
+        return GeographicAssignmentAssessment(
+            home, current, pickup, minutes, 0, "same_zone", True,
+            minutes <= side_by_side_minutes,
+            "Pickup is in the rider's home zone.",
+        )
+    if minutes <= side_by_side_minutes:
+        return GeographicAssignmentAssessment(
+            home, current, pickup, minutes, 1, "side_by_side", True, True,
+            "Adjacent-zone pickup is operationally close by travel time.",
+        )
+    if minutes <= max_adjacent_minutes:
+        return GeographicAssignmentAssessment(
+            home, current, pickup, minutes, 2, "adjacent", True, False,
+            "Adjacent-zone pickup is within the permitted travel threshold.",
+        )
+    return GeographicAssignmentAssessment(
+        home, current, pickup, minutes, 3, "adjacent_too_far", False, False,
+        f"Travel to the adjacent-zone pickup exceeds {max_adjacent_minutes:.0f} minutes.",
+    )
+
+
 REGIONAL_SUPPORT_RULES: dict[str, dict[str, list[str]]] = {
     "west_core": {"primary_regions": ["west"], "support_regions": []},
     "north_west": {"primary_regions": ["west"], "support_regions": ["north"]},
