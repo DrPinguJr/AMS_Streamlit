@@ -411,8 +411,8 @@ class TravelCost:
 
     def optimisation_value(self, optimise_by: str) -> float:
         if optimise_by == "distance":
-            return self.distance_km if self.distance_km is not None else self.duration_min or math.inf
-        return self.duration_min if self.duration_min is not None else self.distance_km or math.inf
+            return self.distance_km if self.distance_km is not None else _number_or_infinity(self.duration_min)
+        return self.duration_min if self.duration_min is not None else _number_or_infinity(self.distance_km)
 
     def to_leg_result(self, origin: str | None = None, destination: str | None = None) -> TravelLegResult:
         """Convert the compatibility value object to the canonical structured leg model."""
@@ -435,6 +435,19 @@ def clean_text(value: Any) -> str:
     if pd.isna(value):
         return ""
     return str(value).strip()
+
+
+def _number_or_infinity(value: Any) -> float:
+    """Convert a nullable route value without treating a valid zero as missing."""
+
+    if value is None:
+        return math.inf
+    try:
+        if pd.isna(value):
+            return math.inf
+        return float(value)
+    except (TypeError, ValueError):
+        return math.inf
 
 
 def _split_lookup_warning(warning: str) -> tuple[str, str]:
@@ -2720,7 +2733,7 @@ def rebuild_outputs_from_sequences(
             job = jobs_by_uploaded_row.get(int(row.get("Uploaded Row", -1)))
             if job is None:
                 continue
-            candidate_cost = float(row.get("Empty Duration Min", math.inf) or math.inf)
+            candidate_cost = _number_or_infinity(row.get("Empty Duration Min"))
             assessment = regional_context.assess_candidate(
                 job,
                 str(row.get("Rider", "")),
@@ -3856,7 +3869,7 @@ def optimise_vehicle_routes(
             allow_walk=False,
             operation_context=operation_context,
         )
-        return float(leg.duration_min or math.inf)
+        return _number_or_infinity(leg.duration_min)
 
     if regional_config.enabled:
         regional_context = build_regional_overflow_context(
@@ -3976,7 +3989,7 @@ def optimise_vehicle_routes(
                         ),
                         "starts_dense_cluster": starts_dense_cluster,
                         "continues_cluster": continues_cluster,
-                        "candidate_cost": float(inserted_row.get("Empty Duration Min", math.inf) or math.inf),
+                        "candidate_cost": _number_or_infinity(inserted_row.get("Empty Duration Min")),
                         "geographic_rank": int(inserted_row.get("Geographic Assignment Rank", 3) or 0),
                         "geographic_status": clean_text(inserted_row.get("Geographic Assignment Status")),
                         "priority_match": _priority_rider_matches_job(rider, job),
@@ -4228,7 +4241,7 @@ def optimise_vehicle_routes(
                                     "job_index": job_index,
                                     "job": job,
                                     "evaluation": evaluation,
-                                    "candidate_cost": float(inserted_row.get("Empty Duration Min", math.inf) or math.inf),
+                                    "candidate_cost": _number_or_infinity(inserted_row.get("Empty Duration Min")),
                                     "geographic_rank": int(inserted_row.get("Geographic Assignment Rank", 3) or 0),
                                     "geographic_status": clean_text(inserted_row.get("Geographic Assignment Status")),
                                     "current_region": infer_zone(inserted_row.get("Start From")) or rider.current_zone or "unknown",
@@ -4414,12 +4427,8 @@ def optimise_vehicle_routes(
                             if receiver_geographic_rank > donor_geographic_rank:
                                 continue
                             if receiver_geographic_rank == donor_geographic_rank == 3:
-                                receiver_empty = float(
-                                    inserted_row.get("Empty Duration Min", math.inf) or math.inf
-                                )
-                                donor_empty = float(
-                                    donor_row.get("Empty Duration Min", math.inf) or math.inf
-                                )
+                                receiver_empty = _number_or_infinity(inserted_row.get("Empty Duration Min"))
+                                donor_empty = _number_or_infinity(donor_row.get("Empty Duration Min"))
                                 if receiver_empty + SIDE_BY_SIDE_MAX_MINUTES >= donor_empty:
                                     continue
 
@@ -4430,7 +4439,7 @@ def optimise_vehicle_routes(
                             regional_audit: dict[str, Any] = {}
                             protected_primary_transfer = False
                             if regional_context:
-                                candidate_cost = float(inserted_row.get("Empty Duration Min", math.inf) or math.inf)
+                                candidate_cost = _number_or_infinity(inserted_row.get("Empty Duration Min"))
                                 assessment = regional_context.assess_candidate(
                                     job,
                                     receiver.name,
@@ -4549,9 +4558,7 @@ def optimise_vehicle_routes(
                     )
                     if current_rank <= 0:
                         continue
-                    current_empty = float(
-                        current_row.get("Empty Duration Min", math.inf) or math.inf
-                    )
+                    current_empty = _number_or_infinity(current_row.get("Empty Duration Min"))
                     donor_candidate_sequence = (
                         donor_sequence[:remove_at] + donor_sequence[remove_at + 1 :]
                     )
@@ -4606,9 +4613,7 @@ def optimise_vehicle_routes(
                             )
                             if replacement_rank >= current_rank or replacement_rank >= 3:
                                 continue
-                            replacement_empty = float(
-                                inserted_row.get("Empty Duration Min", math.inf) or math.inf
-                            )
+                            replacement_empty = _number_or_infinity(inserted_row.get("Empty Duration Min"))
                             added_duration = float(
                                 receiver_evaluation.get("raw_duration", math.inf)
                             ) - receiver_current_duration
@@ -4694,7 +4699,7 @@ def optimise_vehicle_routes(
                 job = all_job_records_by_id.get(job_id)
                 audit = dict(regional_context.assignments.get(job_id, {}))
                 if job is not None and not audit:
-                    candidate_cost = float(route_row.get("Empty Duration Min", math.inf) or math.inf)
+                    candidate_cost = _number_or_infinity(route_row.get("Empty Duration Min"))
                     assessment = regional_context.assess_candidate(
                         job,
                         rider.name,
@@ -4787,7 +4792,7 @@ def optimise_vehicle_routes(
 
         candidate_rows = sorted(
             candidate_rows,
-            key=lambda row: float(row["Projected Adjusted Duration Min"] or math.inf),
+            key=lambda row: _number_or_infinity(row["Projected Adjusted Duration Min"]),
         )
         rejected_candidate_audit.extend(candidate_rows[:3])
         best = candidate_rows[0] if candidate_rows else {}
@@ -4976,6 +4981,12 @@ def optimise_vehicle_routes(
         )
     report("Finished route optimisation", phase="Finished", progress=1.0)
     return route_df, summary_df, _dedupe_lookup_warnings(lookup_warnings)
+
+
+def run_optimiser_v1(*args: Any, **kwargs: Any) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    """Frozen public entry point for the pre-V2 production optimiser."""
+
+    return optimise_vehicle_routes(*args, **kwargs)
 
 
 def improve_route_dataframe(

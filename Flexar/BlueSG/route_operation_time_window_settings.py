@@ -84,6 +84,15 @@ class OperationContext:
         hour = self.operation_start.hour
         return f"{hour // 3 * 3:02d}-{(hour // 3 * 3 + 3) % 24:02d}"
 
+    @property
+    def operation_quarter_hour_bucket(self) -> str:
+        """Return the public-transport departure bucket used by V2 caches."""
+
+        minute = (self.operation_start.minute // 15) * 15
+        bucket_start = self.operation_start.replace(minute=minute, second=0, microsecond=0)
+        bucket_end = bucket_start + timedelta(minutes=14)
+        return f"{bucket_start:%H:%M}-{bucket_end:%H:%M}"
+
     def at_minutes(self, minutes: float) -> datetime:
         return self.operation_start + timedelta(minutes=float(minutes))
 

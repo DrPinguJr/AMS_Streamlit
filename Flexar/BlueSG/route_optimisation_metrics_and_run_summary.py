@@ -18,7 +18,9 @@ from Flexar.BlueSG.convert_results_to_output_safe_values import sanitize_for_out
 from Flexar.BlueSG.travel_cache_keys_and_route_confidence import confidence_from_source
 
 
-ALGORITHM_VERSION = "2.0.0"
+# This module is also used by the frozen V1 compatibility path. V2 passes its
+# own explicit version when the canonical run artifact is created.
+ALGORITHM_VERSION = "1.0.0-v1"
 
 
 def sha256_bytes(data: bytes) -> str:

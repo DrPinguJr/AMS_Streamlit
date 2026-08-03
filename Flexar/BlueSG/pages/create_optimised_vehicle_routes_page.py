@@ -97,6 +97,7 @@ from Flexar.BlueSG.optimiser_workflow_state import (
     normalise_riders,
     refresh_stale_flag,
     riders_for_optimizer,
+    riders_for_v2,
     save_rider_draft,
     normalise_assignment_sequences,
     streamlit_key_value_table,
@@ -104,9 +105,22 @@ from Flexar.BlueSG.optimiser_workflow_state import (
     validate_assignment_draft,
     validate_rider_draft,
 )
+from Flexar.BlueSG.optimiser_config import OPTIMISER_VERSION
+from Flexar.BlueSG.vehicle_route_optimiser_v2 import (
+    V2OptimisationResult,
+    WorkStyle,
+    capacity_summary,
+    run_optimiser_v2,
+    validate_v2_roster,
+)
+from Flexar.BlueSG.v2_daily_roster_source import (
+    DEFAULT_LOCAL_ROSTER,
+    load_daily_v2_roster,
+    save_local_v2_roster,
+)
 
 try:
-    st.set_page_config(page_title="Vehicle Route Optimiser", layout="wide")
+    st.set_page_config(page_title="Vehicle Route Optimiser — Version 2.0", layout="wide")
 except st.errors.StreamlitAPIException:
     pass
 
@@ -307,6 +321,15 @@ def persistent_roster_columns(rider_df: pd.DataFrame) -> pd.DataFrame:
         if column not in rider_df.columns:
             rider_df[column] = None
     return rider_df.loc[:, RIDER_COLUMNS].copy()
+
+
+def configured_google_roster_url() -> str:
+    """Return the optional published Google-Sheet CSV URL without requiring secrets."""
+
+    try:
+        return clean_text(st.secrets.get("BLUESG_ROSTER_GOOGLE_SHEET_CSV_URL", ""))
+    except Exception:
+        return ""
 
 
 def build_route_map_data(
@@ -1264,85 +1287,72 @@ def configure_riders_dialog(default_roster_day: str) -> None:
         index=default_index,
         key="bluesg_drawer_roster_day",
     )
-    roster_actions = st.columns(2)
-    if roster_actions[0].button(
-        "Reload roster as draft",
-        icon=":material/refresh:",
-        width="stretch",
-    ):
-        st.session_state.rider_draft = normalise_riders(
-            add_session_rider_load_column(load_rider_roster(roster_day))
+    source = clean_text(st.session_state.get("bluesg_roster_source")) or "Local fallback"
+    st.caption(f"Roster source: {source}")
+    if st.session_state.get("bluesg_roster_warning"):
+        st.info(st.session_state.bluesg_roster_warning)
+    if st.button("Reload daily roster", icon=":material/refresh:"):
+        loaded = load_daily_v2_roster(
+            roster_day,
+            google_csv_url=configured_google_roster_url() or None,
         )
+        st.session_state.rider_draft = normalise_riders(loaded.dataframe)
+        st.session_state.bluesg_roster_source = loaded.source
+        st.session_state.bluesg_roster_warning = loaded.warning
         st.rerun(scope="fragment")
-    roster_actions[1].download_button(
-        "Download roster workbook",
-        data=read_rider_roster_file(),
-        file_name="weekday_rider_availability_and_capacity_roster.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        icon=":material/download:",
-        width="stretch",
-    )
-    st.caption(f"Roster workbook: {ensure_rider_roster_workbook()}")
 
     if st.session_state.get("rider_draft") is None:
         begin_rider_draft(st.session_state)
     draft = normalise_riders(st.session_state.rider_draft)
+    display_draft = draft.copy()
+    operation_date = pd.Timestamp.now(tz="Asia/Singapore").date()
+    display_draft["Validation Status"] = [
+        (
+            "Inactive"
+            if not bool(row.get("Active", True))
+            else (
+                "Valid"
+                if validate_v2_roster(pd.DataFrame([row]), operation_date).is_valid
+                else "Needs attention"
+            )
+        )
+        for row in display_draft.to_dict("records")
+    ]
     with st.form("bluesg_v2_rider_form", border=False):
         edited = st.data_editor(
-            draft,
+            display_draft,
             num_rows="dynamic",
             hide_index=True,
             width="stretch",
             height=360,
+            disabled=["Validation Status"],
             column_config={
                 "Rider Name": st.column_config.TextColumn(required=True),
                 "Start Location": st.column_config.TextColumn(required=True),
                 "Start Zone": st.column_config.SelectboxColumn(
                     options=["", "North", "North-West", "North-East", "East", "Central", "West", "South/CBD"]
                 ),
-                "Maximum Jobs": st.column_config.NumberColumn(min_value=1, step=1),
-                "Rider Load": st.column_config.SelectboxColumn(options=RIDER_LOAD_INPUT_OPTIONS),
+                "Preferred": st.column_config.NumberColumn(min_value=0, step=1, required=True),
+                "Maximum": st.column_config.NumberColumn(min_value=1, step=1, required=True),
+                "Work Style": st.column_config.SelectboxColumn(
+                    options=[style.value for style in WorkStyle], required=True
+                ),
+                "End Requirement": st.column_config.TextColumn(
+                    help="Optional, for example: CCK by 4:30 PM"
+                ),
                 "Active": st.column_config.CheckboxColumn(),
+                "Validation Status": st.column_config.TextColumn(width="small"),
+                "Maximum Jobs": None,
+                "Rider Load": None,
             },
         )
-        utility_columns = st.columns(3)
-        duplicate_name = utility_columns[0].selectbox(
-            "Duplicate rider",
-            [""] + [name for name in edited["Rider Name"].apply(clean_text).tolist() if name],
-        )
-        bulk_max_jobs = utility_columns[1].number_input(
-            "Bulk maximum jobs", min_value=1, value=5, step=1
-        )
-        bulk_load = utility_columns[2].selectbox(
-            "Bulk rider load", RIDER_LOAD_LEVELS, index=1
-        )
-        action_columns = st.columns(5)
-        duplicate_clicked = action_columns[0].form_submit_button("Duplicate Row")
-        bulk_jobs_clicked = action_columns[1].form_submit_button("Set Max Jobs")
-        bulk_load_clicked = action_columns[2].form_submit_button("Set Rider Load")
-        save_clicked = action_columns[3].form_submit_button("Save Riders", type="primary")
-        cancel_clicked = action_columns[4].form_submit_button("Cancel")
+        action_columns = st.columns(2)
+        save_clicked = action_columns[0].form_submit_button("Save riders", type="primary")
+        cancel_clicked = action_columns[1].form_submit_button("Cancel")
 
     if cancel_clicked:
         cancel_rider_draft(st.session_state)
         st.rerun()
-    if duplicate_clicked:
-        source = edited[edited["Rider Name"].apply(clean_text).eq(duplicate_name)]
-        if source.empty:
-            st.error("Choose a rider row to duplicate.")
-        else:
-            duplicate = source.iloc[[0]].copy()
-            duplicate["Rider Name"] = duplicate["Rider Name"].apply(lambda value: f"{clean_text(value)} Copy")
-            st.session_state.rider_draft = pd.concat([edited, duplicate], ignore_index=True)
-            st.rerun(scope="fragment")
-    if bulk_jobs_clicked:
-        edited["Maximum Jobs"] = int(bulk_max_jobs)
-        st.session_state.rider_draft = edited
-        st.rerun(scope="fragment")
-    if bulk_load_clicked:
-        edited["Rider Load"] = bulk_load
-        st.session_state.rider_draft = edited
-        st.rerun(scope="fragment")
     if save_clicked:
         validation = validate_rider_draft(edited)
         if not validation.is_valid:
@@ -1351,15 +1361,13 @@ def configure_riders_dialog(default_roster_day: str) -> None:
         else:
             try:
                 changed = save_rider_draft(st.session_state, edited)
-                save_rider_roster(
-                    roster_day,
-                    persistent_roster_columns(riders_for_optimizer(st.session_state.committed_riders)),
-                )
+                if clean_text(st.session_state.get("bluesg_roster_source")) != "Google Sheets":
+                    save_local_v2_roster(roster_day, st.session_state.committed_riders)
             except Exception as exc:
                 st.error(f"Could not save riders: {exc}")
             else:
                 st.session_state.bluesg_rider_save_message = (
-                    "Riders saved."
+                    "Riders saved for this session."
                     + (" The previous optimisation is now stale." if changed and st.session_state.result_is_stale else "")
                 )
                 st.rerun()
@@ -1426,6 +1434,78 @@ def assignment_review_table(route_df: pd.DataFrame, jobs_df: pd.DataFrame) -> pd
                 "Loaded Travel Min": route.get("Loaded Duration Min"),
                 "Pickup Zone": clean_text(job.get("Pickup Zone")),
                 "Drop-off Zone": clean_text(job.get("Drop-off Zone")),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_v2_archive_table(
+    route_df: pd.DataFrame,
+    rider_df: pd.DataFrame,
+    explanations: list[dict[str, object]],
+    *,
+    operation_date: str,
+    completion_status: str,
+    runtime_seconds: float,
+    cache_hit_rate: float,
+) -> pd.DataFrame:
+    """Build the operations-facing daily archive without changing rider defaults."""
+
+    explanation_df = pd.DataFrame(explanations)
+    rows: list[dict[str, object]] = []
+    for rider in normalise_riders(rider_df).to_dict("records"):
+        rider_name = clean_text(rider.get("Rider Name"))
+        rider_routes = route_df[
+            route_df.get("Rider", pd.Series(index=route_df.index, dtype=str))
+            .astype(str)
+            .eq(rider_name)
+        ].copy()
+        if not rider_routes.empty:
+            rider_routes["_sequence"] = pd.to_numeric(
+                rider_routes.get("Sequence"), errors="coerce"
+            ).fillna(0)
+            last_route = rider_routes.sort_values("_sequence", kind="stable").iloc[-1]
+            final_location = clean_text(last_route.get("Drop-off Address"))
+        else:
+            final_location = clean_text(rider.get("Start Location"))
+        rider_explanations = (
+            explanation_df[
+                explanation_df.get(
+                    "rider_name", pd.Series(index=explanation_df.index, dtype=str)
+                )
+                .astype(str)
+                .eq(rider_name)
+            ]
+            if not explanation_df.empty
+            else pd.DataFrame()
+        )
+        severities = pd.to_numeric(
+            rider_explanations.get("severity", pd.Series(dtype=float)), errors="coerce"
+        ).fillna(0)
+        end_arrivals = [
+            value
+            for value in rider_explanations.get(
+                "estimated_end_arrival", pd.Series(dtype=object)
+            ).tolist()
+            if value not in (None, "")
+        ]
+        rows.append(
+            {
+                "Date": operation_date,
+                "Rider": rider_name,
+                "Start location": clean_text(rider.get("Start Location")),
+                "Work Style": clean_text(rider.get("Work Style")),
+                "Preferred Jobs": int(rider.get("Preferred") or 0),
+                "Maximum Jobs": int(rider.get("Maximum") or 0),
+                "Jobs assigned": len(rider_routes),
+                "Final job location": final_location,
+                "Required end destination": clean_text(rider.get("End Requirement")),
+                "Estimated required-end arrival": str(end_arrivals[-1]) if end_arrivals else "",
+                "Disliked assignments": int(severities.eq(2).sum()),
+                "Cross-zone assignments": int(severities.eq(3).sum()),
+                "Completion status": completion_status,
+                "Runtime seconds": round(float(runtime_seconds), 3),
+                "Cache hit rate": round(float(cache_hit_rate), 4),
             }
         )
     return pd.DataFrame(rows)
@@ -1500,6 +1580,69 @@ def render_operator_assignment_review(
         st.dataframe(unassigned_jobs_df, width="stretch", hide_index=True)
     else:
         st.caption("All committed jobs are assigned.")
+
+
+def render_v2_rider_cards(
+    route_df: pd.DataFrame,
+    rider_df: pd.DataFrame,
+    explanations: list[dict[str, object]],
+) -> None:
+    st.subheader("Rider routes")
+    explanation_df = pd.DataFrame(explanations)
+    card_columns = st.columns(2)
+    active_riders = normalise_riders(rider_df)
+    active_riders = active_riders[active_riders["Active"]].reset_index(drop=True)
+    for index, rider in active_riders.iterrows():
+        rider_name = clean_text(rider.get("Rider Name"))
+        rider_routes = route_df[
+            route_df.get("Rider", pd.Series(index=route_df.index, dtype=str))
+            .astype(str)
+            .eq(rider_name)
+        ].copy()
+        final_location = clean_text(rider.get("Start Location"))
+        route_valid = True
+        if not rider_routes.empty:
+            rider_routes["_sequence"] = pd.to_numeric(
+                rider_routes.get("Sequence"), errors="coerce"
+            ).fillna(0)
+            final_location = clean_text(
+                rider_routes.sort_values("_sequence", kind="stable").iloc[-1].get(
+                    "Drop-off Address"
+                )
+            )
+            if "Route Validation Status" in rider_routes:
+                route_valid = rider_routes["Route Validation Status"].astype(str).eq("OK").all()
+        end_requirement = clean_text(rider.get("End Requirement"))
+        estimated_arrival = ""
+        if end_requirement and not explanation_df.empty and "rider_name" in explanation_df:
+            rider_explanations = explanation_df[
+                explanation_df["rider_name"].astype(str).eq(rider_name)
+            ]
+            arrivals = [
+                value
+                for value in rider_explanations.get(
+                    "estimated_end_arrival", pd.Series(dtype=object)
+                ).tolist()
+                if value not in (None, "")
+            ]
+            if arrivals:
+                try:
+                    estimated_arrival = pd.Timestamp(arrivals[-1]).strftime("%-I:%M %p")
+                except ValueError:
+                    estimated_arrival = pd.Timestamp(arrivals[-1]).strftime("%I:%M %p").lstrip("0")
+        with card_columns[index % 2].container(border=True):
+            st.markdown(f"**{rider_name}**")
+            st.caption(
+                f"{len(rider_routes)} / {int(rider.get('Maximum') or 0)} jobs  \n"
+                f"{clean_text(rider.get('Work Style'))} — {clean_text(rider.get('Start Zone'))}  \n"
+                f"Final location: {final_location or 'Not assigned'}  \n"
+                f"Status: {'Valid' if route_valid else 'Needs review'}"
+            )
+            if end_requirement:
+                st.caption(
+                    f"Required destination: {end_requirement}  \n"
+                    f"Estimated arrival: {estimated_arrival or 'Not available'}"
+                )
 
 
 def build_assignment_editor_dataframe(
@@ -1606,6 +1749,67 @@ def edit_assignments_dialog() -> None:
             UNASSIGNED_LANE: proposed.get(UNASSIGNED_LANE, [])
         }
         confirmed = assignment_from_routes(route_df, jobs_df, rider_names)
+        if latest.get("v2_status"):
+            if proposed.get(UNASSIGNED_LANE):
+                st.error(
+                    "V2 manual changes must keep every committed job assigned. "
+                    "Use Run Optimiser V2.0 if a complete alternative is needed."
+                )
+                return
+            v2_roster = normalise_riders(rider_df)
+            maximum_by_rider = {
+                clean_text(row.get("Rider Name")): int(row.get("Maximum") or 0)
+                for row in v2_roster.to_dict("records")
+            }
+            for rider_name, job_ids in proposed.items():
+                if rider_name == UNASSIGNED_LANE:
+                    continue
+                if len(job_ids) > maximum_by_rider.get(rider_name, 0):
+                    st.error(
+                        f"{rider_name}: manual assignment has {len(job_ids)} jobs, above "
+                        f"Maximum Jobs {maximum_by_rider.get(rider_name, 0)}."
+                    )
+                    return
+            end_requirement_by_rider = {
+                clean_text(row.get("Rider Name")): clean_text(row.get("End Requirement"))
+                for row in v2_roster.to_dict("records")
+            }
+            changed_end_riders = [
+                rider_name
+                for rider_name, requirement in end_requirement_by_rider.items()
+                if requirement
+                and list(proposed.get(rider_name, []))
+                != list(confirmed.get(rider_name, []))
+            ]
+            if changed_end_riders:
+                st.error(
+                    "Routes with a required end destination must be rebuilt by V2 so the final "
+                    f"return journey remains a hard constraint: {', '.join(changed_end_riders)}."
+                )
+                return
+            jobs_by_stable_id = build_jobs_by_stable_id(jobs_df)
+            for rider_name, job_ids in proposed.items():
+                if rider_name == UNASSIGNED_LANE:
+                    continue
+                for stable_id in job_ids:
+                    job = jobs_by_stable_id[stable_id]
+                    fixed = clean_text(job.get("Fixed Rider") or job.get("Required Rider"))
+                    if fixed and fixed.casefold() != rider_name.casefold():
+                        st.error(f"{clean_text(job.get('Job ID')) or stable_id} is fixed to {fixed}.")
+                        return
+                    excluded = {
+                        part.strip().casefold()
+                        for part in clean_text(
+                            job.get("Excluded Riders") or job.get("Rider Exclusions")
+                        ).replace(";", ",").replace("|", ",").split(",")
+                        if part.strip()
+                    }
+                    if rider_name.casefold() in excluded:
+                        st.error(
+                            f"{rider_name} is explicitly excluded from "
+                            f"{clean_text(job.get('Job ID')) or stable_id}."
+                        )
+                        return
         try:
             with st.status("Recalculating affected rider routes", expanded=True):
                 result = incremental_recalculate(
@@ -1620,6 +1824,18 @@ def edit_assignments_dialog() -> None:
         except Exception as exc:
             st.error(f"No changes were committed: {exc}")
             return
+        operation_context = latest.get("optimisation_settings", {}).get("operation_context")
+        if latest.get("v2_status") and operation_context is not None:
+            completion = pd.to_datetime(
+                result.route_df.get("Final Completion ETA"), errors="coerce", utc=True
+            )
+            operation_end = pd.Timestamp(operation_context.operation_end).tz_convert("UTC")
+            if completion.notna().any() and completion.gt(operation_end).any():
+                st.error(
+                    "No changes were committed: the manual route would finish after the "
+                    "operation window."
+                )
+                return
         st.session_state.setdefault("v2_assignment_undo", []).append(copy.deepcopy(latest))
         st.session_state.v2_assignment_undo = st.session_state.v2_assignment_undo[-10:]
         updated = copy.deepcopy(latest)
@@ -1628,6 +1844,18 @@ def edit_assignments_dialog() -> None:
         updated["lookup_warnings"] = sorted(set([*updated.get("lookup_warnings", []), *result.warnings]))
         updated["integrity_report"] = optimisation_integrity_report(result.route_df, jobs_df)
         updated["run_result"] = None
+        if updated.get("v2_status"):
+            updated["v2_status"] = "COMPLETE_WITH_EXCEPTIONS"
+            updated["v2_objective"] = []
+            updated["v2_explanations"] = []
+            updated["lookup_warnings"] = sorted(
+                set(
+                    [
+                        *updated.get("lookup_warnings", []),
+                        "Manual reassignment applied; rerun V2 for a fresh global objective and explanations.",
+                    ]
+                )
+            )
         st.session_state.setdefault("original_optimiser_result", copy.deepcopy(latest))
         commit_optimiser_result(
             st.session_state,
@@ -1647,7 +1875,6 @@ selected_job_date = pd.Timestamp.now(tz="Asia/Singapore").date()
 input_filename = ""
 input_sha256 = ""
 validation_warnings: list[str] = []
-ensure_rider_roster_workbook()
 scoring_defaults = {
     "empty_weight": DEFAULT_EMPTY_WEIGHT,
     "loaded_weight": DEFAULT_LOADED_WEIGHT,
@@ -1665,12 +1892,21 @@ scoring_defaults = {
 }
 
 today_name = pd.Timestamp.now(tz="Asia/Singapore").day_name()
-initial_riders = add_session_rider_load_column(load_rider_roster(today_name))
+if "committed_riders" not in st.session_state:
+    initial_roster_load = load_daily_v2_roster(
+        today_name,
+        google_csv_url=configured_google_roster_url() or None,
+    )
+    initial_riders = initial_roster_load.dataframe
+    st.session_state.bluesg_roster_source = initial_roster_load.source
+    st.session_state.bluesg_roster_warning = initial_roster_load.warning
+else:
+    initial_riders = st.session_state.committed_riders
 initialise_workflow_state(st.session_state, initial_riders)
 refresh_stale_flag(st.session_state)
 
 header_columns = st.columns([5, 1.25], vertical_alignment="center")
-header_columns[0].title("Vehicle Route Optimiser")
+header_columns[0].title("Vehicle Route Optimiser — Version 2.0")
 if header_columns[1].button(
     "Today's riders",
     icon=":material/menu:",
@@ -1680,15 +1916,20 @@ if header_columns[1].button(
     configure_riders_dialog(today_name)
 
 active_count = int(normalise_riders(st.session_state.committed_riders)["Active"].sum())
-st.caption(f"{active_count} active rider{'s' if active_count != 1 else ''}")
+st.caption(
+    f"{active_count} active rider{'s' if active_count != 1 else ''} · "
+    f"{clean_text(st.session_state.get('bluesg_roster_source')) or 'Local fallback'} roster"
+)
 if st.session_state.get("bluesg_rider_save_message"):
     st.success(st.session_state.pop("bluesg_rider_save_message"))
 
 with st.expander("How the route optimiser works", expanded=False):
     st.write(
-        "Upload or paste the Flexar jobs, check today's riders, then run the optimiser. "
-        "Each rider travels to a pickup, moves the vehicle to its drop-off, and continues "
-        "from there. Same-zone work is preferred; short adjacent-zone work is allowed."
+        "Every valid job is mandatory whenever a hard-feasible plan exists. Version 2 checks "
+        "rider maximums, the operating window, availability and end-location deadlines first, "
+        "then minimises serious geographic exceptions, cross-zone work, disliked work, preferred "
+        "capacity overage, rider burden and travel. Area Leads retain first claim on local jobs "
+        "when their travel advantage is at least 12 minutes."
     )
 
 render_job_importer()
@@ -1735,6 +1976,13 @@ with action_col:
         operation_end_time,
         empty_travel_mode=EMPTY_TRAVEL_MODES[empty_travel_mode_label],
     )
+    roster_preview_errors: list[str] = []
+    try:
+        preview_riders = riders_for_v2(st.session_state.committed_riders, operation_date)
+    except ValueError as exc:
+        preview_riders = []
+        roster_preview_errors = [part.strip() for part in str(exc).split(";") if part.strip()]
+    preview_capacity = capacity_summary(len(jobs_df), preview_riders)
     with st.container(border=True):
         st.markdown(
             f"**{len(jobs_df)} committed jobs · {active_count} active riders**  \n"
@@ -1742,13 +1990,41 @@ with action_col:
             f"Travel mode: {empty_travel_mode_label}"
         )
 
-        ready_to_optimise = file_is_valid and active_count > 0
+        capacity_cols = st.columns(4)
+        capacity_cols[0].metric("Jobs", preview_capacity.job_count)
+        capacity_cols[1].metric("Preferred capacity", preview_capacity.preferred_capacity)
+        capacity_cols[2].metric("Maximum capacity", preview_capacity.maximum_capacity)
+        capacity_cols[3].metric(
+            "Average required",
+            f"{preview_capacity.required_average:.2f}" if preview_riders else "—",
+        )
+        for error in roster_preview_errors:
+            st.error(error)
+        if jobs_df.shape[0] and not preview_capacity.feasible_by_job_count:
+            st.error(
+                f"INFEASIBLE — {preview_capacity.job_count} jobs must be completed, but the "
+                f"current riders can perform at most {preview_capacity.maximum_capacity}. "
+                f"Capacity shortfall: {preview_capacity.shortfall} jobs."
+            )
+        available_rider_minutes = max(0.0, operation_context.window_duration_min) * len(preview_riders)
+        if jobs_df.shape[0] and len(jobs_df) * 35 > available_rider_minutes:
+            st.warning(
+                "The coarse time-capacity estimate is tight. V2 will use the complete travel "
+                "matrix to determine whether a physically feasible plan exists."
+            )
+
+        ready_to_optimise = (
+            file_is_valid
+            and active_count > 0
+            and not roster_preview_errors
+            and preview_capacity.feasible_by_job_count
+        )
         if not file_is_valid:
             st.warning("Upload at least one valid job before running the optimiser.")
         elif active_count <= 0:
             st.warning("Activate at least one rider in Today's riders before running the optimiser.")
         optimise_clicked = st.button(
-            "Run optimiser",
+            "Run Optimiser V2.0",
             type="primary",
             icon=":material/play_arrow:",
             disabled=not ready_to_optimise,
@@ -1973,10 +2249,23 @@ with action_col:
     )
 
 if optimise_clicked or optimise_new_route_clicked:
-    rider_df_for_optimise, duplicate_rider_rows_removed = dedupe_rider_roster(rider_df)
+    rider_source = (
+        normalise_riders(st.session_state.committed_riders)
+        if OPTIMISER_VERSION == "v2"
+        else rider_df
+    )
+    rider_df_for_optimise, duplicate_rider_rows_removed = dedupe_rider_roster(rider_source)
     if duplicate_rider_rows_removed:
         st.warning(f"Duplicate rider rows removed before optimisation: {duplicate_rider_rows_removed}")
-    riders, rider_errors = validate_riders(rider_df_for_optimise)
+    if OPTIMISER_VERSION == "v2":
+        try:
+            riders = riders_for_v2(rider_df_for_optimise, operation_date)
+            rider_errors = []
+        except ValueError as exc:
+            riders = []
+            rider_errors = [part.strip() for part in str(exc).split(";") if part.strip()]
+    else:
+        riders, rider_errors = validate_riders(rider_df_for_optimise)
     if rider_errors:
         for error in rider_errors:
             st.error(error)
@@ -2075,7 +2364,45 @@ if optimise_clicked or optimise_new_route_clicked:
                 assignment_reason, rider_load_level, region
             )
             show_terminal_entry = True
-            if event_type in {"assignment", "final_assignment"}:
+            if event_type == "v2_capacity":
+                terminal_message = "\n".join(
+                    [
+                        "Checking rider capacity",
+                        status,
+                        f"Jobs waiting: {remaining_jobs}",
+                    ]
+                )
+            elif event_type == "v2_matrix":
+                matrix_completed = int(event.get("matrix_completed", 0) or 0)
+                matrix_total = int(event.get("matrix_total", 0) or 0)
+                terminal_message = "\n".join(
+                    [
+                        f"Loading travel routes ({matrix_completed:,} of {matrix_total:,})",
+                        f"Saved-route hits: {int(event.get('cache_hits', 0) or 0):,}",
+                        f"New OneMap requests: {int(event.get('onemap_requests', 0) or 0):,}",
+                        f"Fallback estimates: {int(event.get('fallback_routes', 0) or 0):,}",
+                    ]
+                )
+            elif event_type == "v2_search":
+                retained_plans = int(event.get("retained_plans", 0) or 0)
+                terminal_message = "\n".join(
+                    [
+                        f"Building complete plans ({assigned_jobs} of {total_jobs} jobs placed)",
+                        f"Candidate routes checked: {comparison_count:,}",
+                        f"Best plans still retained: {retained_plans:,}",
+                        f"Jobs still left: {remaining_jobs}",
+                        f"Current car: {car_plate or 'Preparing next job'}",
+                    ]
+                )
+            elif event_type == "v2_finished":
+                terminal_message = "\n".join(
+                    [
+                        status,
+                        f"Jobs assigned: {assigned_jobs} of {total_jobs}",
+                        f"Candidate routes checked: {comparison_count:,}",
+                    ]
+                )
+            elif event_type in {"assignment", "final_assignment"}:
                 first_line = (
                     "Final route confirmed"
                     if event_type == "final_assignment"
@@ -2159,6 +2486,8 @@ if optimise_clicked or optimise_new_route_clicked:
                 event_type, phase, status, car_plate, rider_name, pickup, dropoff,
                 address, assignment_reason, driver_order_number,
                 driver_location_before_order, event.get("geocode_completed"),
+                event.get("matrix_completed"), assigned_jobs,
+                event.get("retained_plans"), event.get("result_status"),
             )
             if show_terminal_entry and signature != terminal_state["last_signature"]:
                 terminal_state["last_signature"] = signature
@@ -2180,12 +2509,22 @@ if optimise_clicked or optimise_new_route_clicked:
                 "Finalising": "Confirming routes",
                 "Finished": "Done",
                 "Fallback": "Estimating travel",
+                "Capacity check": "Checking capacity",
+                "Travel matrix": "Loading travel",
+                "Plan search": "Building complete plans",
             }.get(phase, "Working")
             phase_metric.metric("What is happening", phase_name)
             assigned_metric.metric("Jobs given", f"{assigned_jobs}/{total_jobs}")
             remaining_metric.metric("Jobs left", remaining_jobs)
             elapsed_metric.metric("Time used", f"{elapsed:,.1f}s")
-            checks_metric.metric("Routes checked", f"{comparison_count:,}/{estimated_comparisons:,}")
+            checks_metric.metric(
+                "Routes checked",
+                (
+                    f"{comparison_count:,}/{estimated_comparisons:,}"
+                    if estimated_comparisons
+                    else f"{comparison_count:,}"
+                ),
+            )
             progress_bar.progress(
                 progress_value,
                 text=f"{phase_name} ({progress_value * 100:.0f}% done)",
@@ -2215,6 +2554,12 @@ if optimise_clicked or optimise_new_route_clicked:
                 detail_parts.append(("Pickup", event["current_pickup"]))
             if event.get("current_dropoff"):
                 detail_parts.append(("Drop-off", event["current_dropoff"]))
+            if event.get("current_origin"):
+                detail_parts.append(("Travel from", event["current_origin"]))
+            if event.get("current_destination"):
+                detail_parts.append(("Travel to", event["current_destination"]))
+            if event.get("retained_plans") is not None:
+                detail_parts.append(("Best plans retained", event["retained_plans"]))
             if event.get("current_region"):
                 detail_parts.append(("Area", event["current_region"]))
             if event.get("rider_load_level"):
@@ -2276,37 +2621,81 @@ if optimise_clicked or optimise_new_route_clicked:
             "regional_overflow_config": regional_overflow_config,
         }
 
+        v2_result: V2OptimisationResult | None = None
+        baseline_run_result = None
+        move_audit: list[dict] = []
         try:
-            route_df, summary_df, lookup_warnings = optimise_vehicle_routes(
-                jobs_df,
-                riders,
-                use_onemap=use_onemap,
-                optimise_by=optimise_by,
-                token=onemap_token or None,
-                progress_callback=show_progress,
-                empty_weight=empty_weight,
-                loaded_weight=loaded_weight,
-                soft_workload_min=soft_workload_min,
-                workload_penalty_per_min=workload_penalty_per_min,
-                soft_adjusted_duration_min=soft_adjusted_duration_min,
-                duration_penalty_per_min=duration_penalty_per_min,
-                max_job_overage_penalty=max_job_overage_penalty,
-                duration_buffer_multiplier=duration_buffer_multiplier,
-                max_adjusted_duration_min=max_adjusted_duration_min,
-                empty_travel_duration_multiplier=empty_travel_duration_multiplier,
-                empty_travel_wait_buffer_min=empty_travel_wait_buffer_min,
-                force_complete_assignment=force_complete_assignment,
-                cluster_pressure_bonus_per_job=cluster_pressure_bonus_per_job,
-                route_variant_index=route_variant_index,
-                fallback_penalty=fallback_penalty,
-                operation_context=operation_context,
-                constraints=hard_constraints,
-                experimental_cluster_first=experimental_cluster_first,
-                max_total_duty_time_min=hard_max_duty_min if hard_duty_enabled else None,
-                regional_overflow_config=regional_overflow_config,
-            )
+            if OPTIMISER_VERSION == "v2":
+                activity_text.info("Precomputing the travel matrix, then searching complete plans...")
+                v2_result = run_optimiser_v2(
+                    jobs_df,
+                    riders,
+                    operation_context=operation_context,
+                    use_onemap=use_onemap,
+                    token=onemap_token or None,
+                    beam_width=120,
+                    time_limit_seconds=45.0,
+                    empty_duration_multiplier=empty_travel_duration_multiplier,
+                    empty_wait_buffer_min=empty_travel_wait_buffer_min,
+                    progress_callback=show_progress,
+                )
+                route_df = v2_result.route_df
+                summary_df = v2_result.summary_df
+                lookup_warnings = []
+                for warning_column in (
+                    "Travel Warning",
+                    "Empty Travel Warning",
+                    "Loaded Travel Warning",
+                ):
+                    if warning_column in route_df:
+                        lookup_warnings.extend(
+                            clean_text(value)
+                            for value in route_df[warning_column].tolist()
+                            if clean_text(value)
+                        )
+                lookup_warnings = sorted(set(lookup_warnings))
+                canonical_settings.update(
+                    {
+                        "optimiser_version": OPTIMISER_VERSION,
+                        "v2_status": v2_result.status,
+                        "v2_objective": list(v2_result.objective),
+                        "v2_capacity": sanitize_for_output(v2_result.capacity.__dict__),
+                        "v2_cache_metrics": sanitize_for_output(v2_result.cache_metrics),
+                    }
+                )
+            else:
+                route_df, summary_df, lookup_warnings = optimise_vehicle_routes(
+                    jobs_df,
+                    riders,
+                    use_onemap=use_onemap,
+                    optimise_by=optimise_by,
+                    token=onemap_token or None,
+                    progress_callback=show_progress,
+                    empty_weight=empty_weight,
+                    loaded_weight=loaded_weight,
+                    soft_workload_min=soft_workload_min,
+                    workload_penalty_per_min=workload_penalty_per_min,
+                    soft_adjusted_duration_min=soft_adjusted_duration_min,
+                    duration_penalty_per_min=duration_penalty_per_min,
+                    max_job_overage_penalty=max_job_overage_penalty,
+                    duration_buffer_multiplier=duration_buffer_multiplier,
+                    max_adjusted_duration_min=max_adjusted_duration_min,
+                    empty_travel_duration_multiplier=empty_travel_duration_multiplier,
+                    empty_travel_wait_buffer_min=empty_travel_wait_buffer_min,
+                    force_complete_assignment=force_complete_assignment,
+                    cluster_pressure_bonus_per_job=cluster_pressure_bonus_per_job,
+                    route_variant_index=route_variant_index,
+                    fallback_penalty=fallback_penalty,
+                    operation_context=operation_context,
+                    constraints=hard_constraints,
+                    experimental_cluster_first=experimental_cluster_first,
+                    max_total_duty_time_min=hard_max_duty_min if hard_duty_enabled else None,
+                    regional_overflow_config=regional_overflow_config,
+                )
             integrity_report = optimisation_integrity_report(route_df, jobs_df)
-            if not integrity_report["is_valid"]:
+            if not integrity_report["is_valid"] and not (
+                v2_result is not None and v2_result.status == "INFEASIBLE"
+            ):
                 st.error(integrity_report["message"])
                 if integrity_report["duplicate_details"]:
                     st.dataframe(pd.DataFrame(integrity_report["duplicate_details"]), width="stretch", hide_index=True)
@@ -2315,23 +2704,25 @@ if optimise_clicked or optimise_new_route_clicked:
             baseline_summary_df = summary_df.copy()
             baseline_integrity = {key: value for key, value in integrity_report.items() if key != "unassigned_df"}
             baseline_integrity.update(route_df.attrs.get("hard_constraint_validation", {}))
-            baseline_run_result = create_run_result(
-                route_df=baseline_route_df,
-                unassigned_df=integrity_report["unassigned_df"],
-                riders=riders,
-                context=operation_context,
-                settings={**canonical_settings, "wall_clock_seconds": time.monotonic() - started_at},
-                input_filename=input_filename,
-                input_sha256=input_sha256,
-                selected_job_date=str(selected_job_date),
-                warnings=[
-                    {"severity": "manual_review" if "fallback" in warning.casefold() or "low-confidence" in warning.casefold() else "warning", "message": warning}
-                    for warning in lookup_warnings
-                ],
-                validation=baseline_integrity,
-            )
-            move_audit: list[dict] = []
-            if enable_local_improvement and integrity_report["unassigned_jobs"] == 0:
+            if not route_df.empty:
+                baseline_run_result = create_run_result(
+                    route_df=baseline_route_df,
+                    unassigned_df=integrity_report["unassigned_df"],
+                    riders=riders,
+                    context=operation_context,
+                    settings={**canonical_settings, "wall_clock_seconds": time.monotonic() - started_at},
+                    input_filename=input_filename,
+                    input_sha256=input_sha256,
+                    selected_job_date=str(selected_job_date),
+                    warnings=[
+                        {"severity": "manual_review" if "fallback" in warning.casefold() or "low-confidence" in warning.casefold() else "warning", "message": warning}
+                        for warning in lookup_warnings
+                    ],
+                    validation=baseline_integrity,
+                    algorithm_name=v2_result.algorithm_name if v2_result else "state_aware_greedy_insertion",
+                    algorithm_version=v2_result.algorithm_version if v2_result else "1.0.0-v1",
+                )
+            if OPTIMISER_VERSION != "v2" and enable_local_improvement and integrity_report["unassigned_jobs"] == 0:
                 route_df, summary_df, improvement_warnings, move_audit = improve_route_dataframe(
                     baseline_route_df,
                     jobs_df,
@@ -2360,7 +2751,18 @@ if optimise_clicked or optimise_new_route_clicked:
             st.session_state.bluesg_latest_optimisation = None
             st.session_state.optimiser_result = None
             st.session_state.result_is_stale = False
-            st.warning("No jobs could be assigned. Check rider roster and input data.")
+            if v2_result is not None and v2_result.status == "INFEASIBLE":
+                st.error("INFEASIBLE — no complete plan satisfies all hard constraints.")
+                capacity = v2_result.capacity
+                st.write(
+                    f"Capacity check: {capacity.job_count} jobs, "
+                    f"{capacity.preferred_capacity} preferred slots and "
+                    f"{capacity.maximum_capacity} maximum slots."
+                )
+                for reason in v2_result.infeasible_reasons:
+                    st.error(reason)
+            else:
+                st.warning("No jobs could be assigned. Check rider roster and input data.")
         else:
             integrity_json = {key: value for key, value in integrity_report.items() if key != "unassigned_df"}
             integrity_json.update(route_df.attrs.get("hard_constraint_validation", {}))
@@ -2372,7 +2774,7 @@ if optimise_clicked or optimise_new_route_clicked:
                 settings={
                     **canonical_settings,
                     "wall_clock_seconds": elapsed_total,
-                    "baseline_summary": baseline_run_result.summary,
+                    "baseline_summary": baseline_run_result.summary if baseline_run_result else {},
                 },
                 input_filename=input_filename,
                 input_sha256=input_sha256,
@@ -2384,9 +2786,16 @@ if optimise_clicked or optimise_new_route_clicked:
                 move_audit=move_audit,
                 validation=integrity_json,
                 algorithm_name=(
-                    "state_aware_greedy_insertion+bounded_local_improvement"
-                    if any(move.get("accepted") for move in move_audit)
-                    else "state_aware_greedy_insertion"
+                    v2_result.algorithm_name
+                    if v2_result is not None
+                    else (
+                        "state_aware_greedy_insertion+bounded_local_improvement"
+                        if any(move.get("accepted") for move in move_audit)
+                        else "state_aware_greedy_insertion"
+                    )
+                ),
+                algorithm_version=(
+                    v2_result.algorithm_version if v2_result is not None else "1.0.0-v1"
                 ),
             )
             run_artifact_path = save_run_artifact(run_result)
@@ -2403,9 +2812,26 @@ if optimise_clicked or optimise_new_route_clicked:
                 "duplicate_rider_rows_removed": duplicate_rider_rows_removed,
                 "route_variant_index": route_variant_index,
                 "run_result": run_result,
-                "baseline_summary": baseline_run_result.summary,
+                "baseline_summary": (
+                    baseline_run_result.summary
+                    if baseline_run_result is not None and v2_result is None
+                    else {}
+                ),
                 "move_audit": move_audit,
                 "run_artifact_path": str(run_artifact_path),
+                "v2_status": v2_result.status if v2_result else "",
+                "v2_objective": list(v2_result.objective) if v2_result else [],
+                "v2_explanations": (
+                    [explanation.__dict__ for explanation in v2_result.explanations]
+                    if v2_result
+                    else []
+                ),
+                "v2_capacity": (
+                    sanitize_for_output(v2_result.capacity.__dict__) if v2_result else {}
+                ),
+                "v2_cache_metrics": (
+                    sanitize_for_output(v2_result.cache_metrics) if v2_result else {}
+                ),
                 "optimisation_settings": {
                     "use_onemap": use_onemap,
                     "optimise_by": optimise_by,
@@ -2427,6 +2853,7 @@ if optimise_clicked or optimise_new_route_clicked:
                     "rider_job_checks": int(last_progress_event.get("comparison_count", 0)),
                     "estimated_checks": int(last_progress_event.get("estimated_comparisons", estimated_checks)),
                     "elapsed_seconds": elapsed_total,
+                    "v2_runtime_seconds": v2_result.runtime_seconds if v2_result else None,
                 }),
             }
             commit_optimiser_result(
@@ -2451,6 +2878,11 @@ if latest_optimisation:
     result_lookup_warnings = latest_optimisation["lookup_warnings"]
     result_token = latest_optimisation["token"]
     result_diagnostics = latest_optimisation.get("diagnostics", {})
+    result_v2_status = clean_text(latest_optimisation.get("v2_status"))
+    result_v2_objective = list(latest_optimisation.get("v2_objective", []))
+    result_v2_explanations = list(latest_optimisation.get("v2_explanations", []))
+    result_v2_capacity = dict(latest_optimisation.get("v2_capacity", {}))
+    result_v2_cache = dict(latest_optimisation.get("v2_cache_metrics", {}))
     result_integrity = latest_optimisation.get("integrity_report") or optimisation_integrity_report(route_df, result_jobs_df)
     duplicate_rider_rows_removed = int(latest_optimisation.get("duplicate_rider_rows_removed", 0))
     result_route_variant_index = int(latest_optimisation.get("route_variant_index", 0))
@@ -2471,6 +2903,12 @@ if latest_optimisation:
         st.subheader("3. Review results")
         if result_is_stale:
             st.error("Stale result — shown for reference only. Run the optimiser again before assigning jobs.")
+        if result_v2_status == "COMPLETE":
+            st.success("COMPLETE — every job is assigned with no soft exceptions.")
+        elif result_v2_status == "COMPLETE_WITH_EXCEPTIONS":
+            st.warning(
+                "COMPLETE WITH EXCEPTIONS — every job is assigned, with the soft exceptions shown below."
+            )
         canonical_summary = result_run.summary if result_run is not None else {}
         assigned_jobs = int(canonical_summary.get("jobs_assigned", result_integrity["assigned_unique_jobs"]))
         assigned_route_rows = int(result_integrity["assigned_route_rows"])
@@ -2490,6 +2928,67 @@ if latest_optimisation:
             f"Loaded travel {loaded_travel:.1f} min\n\n"
             f"Warnings {warning_count}"
         )
+
+        if result_v2_status:
+            capacity_cols = st.columns(4)
+            capacity_cols[0].metric(
+                "Preferred capacity", int(result_v2_capacity.get("preferred_capacity", 0))
+            )
+            capacity_cols[1].metric(
+                "Maximum capacity", int(result_v2_capacity.get("maximum_capacity", 0))
+            )
+            capacity_cols[2].metric(
+                "Cache hit rate",
+                f"{float(result_v2_cache.get('cache_hit_rate', 0.0)) * 100:.0f}%",
+            )
+            capacity_cols[3].metric(
+                "V2 runtime",
+                f"{float(result_diagnostics.get('v2_runtime_seconds') or 0.0):.1f}s",
+            )
+            if len(result_v2_objective) >= 12:
+                exception_table = pd.DataFrame(
+                    [
+                        ["Extreme assignments", result_v2_objective[2]],
+                        ["Cross-zone assignments", result_v2_objective[3]],
+                        ["Area Lead ownership exceptions", result_v2_objective[4]],
+                        ["Fragmented clusters", result_v2_objective[5]],
+                        ["Disliked assignments", result_v2_objective[8]],
+                        ["Jobs above preferred capacity", result_v2_objective[9]],
+                    ],
+                    columns=["Exception", "Count"],
+                )
+                with st.expander("V2 objective and soft exceptions", expanded=False):
+                    st.dataframe(exception_table, width="stretch", hide_index=True)
+                    st.caption(
+                        "Lexicographic order: mandatory coverage, hard feasibility, extreme travel, "
+                        "cross-zone work, Area Lead ownership, cluster continuity, maximum burden, "
+                        "burden spread, disliked work, preferred overage, empty travel, total duration."
+                    )
+
+            if result_v2_explanations:
+                explanation_rows = []
+                for explanation in result_v2_explanations:
+                    explanation_rows.append(
+                        {
+                            "Rider": explanation.get("rider_name", ""),
+                            "Job": explanation.get("job_id", ""),
+                            "Severity": int(explanation.get("severity", 0)),
+                            "Empty min": explanation.get("empty_travel_minutes", 0),
+                            "Loaded min": explanation.get("loaded_travel_minutes", 0),
+                            "Projected jobs": explanation.get("projected_job_count", 0),
+                            "Why selected": "; ".join(explanation.get("selected_reasons", ())),
+                            "Soft exceptions": "; ".join(explanation.get("soft_exceptions", ())),
+                            "Travel source": explanation.get("travel_source", ""),
+                            "Cache": explanation.get("cache_status", ""),
+                        }
+                    )
+                with st.expander("Why each job was assigned", expanded=False):
+                    st.dataframe(
+                        pd.DataFrame(explanation_rows),
+                        width="stretch",
+                        hide_index=True,
+                        height=min(900, 42 + len(explanation_rows) * 34),
+                    )
 
         if baseline_run_summary:
             comparison_fields = [
@@ -2601,6 +3100,9 @@ if latest_optimisation:
                 st.dataframe(route_df[regional_columns], width="stretch", hide_index=True, height=280)
             else:
                 st.caption("Regional overflow diagnostics were not enabled for this run.")
+
+    if result_v2_status:
+        render_v2_rider_cards(route_df, result_rider_df, result_v2_explanations)
 
     render_operator_assignment_review(
         route_df,
@@ -2714,6 +3216,7 @@ if latest_optimisation:
 
     st.subheader("Download")
     export_bytes = None
+    archive_bytes = None
     if not result_is_stale:
         export_bytes = export_routes_to_excel(
             route_df,
@@ -2724,12 +3227,32 @@ if latest_optimisation:
             run_result=result_run,
             move_audit=result_move_audit,
         )
-    st.download_button(
+        archive_table = build_v2_archive_table(
+            route_df,
+            result_rider_df,
+            result_v2_explanations,
+            operation_date=(result_run.selected_job_date if result_run is not None else str(selected_job_date)),
+            completion_status=result_v2_status or "COMPLETE_WITH_EXCEPTIONS",
+            runtime_seconds=float(result_diagnostics.get("v2_runtime_seconds") or 0.0),
+            cache_hit_rate=float(result_v2_cache.get("cache_hit_rate", 0.0)),
+        )
+        archive_bytes = archive_table.to_csv(index=False).encode("utf-8")
+    download_cols = st.columns(2)
+    download_cols[0].download_button(
         "Download Excel Output",
         data=export_bytes or b"",
         file_name="vehicle_route_optimisation.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         disabled=export_bytes is None,
+        width="stretch",
+    )
+    download_cols[1].download_button(
+        "Archive Daily Result",
+        data=archive_bytes or b"",
+        file_name=f"vehicle_route_archive_{selected_job_date}.csv",
+        mime="text/csv",
+        disabled=archive_bytes is None,
+        width="stretch",
     )
 else:
     with review_col:

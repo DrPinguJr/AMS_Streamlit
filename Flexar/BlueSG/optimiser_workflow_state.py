@@ -12,15 +12,26 @@ from Flexar.BlueSG.job_import_staging import (
     commit_staged_jobs,
     validate_staged_jobs,
 )
+from Flexar.BlueSG.vehicle_route_optimiser_v2 import (
+    Rider,
+    WorkStyle,
+    normalise_v2_roster,
+    validate_v2_roster,
+)
 
 
 RIDER_DRAFT_COLUMNS = [
     "Rider Name",
     "Start Location",
     "Start Zone",
+    "Preferred",
+    "Maximum",
+    "Work Style",
+    "End Requirement",
+    "Active",
+    # Compatibility aliases retained for V1 rollback and the route planner.
     "Maximum Jobs",
     "Rider Load",
-    "Active",
 ]
 
 
@@ -64,48 +75,30 @@ def streamlit_key_value_table(
 
 
 def normalise_riders(rider_df: pd.DataFrame | None) -> pd.DataFrame:
-    riders = rider_df.copy(deep=True) if rider_df is not None else pd.DataFrame()
-    if "Maximum Jobs" not in riders.columns and "Max Jobs" in riders.columns:
-        riders["Maximum Jobs"] = riders["Max Jobs"]
-    defaults = {
-        "Rider Name": "",
-        "Start Location": "",
-        "Start Zone": "",
-        "Maximum Jobs": None,
-        "Rider Load": "Medium",
-        "Active": True,
-    }
-    for column, default in defaults.items():
-        if column not in riders.columns:
-            riders[column] = default
-    riders = riders.loc[:, RIDER_DRAFT_COLUMNS].copy()
-    for column in ["Rider Name", "Start Location", "Start Zone", "Rider Load"]:
-        riders[column] = riders[column].apply(_clean)
-    riders["Rider Load"] = riders["Rider Load"].replace({"Normal": "Medium", "Piority": "Priority"})
-    riders["Maximum Jobs"] = pd.to_numeric(riders["Maximum Jobs"], errors="coerce").astype("Int64")
-    riders["Active"] = riders["Active"].fillna(True).astype(bool)
-    return riders.reset_index(drop=True)
+    source = rider_df.copy(deep=True) if rider_df is not None else pd.DataFrame()
+    if "Maximum Jobs" not in source and "Max Jobs" in source:
+        source["Maximum Jobs"] = source["Max Jobs"]
+    v2 = normalise_v2_roster(source)
+    v2["Preferred"] = pd.to_numeric(v2["Preferred"], errors="coerce").astype("Int64")
+    v2["Maximum"] = pd.to_numeric(v2["Maximum"], errors="coerce").astype("Int64")
+    v2["Maximum Jobs"] = v2["Maximum"]
+    v2["Rider Load"] = v2["Work Style"].map(
+        {
+            WorkStyle.LOCAL.value: "Low",
+            WorkStyle.FLEXIBLE.value: "Medium",
+            WorkStyle.AREA_LEAD.value: "Priority",
+        }
+    ).fillna("Medium")
+    for column in ["Rider Name", "Start Location", "Start Zone", "Work Style", "End Requirement"]:
+        v2[column] = v2[column].apply(_clean)
+    v2["Active"] = v2["Active"].fillna(True).astype(bool)
+    return v2.loc[:, RIDER_DRAFT_COLUMNS].reset_index(drop=True)
 
 
 def validate_rider_draft(rider_df: pd.DataFrame) -> RiderValidationResult:
-    riders = normalise_riders(rider_df)
-    errors: list[str] = []
-    active = riders[riders["Active"]]
-    blank_names = active["Rider Name"].eq("")
-    if blank_names.any():
-        errors.append("Every active rider needs a Rider Name.")
-    blank_starts = active["Start Location"].eq("")
-    if blank_starts.any():
-        errors.append("Every active rider needs a Start Location.")
-    duplicate_names = active["Rider Name"].str.casefold().loc[lambda values: values.ne("")].duplicated(keep=False)
-    if duplicate_names.any():
-        errors.append("Active rider names must be unique.")
-    invalid_max = active["Maximum Jobs"].notna() & active["Maximum Jobs"].le(0)
-    if invalid_max.any():
-        errors.append("Maximum Jobs must be blank or at least 1.")
-    if active.empty:
-        errors.append("At least one rider must be active.")
-    return RiderValidationResult(not errors, tuple(errors))
+    operation_date = pd.Timestamp.now(tz="Asia/Singapore").date()
+    validation = validate_v2_roster(normalise_v2_roster(rider_df), operation_date)
+    return RiderValidationResult(validation.is_valid, tuple(validation.errors))
 
 
 def riders_for_optimizer(rider_df: pd.DataFrame) -> pd.DataFrame:
@@ -114,8 +107,15 @@ def riders_for_optimizer(rider_df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("; ".join(validation.errors))
     riders = normalise_riders(rider_df)
     riders = riders[riders["Active"]].copy()
-    riders = riders.rename(columns={"Maximum Jobs": "Max Jobs"})
+    riders = riders.rename(columns={"Maximum": "Max Jobs"})
     return riders[["Rider Name", "Start Location", "Start Zone", "Max Jobs", "Rider Load"]].reset_index(drop=True)
+
+
+def riders_for_v2(rider_df: pd.DataFrame, operation_date: Any) -> list[Rider]:
+    validation = validate_v2_roster(normalise_riders(rider_df), operation_date)
+    if not validation.is_valid:
+        raise ValueError("; ".join(validation.errors))
+    return validation.riders
 
 
 def initialise_workflow_state(state: MutableMapping[str, Any], initial_riders: pd.DataFrame) -> None:
@@ -139,11 +139,24 @@ def cancel_rider_draft(state: MutableMapping[str, Any]) -> None:
 
 
 def save_rider_draft(state: MutableMapping[str, Any], draft: pd.DataFrame) -> bool:
-    normalised = normalise_riders(draft)
-    validation = validate_rider_draft(normalised)
+    reconciled = draft.copy(deep=True)
+    before = normalise_riders(state.get("committed_riders"))
+    if {"Maximum", "Maximum Jobs"} <= set(reconciled.columns) and len(reconciled) == len(before):
+        for index in reconciled.index:
+            current_new = reconciled.at[index, "Maximum"]
+            current_legacy = reconciled.at[index, "Maximum Jobs"]
+            previous_new = before.at[index, "Maximum"]
+            previous_legacy = before.at[index, "Maximum Jobs"]
+            new_changed = not pd.isna(current_new) and current_new != previous_new
+            legacy_changed = not pd.isna(current_legacy) and current_legacy != previous_legacy
+            if legacy_changed and not new_changed:
+                reconciled.at[index, "Maximum"] = current_legacy
+            else:
+                reconciled.at[index, "Maximum Jobs"] = current_new
+    validation = validate_rider_draft(reconciled)
     if not validation.is_valid:
         raise ValueError("; ".join(validation.errors))
-    before = normalise_riders(state.get("committed_riders"))
+    normalised = normalise_riders(reconciled)
     changed = not before.equals(normalised)
     state["committed_riders"] = normalised.copy(deep=True)
     state["rider_draft"] = None
@@ -188,8 +201,8 @@ def dataframe_signature(dataframe: pd.DataFrame | None) -> str:
         return hashlib.sha256(b"[]").hexdigest()
     normalised = dataframe.copy()
     normalised.columns = [str(column) for column in normalised.columns]
-    normalised = normalised.reindex(sorted(normalised.columns), axis=1).fillna("")
-    payload = normalised.astype(str).to_dict("records")
+    normalised = normalised.reindex(sorted(normalised.columns), axis=1).astype("string").fillna("")
+    payload = normalised.to_dict("records")
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
