@@ -1,5 +1,17 @@
 import streamlit as st
 
+from Flexar.BlueSG.cloud_deployment_guard import should_use_bluesg_cloud_entrypoint
+
+
+if should_use_bluesg_cloud_entrypoint():
+    # Community Cloud may still be configured with the repository root app.
+    # On Linux, always hand off to the authenticated BlueSG-only router so the
+    # Windows/local AMS tools are never imported or exposed.
+    from Flexar.BlueSG.cloud_streamlit_router import run_bluesg_cloud_app
+
+    run_bluesg_cloud_app()
+    st.stop()
+
 
 st.set_page_config(page_title="Lance Workspace", layout="wide")
 

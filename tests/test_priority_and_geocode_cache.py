@@ -129,7 +129,8 @@ Lim Choon Yong Lester\tJurong\tWest\t5\tPiority"""
     app_source = (
         optimizer.BASE_DIR / "pages" / "create_optimised_vehicle_routes_page.py"
     ).read_text(encoding="utf-8")
-    assert "options=RIDER_LOAD_INPUT_OPTIONS" in app_source
+    assert '"Rider Load": None' in app_source
+    assert "options=[style.value for style in WorkStyle]" in app_source
 
 
 def test_geocode_batch_deduplicates_places_and_runs_distinct_places_in_parallel(monkeypatch) -> None:

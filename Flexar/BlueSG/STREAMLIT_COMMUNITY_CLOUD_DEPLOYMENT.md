@@ -4,6 +4,12 @@ This deployment runs only the BlueSG optimiser. The repository's root `app.py`
 is for local use and includes Windows-only and local-service features. **Do not
 select the root `app.py` when creating the Cloud app.**
 
+As a defence-in-depth measure, the root `app.py` detects Linux and hands off to
+the same authenticated BlueSG-only router. This protects an existing app that
+was accidentally configured with the root entrypoint. The dedicated entrypoint
+below remains the supported deployment because it also selects the minimal
+pinned dependency file beside it.
+
 ## Deployment settings
 
 Use these exact values in Streamlit Community Cloud:
@@ -154,7 +160,9 @@ persistent token into source code.
 
 Confirm `Flexar/BlueSG/requirements.txt` exists on `main`, contains the four
 exact pinned packages above, and the app uses Python 3.12. Reboot after changing
-dependencies.
+dependencies. After signing in, the startup preflight identifies the failing
+module in the app and writes the complete original traceback to **Manage app >
+Cloud logs**.
 
 ### A file works on Windows but is missing on Cloud
 

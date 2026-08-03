@@ -10,9 +10,11 @@ from types import SimpleNamespace
 REPOSITORY_ROOT = Path(__file__).parents[1]
 BLUESG_DIR = REPOSITORY_ROOT / "Flexar" / "BlueSG"
 STREAMLIT_ENTRYPOINT = BLUESG_DIR / "streamlit_app.py"
+ROOT_ENTRYPOINT = REPOSITORY_ROOT / "app.py"
+SHARED_ROUTER = BLUESG_DIR / "cloud_streamlit_router.py"
 EXPECTED_PAGE_TARGETS = {
-    "pages/create_optimised_vehicle_routes_page.py",
-    "pages/review_map_and_manually_adjust_route_assignments_page.py",
+    "create_optimised_vehicle_routes_page.py",
+    "review_map_and_manually_adjust_route_assignments_page.py",
 }
 EXPECTED_REQUIREMENTS = [
     "streamlit==1.57.0",
@@ -22,24 +24,13 @@ EXPECTED_REQUIREMENTS = [
 ]
 
 
-def _literal_streamlit_page_targets(source: str) -> list[str]:
+def _page_filename_constants(source: str) -> list[str]:
     tree = ast.parse(source)
     targets: list[str] = []
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        function = node.func
-        if not (
-            isinstance(function, ast.Attribute)
-            and function.attr == "Page"
-            and isinstance(function.value, ast.Name)
-            and function.value.id == "st"
-        ):
-            continue
-        if node.args and isinstance(node.args[0], ast.Constant):
-            target = node.args[0].value
-            if isinstance(target, str):
-                targets.append(target)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if node.value.endswith("_page.py"):
+                targets.append(node.value)
     return targets
 
 
@@ -52,15 +43,66 @@ def _non_comment_lines(path: Path) -> list[str]:
 
 
 def test_cloud_entrypoint_exposes_only_existing_bluesg_pages() -> None:
-    source = STREAMLIT_ENTRYPOINT.read_text(encoding="utf-8")
-    page_targets = _literal_streamlit_page_targets(source)
+    source = SHARED_ROUTER.read_text(encoding="utf-8")
+    page_targets = _page_filename_constants(source)
 
     assert set(page_targets) == EXPECTED_PAGE_TARGETS
     assert len(page_targets) == len(EXPECTED_PAGE_TARGETS)
     for target in page_targets:
-        assert "\\" not in target, f"Cloud page paths must use forward slashes: {target}"
-        assert not Path(target).is_absolute()
-        assert (BLUESG_DIR / Path(*target.split("/"))).is_file()
+        assert (BLUESG_DIR / "pages" / target).is_file()
+
+
+def test_both_entrypoints_use_the_shared_cloud_router() -> None:
+    dedicated_source = STREAMLIT_ENTRYPOINT.read_text(encoding="utf-8")
+    root_source = ROOT_ENTRYPOINT.read_text(encoding="utf-8")
+
+    assert "run_bluesg_cloud_app" in dedicated_source
+    assert "should_use_bluesg_cloud_entrypoint" in root_source
+    assert "run_bluesg_cloud_app" in root_source
+
+
+def test_root_entrypoint_guard_cannot_be_disabled_on_linux() -> None:
+    guard = importlib.import_module("Flexar.BlueSG.cloud_deployment_guard")
+
+    assert guard.should_use_bluesg_cloud_entrypoint(
+        platform_name="posix",
+        environment={"BLUESG_FORCE_CLOUD_ENTRYPOINT": "false"},
+    ) is True
+    assert guard.should_use_bluesg_cloud_entrypoint(
+        platform_name="nt",
+        environment={},
+    ) is False
+    assert guard.should_use_bluesg_cloud_entrypoint(
+        platform_name="nt",
+        environment={"BLUESG_FORCE_CLOUD_ENTRYPOINT": "true"},
+    ) is True
+
+
+def test_cloud_preflight_smoke_imports_the_deployment_stack() -> None:
+    preflight = importlib.import_module("Flexar.BlueSG.cloud_deployment_preflight")
+
+    assert preflight.check_deployment_imports() == ()
+
+
+def test_cloud_preflight_sanitises_missing_dependency_errors() -> None:
+    preflight = importlib.import_module("Flexar.BlueSG.cloud_deployment_preflight")
+
+    def missing_importer(module_name: str):
+        error = ModuleNotFoundError("sensitive arbitrary exception text")
+        error.name = "example_missing_dependency"
+        raise error
+
+    failures = preflight.check_deployment_imports(importer=missing_importer)
+
+    assert len(failures) == len(preflight.REQUIRED_DEPLOYMENT_MODULES)
+    assert all(
+        failure.display_detail == "Missing module: example_missing_dependency"
+        for failure in failures
+    )
+    assert all(
+        "sensitive arbitrary exception text" not in failure.display_detail
+        for failure in failures
+    )
 
 
 def test_cloud_requirements_are_minimal_and_exactly_pinned() -> None:
@@ -106,7 +148,7 @@ def test_gitignore_protects_nested_secrets_and_mutable_bluesg_data() -> None:
 
 def test_onemap_token_widgets_never_prefill_configured_secrets() -> None:
     page_paths = [
-        BLUESG_DIR / Path(*target.split("/")) for target in EXPECTED_PAGE_TARGETS
+        BLUESG_DIR / "pages" / target for target in EXPECTED_PAGE_TARGETS
     ]
     token_widgets = 0
 
