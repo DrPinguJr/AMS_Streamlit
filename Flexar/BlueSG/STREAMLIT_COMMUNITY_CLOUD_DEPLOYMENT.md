@@ -26,6 +26,7 @@ The dedicated dependency file is
 
 ```text
 streamlit==1.57.0
+starlette==1.3.1
 pandas==3.0.3
 openpyxl==3.1.5
 pydeck==0.9.2
