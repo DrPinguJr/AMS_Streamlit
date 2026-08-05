@@ -10,6 +10,7 @@ from Contracts.generators.cfs_generator import (
     end_of_month,
     generate_blank_cfs_docx,
     generate_cfs_docx,
+    generate_cfs_pdf,
 )
 from Contracts.shared.batch_utils import normalize_dataframe
 from Contracts.shared.file_utils import sanitize_filename_for_legacy_docx
@@ -24,10 +25,9 @@ except st.errors.StreamlitAPIException:
 # Form state helper callback
 def clear_generated_contract():
     """Callback to clear cached contract bytes when form fields change to prevent outdated downloads."""
-    if "contract_gen_bytes" in st.session_state:
-        del st.session_state["contract_gen_bytes"]
-    if "contract_gen_filename" in st.session_state:
-        del st.session_state["contract_gen_filename"]
+    st.session_state.pop("contract_gen_bytes", None)
+    st.session_state.pop("contract_gen_filename", None)
+    st.session_state.pop("contract_gen_mime", None)
 
 def clear_bulk_contracts():
     """Clear cached bulk ZIP output when bulk inputs change."""
@@ -227,7 +227,21 @@ def render_individual_contract_generator() -> None:
             st.caption("Defaults to the end of this month; you can select any other date.")
             
             st.markdown('<div class="section-title">Actions & Verification</div>', unsafe_allow_html=True)
-            st.write("Ensure all details are correct. Generating a contract will render a printable Word (.docx) document instantly in memory.")
+            st.write("Ensure all details are correct. Generate either a Word (.docx) or PDF (.pdf) contract.")
+            output_format = st.radio(
+                "Output Format",
+                ["Word document (.docx)", "PDF document (.pdf)"],
+                horizontal=True,
+                key="c_output_format",
+                on_change=clear_generated_contract,
+            )
+            pdf_requested = output_format == "PDF document (.pdf)"
+            pdf_converter_status = get_pdf_converter_status() if pdf_requested else None
+            if pdf_requested and pdf_converter_status and not pdf_converter_status.available:
+                st.warning(
+                    pdf_converter_status.error
+                    or "PDF generation is unavailable on this computer."
+                )
             
             # Validation checks
             validation_error = None
@@ -261,19 +275,34 @@ def render_individual_contract_generator() -> None:
                             service_fee=service_fee
                         )
                         
-                        # Generate the document into a BytesIO stream
-                        output = generate_cfs_docx(context)
-                        
                         # Prepare file name
                         sanitized_name = sanitize_filename_for_legacy_docx(contractor_name)
                         start_date_str = start_date.strftime("%Y-%m-%d")
-                        filename = f"CFS_{sanitized_name}_{start_date_str}.docx"
+                        filename_base = f"CFS_{sanitized_name}_{start_date_str}"
+
+                        if pdf_requested:
+                            pdf_converter_status = get_pdf_converter_status()
+                            if not pdf_converter_status.available:
+                                st.error(
+                                    pdf_converter_status.error
+                                    or "PDF generation is unavailable on this computer."
+                                )
+                                return
+                            generated_bytes = generate_cfs_pdf(context)
+                            filename = f"{filename_base}.pdf"
+                            mime = "application/pdf"
+                        else:
+                            output = generate_cfs_docx(context)
+                            generated_bytes = output.getvalue()
+                            filename = f"{filename_base}.docx"
+                            mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                         
                         # Save to session state
-                        st.session_state["contract_gen_bytes"] = output.getvalue()
+                        st.session_state["contract_gen_bytes"] = generated_bytes
                         st.session_state["contract_gen_filename"] = filename
+                        st.session_state["contract_gen_mime"] = mime
                         
-                        st.success("Contract generated successfully! Click the button below to download the file.")
+                        st.success("Contract generated successfully. Click the button below to download the file.")
                     except Exception as e:
                         # Generic clean user error without full traceback exposure
                         st.error(f"Failed to generate contract: {str(e)}")
@@ -284,7 +313,10 @@ def render_individual_contract_generator() -> None:
                     label="📥 Download Generated Contract",
                     data=st.session_state["contract_gen_bytes"],
                     file_name=st.session_state["contract_gen_filename"],
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    mime=st.session_state.get(
+                        "contract_gen_mime",
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    ),
                     width="stretch"
                 )
 

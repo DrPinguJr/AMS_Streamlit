@@ -14,6 +14,11 @@ def test_cfs_end_date_defaults_to_month_end_but_preserves_manual_selection() -> 
 
     assert not app.exception
     assert app.date_input(key="c_end_date").value == expected_default
+    assert app.radio(key="c_output_format").options == [
+        "Word document (.docx)",
+        "PDF document (.pdf)",
+    ]
+    assert app.radio(key="c_output_format").value == "Word document (.docx)"
 
     app.date_input(key="c_end_date").set_value(manual_end_date).run()
     assert app.date_input(key="c_end_date").value == manual_end_date
