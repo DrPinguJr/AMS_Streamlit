@@ -1,0 +1,233 @@
+{
+  "main": {
+    "id": "bac309708197bb15",
+    "type": "split",
+    "children": [
+      {
+        "id": "4c5523b3353a646e",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "a6b999d042b6ea30",
+            "type": "leaf",
+            "state": {
+              "type": "graph",
+              "state": {},
+              "icon": "lucide-git-fork",
+              "title": "Graph view"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "85e5dc6d1de32e54",
+    "type": "split",
+    "children": [
+      {
+        "id": "c23de32452b9a17d",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "11d1ea28ced2ba19",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-folder-closed",
+              "title": "Files"
+            }
+          },
+          {
+            "id": "fcc15c26a497232c",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "Search"
+            }
+          },
+          {
+            "id": "4ac244c1f043bd9c",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-bookmark",
+              "title": "Bookmarks"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "d4739e9b680a75c2",
+    "type": "split",
+    "children": [
+      {
+        "id": "ae6d09232bf863a0",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "13db130adc98b8e3",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "Backlinks"
+            }
+          },
+          {
+            "id": "b8dc288a7ba13ca8",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "Outgoing links"
+            }
+          },
+          {
+            "id": "adafc6a7cec6e2ad",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "Tags"
+            }
+          },
+          {
+            "id": "a29956bbec3ab7ab",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "All properties"
+            }
+          },
+          {
+            "id": "c223a9b811ad02a7",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "Outline"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:Open quick switcher": false,
+      "graph:Open graph view": false,
+      "canvas:Create new canvas": false,
+      "daily-notes:Open today's daily note": false,
+      "templates:Insert template": false,
+      "command-palette:Open command palette": false,
+      "bases:Create new base": false
+    }
+  },
+  "active": "a6b999d042b6ea30",
+  "lastOpenFiles": [
+    "runs/2026-08-05/130543_severity_area_lead_beam_search_run_summary.json",
+    "runs/2026-08-05",
+    "AMS Repository Snapshot.zip",
+    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/05 Graph View Setup.md",
+    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/91 Change Impact Routes.md",
+    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/93 Acceptance Scenarios.md",
+    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/92 Known Technical Debt.md",
+    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/90 Behaviour Contract Map.md",
+    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/82 Deployment Preflight.md",
+    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/81 Access Gate.md",
+    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/80 BlueSG Cloud Entry.md",
+    "AMS Repository Snapshot/Untitled",
+    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/77 Confirmed Draft Export Guard.md",
+    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/76 Incremental Recalculation.md",
+    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/75 Map and Preview Geometry.md",
+    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/74 Draft History.md",
+    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/73 Locks and Reshuffle Pool.md",
+    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/72 Assignment Board Identity.md",
+    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/71 Planner Input Reconstruction.md",
+    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/70 Route Planner Bridge.md",
+    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/64 Excel Workbook Contract.md",
+    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/63 Canonical Metrics and Run Artifact.md",
+    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/62 Compatible Route Schema.md",
+    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/61 Progress and Diagnostics.md",
+    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/60 Optimiser Page Orchestrator.md",
+    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/58 Optional Local Improvement.md",
+    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/57 Route Reconstruction and Integrity.md",
+    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/56 V1 Regional Overflow Policy.md",
+    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/55 Seven Zone Adjacency.md",
+    "AMS Repository Snapshot/BlueSG/Route Optimiser Web",
+    "AMS Repository Snapshot/Subsystems",
+    "AMS Repository Snapshot/BlueSG",
+    "AMS Repository Snapshot",
+    "Flexar/whatsapp_request_processor/scripts/__pycache__/ams_supervisor.cpython-314.pyc",
+    "Flexar/whatsapp_request_processor/scripts/__pycache__",
+    "Flexar/whatsapp_request_processor/__pycache__/ui_components.cpython-314.pyc",
+    "Flexar/whatsapp_request_processor/data/placeholder_12.gif",
+    "Flexar/whatsapp_request_processor/data/placeholder_11.gif",
+    "Flexar/whatsapp_request_processor/data/placeholder_10.gif",
+    "Flexar/whatsapp_request_processor/data/placeholder_09.gif",
+    "Flexar/whatsapp_request_processor/data/placeholder_08.gif",
+    "Flexar/whatsapp_request_processor/data/placeholder_07.gif",
+    "Flexar/whatsapp_request_processor/data/placeholder_06.gif",
+    "Flexar/whatsapp_request_processor/data/placeholder_05.gif",
+    "Flexar/whatsapp_request_processor/data/placeholder_04.gif",
+    "Flexar/whatsapp_request_processor/data/placeholder_03.gif"
+  ]
+}

@@ -13,7 +13,7 @@ import statistics
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as clock_time, timedelta
 from enum import Enum, IntEnum
 from typing import Any, Callable, Iterable
 
@@ -41,13 +41,14 @@ from Flexar.BlueSG.route_operation_time_window_settings import OperationContext
 
 AREA_LEAD_OVERRIDE_ADVANTAGE_MINUTES = 12.0
 END_REQUIREMENT_BUFFER_MINUTES = 10.0
+SHIFT_END_ASSIGNMENT_BUFFER_MINUTES = 10.0
 LONG_REPOSITIONING_MINUTES = 35.0
 LONG_DISTANCE_CROSS_ZONE_MINUTES = 45.0
 OPERATIONALLY_EXTREME_MINUTES = 75.0
 DEFAULT_V2_BEAM_WIDTH = 120
 DEFAULT_V2_TIME_LIMIT_SECONDS = 45.0
 V2_ALGORITHM_NAME = "severity_area_lead_beam_search"
-V2_ALGORITHM_VERSION = "2.0.0-v2"
+V2_ALGORITHM_VERSION = "2.1.0-rolling-dispatch"
 V2ProgressCallback = Callable[[dict[str, Any]], None]
 
 LOCATION_ALIASES = {
@@ -103,6 +104,7 @@ class Rider:
     acceptable_areas: frozenset[str] = field(default_factory=frozenset)
     available_from: datetime | None = None
     available_until: datetime | None = None
+    last_completion_at: datetime | None = None
 
     def __post_init__(self) -> None:
         style = self.work_style if isinstance(self.work_style, WorkStyle) else WorkStyle(str(self.work_style))
@@ -172,6 +174,7 @@ class PlanMetrics:
     preferred_overage: int
     empty_minutes: float
     total_duration: float
+    wait_time_penalty: float = 0.0
 
     def objective(self) -> tuple[float | int, ...]:
         return (
@@ -181,6 +184,7 @@ class PlanMetrics:
             self.cross_zone_assignments,
             self.area_lead_violations,
             self.fragmented_clusters,
+            round(self.wait_time_penalty, 6),
             self.maximum_rider_burden,
             self.burden_spread,
             self.disliked_assignments,
@@ -403,7 +407,17 @@ def normalise_v2_roster(rider_df: pd.DataFrame | None) -> pd.DataFrame:
     if "End Requirement" not in source:
         source["End Requirement"] = ""
     if "Active" not in source:
-        source["Active"] = True
+        if "Active Status" in source:
+            source["Active"] = source["Active Status"].apply(
+                lambda value: _normalise_space(value).casefold()
+                in {"active", "yes", "true", "1", "on"}
+            )
+        else:
+            source["Active"] = True
+    if "Shift Start" not in source:
+        source["Shift Start"] = source.get("Available From", "")
+    if "Shift End" not in source:
+        source["Shift End"] = source.get("Available Until", "")
     defaults = {
         "Rider Name": "",
         "Start Location": "",
@@ -413,6 +427,8 @@ def normalise_v2_roster(rider_df: pd.DataFrame | None) -> pd.DataFrame:
         "Work Style": WorkStyle.FLEXIBLE.value,
         "End Requirement": "",
         "Active": True,
+        "Shift Start": "",
+        "Shift End": "",
     }
     for column, default in defaults.items():
         if column not in source:
@@ -433,6 +449,34 @@ def _strict_integer(value: Any, label: str, rider_name: str, minimum: int) -> tu
     if parsed < minimum:
         return None, f"{rider_name}: {label} must be at least {minimum}."
     return parsed, None
+
+
+def _parse_shift_time(value: Any, operation_date: date, label: str) -> datetime | None:
+    """Parse roster clocks while keeping the public sheet format human-friendly."""
+
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, datetime):
+        parsed_time = value.time()
+    elif isinstance(value, clock_time):
+        parsed_time = value
+    else:
+        text = _normalise_space(value).upper().replace(".", "")
+        if not text:
+            return None
+        parsed_time = None
+        for pattern in ("%I:%M %p", "%I %p", "%H:%M", "%H%M"):
+            try:
+                parsed_time = datetime.strptime(text, pattern).time()
+                break
+            except ValueError:
+                continue
+        if parsed_time is None:
+            raise ValueError(
+                f'{label} "{value}" is invalid. Use a time such as 1:00 PM or 16:00.'
+            )
+    zone = OperationContext().operation_start.tzinfo
+    return datetime.combine(operation_date, parsed_time).replace(tzinfo=zone)
 
 
 def validate_v2_roster(rider_df: pd.DataFrame, operation_date: date) -> V2RosterValidationResult:
@@ -479,6 +523,21 @@ def validate_v2_roster(rider_df: pd.DataFrame, operation_date: date) -> V2Roster
             end_requirement = parse_end_requirement(_normalise_space(row.get("End Requirement")), operation_date)
         except ValueError as exc:
             row_errors.append(f"{display_name}: {exc}")
+        available_from = available_until = None
+        try:
+            available_from = _parse_shift_time(row.get("Shift Start"), operation_date, "Shift Start")
+            available_until = _parse_shift_time(row.get("Shift End"), operation_date, "Shift End")
+            if (available_from is None) != (available_until is None):
+                row_errors.append(
+                    f"{display_name}: Shift Start and Shift End must either both be entered or both be blank."
+                )
+            elif available_from is not None and available_until is not None:
+                if available_until <= available_from:
+                    available_until += timedelta(days=1)
+                if available_until - available_from < timedelta(minutes=20):
+                    row_errors.append(f"{display_name}: Shift Window must be at least 20 minutes.")
+        except ValueError as exc:
+            row_errors.append(f"{display_name}: {exc}")
         folded = name.casefold()
         if folded and folded in names_seen:
             row_errors.append(f"Duplicate rider name: {name}.")
@@ -510,6 +569,8 @@ def validate_v2_roster(rider_df: pd.DataFrame, operation_date: date) -> V2Roster
                     maximum_jobs=maximum,
                     work_style=style,
                     end_requirement=required,
+                    available_from=available_from,
+                    available_until=available_until,
                 )
             )
     if active.empty:
@@ -823,8 +884,15 @@ def evaluate_v2_route(
         completion = operation_context.at_minutes(elapsed)
         if completion > operation_context.operation_end:
             reasons.append(f"{job_id} would complete after the operation end.")
-        if rider.available_until is not None and completion > rider.available_until:
-            reasons.append(f"{rider.name} is unavailable before {job_id} would complete.")
+        if rider.available_until is not None:
+            assignment_cutoff = rider.available_until - timedelta(
+                minutes=SHIFT_END_ASSIGNMENT_BUFFER_MINUTES
+            )
+            if completion > assignment_cutoff:
+                reasons.append(
+                    f"{job_id} would complete within the {SHIFT_END_ASSIGNMENT_BUFFER_MINUTES:.0f}-minute "
+                    f"shift-end buffer for {rider.name}."
+                )
         empty_total += empty_min
         severities.append(severity)
         source = f"{empty.source} / {loaded.source}"
@@ -920,6 +988,10 @@ def evaluate_v2_route(
                 reasons.append(
                     f"Required destination arrival would be {_display_time(end_arrival)}, "
                     f"after {_display_time(rider.end_requirement.required_by)}."
+                )
+            if rider.available_until is not None and end_arrival > rider.available_until:
+                reasons.append(
+                    f"Required destination arrival would be after {rider.name}'s shift end."
                 )
             if rows:
                 rows[-1]["Estimated Required-End Arrival"] = end_arrival.isoformat(timespec="minutes")
@@ -1035,6 +1107,15 @@ def _plan_metrics(
 ) -> PlanMetrics:
     burdens = [evaluation.burden.score for evaluation in evaluations]
     assigned = sum(len(route) for route in routes)
+    now = operation_context.operation_start
+    wait_minutes: list[float] = []
+    for rider in riders:
+        anchor = rider.last_completion_at or rider.available_from or now
+        if anchor.tzinfo is None:
+            anchor = anchor.replace(tzinfo=now.tzinfo)
+        else:
+            anchor = anchor.astimezone(now.tzinfo)
+        wait_minutes.append(max(0.0, (now - anchor).total_seconds() / 60.0))
     return PlanMetrics(
         unassigned_jobs=total_jobs - assigned,
         hard_violations=sum(not evaluation.feasibility.feasible for evaluation in evaluations),
@@ -1044,6 +1125,12 @@ def _plan_metrics(
             routes, evaluations, riders, jobs_by_id, matrix, operation_context
         ),
         fragmented_clusters=_fragmented_lead_clusters(routes, riders, jobs_by_id),
+        # Minimising the wait remaining on unassigned riders gives the next
+        # available job to the rider who has been idle longest. Once every
+        # rider has work, the existing burden objectives resume control.
+        wait_time_penalty=sum(
+            wait_minutes[index] for index, route in enumerate(routes) if not route
+        ),
         maximum_rider_burden=max(burdens, default=0),
         burden_spread=max(burdens, default=0) - min(burdens, default=0),
         disliked_assignments=sum(evaluation.burden.disliked_assignments for evaluation in evaluations),
@@ -1267,7 +1354,7 @@ def run_optimiser_v2(
             [],
             [],
             [],
-            (0,) * 12,
+            (0,) * 13,
             {},
             time.monotonic() - started,
         )

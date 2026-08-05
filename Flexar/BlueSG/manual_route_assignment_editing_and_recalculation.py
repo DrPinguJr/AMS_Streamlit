@@ -1286,7 +1286,12 @@ def incremental_recalculate(
         **rebuild_settings,
     )
     unaffected = confirmed_routes[~confirmed_routes["Rider"].apply(clean_text).isin(affected)].copy()
-    combined = pd.concat([unaffected, rebuilt], ignore_index=True)
+    route_parts = [frame for frame in (unaffected, rebuilt) if not frame.empty]
+    combined = (
+        pd.concat(route_parts, ignore_index=True)
+        if route_parts
+        else pd.DataFrame(columns=ROUTE_COLUMNS)
+    )
     for column in ROUTE_COLUMNS:
         if column not in combined.columns:
             combined[column] = ""

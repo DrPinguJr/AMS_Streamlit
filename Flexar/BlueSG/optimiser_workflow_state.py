@@ -29,6 +29,8 @@ RIDER_DRAFT_COLUMNS = [
     "Work Style",
     "End Requirement",
     "Active",
+    "Shift Start",
+    "Shift End",
     # Compatibility aliases retained for V1 rollback and the route planner.
     "Maximum Jobs",
     "Rider Load",
@@ -89,7 +91,15 @@ def normalise_riders(rider_df: pd.DataFrame | None) -> pd.DataFrame:
             WorkStyle.AREA_LEAD.value: "Priority",
         }
     ).fillna("Medium")
-    for column in ["Rider Name", "Start Location", "Start Zone", "Work Style", "End Requirement"]:
+    for column in [
+        "Rider Name",
+        "Start Location",
+        "Start Zone",
+        "Work Style",
+        "End Requirement",
+        "Shift Start",
+        "Shift End",
+    ]:
         v2[column] = v2[column].apply(_clean)
     v2["Active"] = v2["Active"].fillna(True).astype(bool)
     return v2.loc[:, RIDER_DRAFT_COLUMNS].reset_index(drop=True)

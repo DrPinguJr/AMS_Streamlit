@@ -26,6 +26,12 @@ bluesg_map = st.Page(
     title="Route Planner",
     icon=":material/map:",
 )
+bluesg_hourly = st.Page(
+    "Flexar/BlueSG/pages/hourly_route_optimiser_page.py",
+    title="Hourly Route Optimiser",
+    icon=":material/schedule:",
+    url_path="hourly-route-optimiser",
+)
 whatsapp_request_processor = st.Page(
     "Flexar/whatsapp_request_processor/app.py",
     title="WhatsApp Request Processor",
@@ -63,7 +69,7 @@ pg = st.navigation(
     {
         "Home": [home],
         "Lance": [tender, sesami, recruitment, converter, whatsapp],
-        "Flexar": [bluesg, bluesg_map, whatsapp_request_processor],
+        "Flexar": [bluesg, bluesg_hourly, bluesg_map, whatsapp_request_processor],
         "Contracts": [cfs_generator, loa_generator, service_agreement_generator],
         "HR": [hriq_report_tool, rdl_management_studio],
     }

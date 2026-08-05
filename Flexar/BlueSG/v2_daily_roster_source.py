@@ -1,4 +1,4 @@
-"""Google-Sheet-first daily roster loading with a local workbook fallback."""
+"""Daily V2 roster loading, including activation and shift-window fields."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ DEFAULT_LOCAL_ROSTER = (
     / "weekday_rider_availability_and_capacity_roster.xlsx"
 )
 GOOGLE_ROSTER_URL_ENV = "BLUESG_ROSTER_GOOGLE_SHEET_CSV_URL"
+ROSTER_DISPATCH_COLUMNS = ("Active", "Shift Start", "Shift End")
 
 
 @dataclass(frozen=True)

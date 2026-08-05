@@ -18,6 +18,9 @@ PLANNER_PAGE = (
     / "pages"
     / "review_map_and_manually_adjust_route_assignments_page.py"
 )
+HOURLY_OPTIMISER_PAGE = (
+    BLUESG_DIRECTORY / "pages" / "hourly_route_optimiser_page.py"
+)
 DEPLOYMENT_GUARD_VERSION = "2026.08.03.1"
 
 
@@ -75,11 +78,18 @@ def run_bluesg_cloud_app() -> None:
         icon=":material/edit_road:",
         url_path="review",
     )
+    hourly_optimiser_page = st.Page(
+        HOURLY_OPTIMISER_PAGE,
+        title="Hourly Route Optimiser",
+        icon=":material/schedule:",
+        url_path="hourly-optimise",
+    )
 
     st.navigation(
         {
             "BlueSG route tools": [
                 optimiser_page,
+                hourly_optimiser_page,
                 planner_page,
             ]
         }

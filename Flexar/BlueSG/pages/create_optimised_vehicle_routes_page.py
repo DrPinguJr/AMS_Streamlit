@@ -1365,6 +1365,12 @@ def configure_riders_dialog(default_roster_day: str) -> None:
                     help="Optional, for example: CCK by 4:30 PM"
                 ),
                 "Active": st.column_config.CheckboxColumn(),
+                "Shift Start": st.column_config.TextColumn(
+                    help="Optional shift clock, for example 1:00 PM or 13:00"
+                ),
+                "Shift End": st.column_config.TextColumn(
+                    help="Optional hard shift end, for example 4:00 PM or 16:00"
+                ),
                 "Validation Status": st.column_config.TextColumn(width="small"),
                 "Maximum Jobs": None,
                 "Rider Load": None,
@@ -2969,15 +2975,16 @@ if latest_optimisation:
                 "V2 runtime",
                 f"{float(result_diagnostics.get('v2_runtime_seconds') or 0.0):.1f}s",
             )
-            if len(result_v2_objective) >= 12:
+            if len(result_v2_objective) >= 13:
                 exception_table = pd.DataFrame(
                     [
                         ["Extreme assignments", result_v2_objective[2]],
                         ["Cross-zone assignments", result_v2_objective[3]],
                         ["Area Lead ownership exceptions", result_v2_objective[4]],
                         ["Fragmented clusters", result_v2_objective[5]],
-                        ["Disliked assignments", result_v2_objective[8]],
-                        ["Jobs above preferred capacity", result_v2_objective[9]],
+                        ["Idle wait penalty", round(float(result_v2_objective[6]), 1)],
+                        ["Disliked assignments", result_v2_objective[9]],
+                        ["Jobs above preferred capacity", result_v2_objective[10]],
                     ],
                     columns=["Exception", "Count"],
                 )
@@ -2985,8 +2992,9 @@ if latest_optimisation:
                     st.dataframe(exception_table, width="stretch", hide_index=True)
                     st.caption(
                         "Lexicographic order: mandatory coverage, hard feasibility, extreme travel, "
-                        "cross-zone work, Area Lead ownership, cluster continuity, maximum burden, "
-                        "burden spread, disliked work, preferred overage, empty travel, total duration."
+                        "cross-zone work, Area Lead ownership, cluster continuity, idle waiting, "
+                        "maximum burden, burden spread, disliked work, preferred overage, "
+                        "empty travel, total duration."
                     )
 
             if result_v2_explanations:
