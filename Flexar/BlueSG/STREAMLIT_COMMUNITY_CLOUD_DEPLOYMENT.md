@@ -32,8 +32,9 @@ openpyxl==3.1.5
 pydeck==0.9.2
 ```
 
-No `packages.txt` file or Linux system package is needed for this BlueSG-only
-deployment.
+The BlueSG-only pages do not require a Linux system package. The repository
+root includes `packages.txt` with LibreOffice for the full AMS contract PDF
+generator; it is harmless if Community Cloud installs it for this deployment.
 
 ## Security requirement before launch
 

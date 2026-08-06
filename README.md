@@ -97,9 +97,13 @@ Contract generators live under `Contracts/`.
 
 ## Streamlit Community Cloud Deployment
 
-Streamlit Community Cloud installs Python packages from `requirements.txt`.
+Streamlit Community Cloud installs Python packages from `requirements.txt` and
+Linux system packages from `packages.txt`.
 
-Contract PDF generation uses an invisible Microsoft Word instance on Windows. DOCX generation remains available on systems without Microsoft Word.
+Contract PDF generation uses an invisible Microsoft Word instance on Windows.
+On Linux deployments such as Streamlit Community Cloud, it uses LibreOffice in
+headless mode. DOCX generation remains available even when no PDF converter is
+installed.
 
 ## Useful Commands
 
