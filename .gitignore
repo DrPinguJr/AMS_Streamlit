@@ -30,6 +30,7 @@ data/whatsapp_images/
 # live rider data must never be committed.
 Flexar/BlueSG/data/weekday_rider_availability_and_capacity_roster.xlsx
 Flexar/BlueSG/data/cache/runtime/
+Flexar/BlueSG/data/hourly_dispatch_ledger.xlsx
 /runs/
 /artifacts/
 

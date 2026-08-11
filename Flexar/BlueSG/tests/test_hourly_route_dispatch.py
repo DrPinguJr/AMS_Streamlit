@@ -15,7 +15,11 @@ from Flexar.BlueSG.hourly_route_dispatch import (
     append_hourly_jobs,
     archive_completed_prefix,
     live_shift_timeline,
+    open_jobs_for_dispatch,
+    operation_context_for_riders,
     run_hourly_dispatch,
+    solve_with_standby_options,
+    standby_riders_for_dispatch,
 )
 from Flexar.BlueSG.job_import_staging import commit_staged_jobs
 from Flexar.BlueSG.route_operation_time_window_settings import OperationContext
@@ -217,3 +221,86 @@ def test_hourly_run_uses_incremental_recalculation_for_open_routes() -> None:
     assert result.route_df[["Rider", "Car Plate"]].to_dict("records") == [
         {"Rider": "Rider A", "Car Plate": "SPE1001A"}
     ]
+
+
+def test_standby_riders_excludes_active_and_requires_a_shift_window() -> None:
+    roster = pd.concat(
+        [
+            _roster(**{"Rider Name": "Active One"}),
+            _roster(**{"Rider Name": "Standby With Window", "Active": False}),
+            _roster(
+                **{
+                    "Rider Name": "Standby No Window",
+                    "Active": False,
+                    "Shift Start": "",
+                    "Shift End": "",
+                }
+            ),
+        ],
+        ignore_index=True,
+    )
+    standby = standby_riders_for_dispatch(roster, datetime(2026, 8, 5, 14, tzinfo=ZONE))
+    assert [rider.name for rider in standby] == ["Standby With Window"]
+
+
+def test_open_jobs_for_dispatch_excludes_archived_jobs() -> None:
+    committed = commit_staged_jobs(pd.DataFrame([_job("J1", 0), _job("J2", 1)]))
+    archived = pd.DataFrame([{**_job("J1", 0), "Rider": "A", "Sequence": 1}])
+    open_jobs = open_jobs_for_dispatch(committed, archived)
+    assert open_jobs["Job ID"].tolist() == ["J2"]
+
+
+def test_operation_context_for_riders_falls_back_to_three_hours() -> None:
+    dispatch_at = datetime(2026, 8, 5, 14, tzinfo=ZONE)
+    context = operation_context_for_riders([], dispatch_at)
+    assert context.operation_end == dispatch_at + timedelta(hours=3)
+
+
+def test_solve_with_standby_options_has_no_recommendation_without_standby_riders() -> None:
+    jobs = pd.DataFrame([_job("J1", 0), _job("J2", 1)])
+    active = [Rider("Rider A", "Tampines 0", "East", 1, 1, WorkStyle.FLEXIBLE)]
+    options = solve_with_standby_options(
+        open_jobs=jobs,
+        active_riders=active,
+        standby_riders=[],
+        dispatch_at=datetime(2026, 8, 5, 14, tzinfo=ZONE),
+        operation_context=CONTEXT,
+        use_onemap=False,
+        beam_width=10,
+        time_limit_seconds=5,
+    )
+    assert options.partial_result.status == "PARTIAL"
+    assert len(options.unassigned_jobs) == 1
+    assert options.standby_recommendation is None
+
+
+def test_solve_with_standby_options_asks_the_advisor_when_leftovers_exist() -> None:
+    jobs = pd.DataFrame([_job("J1", 0), _job("J2", 1)])
+    active = [Rider("Rider A", "Tampines 0", "East", 1, 1, WorkStyle.FLEXIBLE)]
+    standby = [
+        Rider(
+            "Standby B",
+            "Bedok 1",
+            "East",
+            1,
+            1,
+            WorkStyle.FLEXIBLE,
+            available_from=datetime(2026, 8, 5, 13, tzinfo=ZONE),
+            available_until=datetime(2026, 8, 5, 16, tzinfo=ZONE),
+        )
+    ]
+    options = solve_with_standby_options(
+        open_jobs=jobs,
+        active_riders=active,
+        standby_riders=standby,
+        dispatch_at=datetime(2026, 8, 5, 14, tzinfo=ZONE),
+        operation_context=CONTEXT,
+        use_onemap=False,
+        beam_width=10,
+        time_limit_seconds=5,
+        gemini_api_key=None,
+    )
+    assert len(options.unassigned_jobs) == 1
+    assert options.standby_recommendation is not None
+    assert options.standby_recommendation.activate_driver is False
+    assert "not configured" in options.standby_recommendation.business_reasoning

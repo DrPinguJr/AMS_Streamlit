@@ -53,6 +53,10 @@ The live developer switch is `OPTIMISER_VERSION = "v2"`. The V2 solver is active
 | `convert_results_to_output_safe_values.py` | finite and JSON-safe boundary conversion |
 | `pages/create_optimised_vehicle_routes_page.py` | 3,284-line operational optimizer UI/orchestrator |
 | `pages/review_map_and_manually_adjust_route_assignments_page.py` | 2,219-line detailed planner UI/orchestrator |
+| `pages/hourly_route_optimiser_page.py` | rolling hourly dispatch UI: append releases, live shift timeline, commit completions, re-solve remainder, standby-driver review |
+| `hourly_route_dispatch.py` | pure engine behind the hourly page: append/dedupe, archive contiguous completions, residual-rider shrink, incremental re-solve, standby-options orchestration |
+| `gemini_standby_advisor.py` | pure Gemini (`google-genai`) call for the standby-driver activation recommendation; never raises |
+| `hourly_dispatch_ledger.py` | local Excel same-day resume ledger for the hourly page; not durable across a Cloud redeploy |
 | `components/.../index.html` | drag/drop lane board UI |
 | `components/register_...py` | component registration; currently legacy `streamlit.components.v1` |
 | `cloud_access_control.py` | shared password gate |

@@ -17,8 +17,13 @@ Context: [[04 Complexity Hotspots]]. Change routing: [[91 Change Impact Routes]]
 
 - planner preview concatenation emits pandas FutureWarnings;
 - route-board registration uses legacy `streamlit.components.v1`;
-- local/Cloud mutable filesystem is not a durable multi-user data store;
-- shared in-process/session/disk boundaries require care under concurrent sessions.
+- local/Cloud mutable filesystem is not a durable multi-user data store — [[96 Local Dispatch Ledger]] is explicitly same-day/best-effort for this reason, not a fix;
+- shared in-process/session/disk boundaries require care under concurrent sessions;
+- [[95 Standby Driver Advisor]]'s `GEMINI_MODEL_NAME` is a single hardcoded model id with no fallback if Google retires it — cheap to fix, easy to forget.
+
+## Resolved
+
+- ~~`residual_riders`/`archive_completed_prefix` read route rows via scattered string literals~~ - centralised in `RouteSchemaAdapter`; see [[94 Hourly Rolling Dispatch]].
 
 ## Documentation/acceptance debt
 

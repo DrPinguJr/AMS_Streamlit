@@ -1294,7 +1294,21 @@ def run_optimiser_v2(
     empty_duration_multiplier: float = 1.5,
     empty_wait_buffer_min: float = 6.0,
     progress_callback: V2ProgressCallback | None = None,
+    allow_partial_assignment: bool = False,
 ) -> V2OptimisationResult:
+    """Solve for the best hard-feasible plan.
+
+    By default every job must be placed or the whole run reports INFEASIBLE
+    (unchanged behaviour for the main optimiser page). When
+    ``allow_partial_assignment`` is True, a job that cannot be placed in any
+    rider's route is skipped instead of aborting the search: the search
+    continues to place the remaining jobs, and the skipped jobs come back on
+    the result as ``unassigned_jobs``/``infeasible_reasons`` alongside a
+    genuine ``route_df`` for everything that *could* be placed, with status
+    ``"PARTIAL"``. This exists for flows (e.g. the hourly standby-driver
+    review) that want to see "N of M placed" rather than nothing at all.
+    """
+
     started = time.monotonic()
     context = operation_context or OperationContext()
     jobs = jobs_from_dataframe(jobs_df)
@@ -1314,7 +1328,7 @@ def run_optimiser_v2(
         comparison_count=0,
         estimated_comparisons=0,
     )
-    if not capacity.feasible_by_job_count:
+    if not capacity.feasible_by_job_count and not allow_partial_assignment:
         reason = (
             f"{capacity.job_count} jobs must be completed. The current riders can perform at most "
             f"{capacity.maximum_capacity} jobs. Capacity shortfall: {capacity.shortfall} jobs."
@@ -1386,6 +1400,8 @@ def run_optimiser_v2(
     ordered_jobs = _ordered_jobs(jobs, riders)
     search_deadline = time.monotonic() + max(1.0, float(time_limit_seconds))
     failure_reasons: list[str] = []
+    partial_unassigned: list[dict[str, Any]] = []
+    partial_reasons: list[str] = []
     candidate_evaluations = 0
     estimated_evaluations = max(
         1,
@@ -1406,6 +1422,7 @@ def run_optimiser_v2(
     )
     for job_position, job in enumerate(ordered_jobs):
         remaining_jobs = ordered_jobs[job_position:]
+        job_reason_start = len(failure_reasons)
         next_plans: list[_Plan] = []
         for plan in beam:
             for rider_index, rider in enumerate(riders):
@@ -1438,9 +1455,35 @@ def run_optimiser_v2(
                     )
                     next_plans.append(_Plan(route_tuple, evaluation_tuple, metrics))
         if not next_plans:
+            if allow_partial_assignment:
+                # Skip this job and keep searching for the rest; it comes back
+                # as an explicit unassigned entry on the final result instead
+                # of aborting the whole plan. Reasons are scoped to just this
+                # job's failed candidates, not the whole search's history.
+                job_reasons = list(dict.fromkeys(failure_reasons[job_reason_start:]))[:10] or [
+                    f"No hard-feasible route could accept {job.job_id}."
+                ]
+                partial_unassigned.append(job.raw)
+                partial_reasons.extend(job_reasons)
+                _emit_progress(
+                    progress_callback,
+                    phase="Plan search",
+                    event_type="v2_search",
+                    status=f"No hard-feasible route could accept {job.job_id}; leaving it unassigned.",
+                    progress=0.45 + (0.50 * (job_position + 1) / max(1, len(jobs))),
+                    assigned_jobs=job_position - len(partial_unassigned) + 1,
+                    total_jobs=len(jobs),
+                    remaining_jobs=len(jobs) - job_position - 1,
+                    comparison_count=candidate_evaluations,
+                    estimated_comparisons=estimated_evaluations,
+                    retained_plans=len(beam),
+                )
+                continue
             assigned_ids = {job_id for plan in beam for route in plan.routes for job_id in route}
             unassigned = [item.raw for item in jobs if item.job_id not in assigned_ids]
-            reasons = list(dict.fromkeys(failure_reasons))[:10] or [f"No hard-feasible route could accept {job.job_id}."]
+            reasons = list(dict.fromkeys(failure_reasons))[:10] or [
+                f"No hard-feasible route could accept {job.job_id}."
+            ]
             result = V2OptimisationResult(
                 pd.DataFrame(columns=ROUTE_COLUMNS),
                 pd.DataFrame(columns=SUMMARY_COLUMNS),
@@ -1501,7 +1544,13 @@ def run_optimiser_v2(
         or best.metrics.preferred_overage
         or best.metrics.area_lead_violations
     )
-    status = "COMPLETE_WITH_EXCEPTIONS" if has_soft_exceptions else "COMPLETE"
+    if partial_unassigned:
+        status = "PARTIAL"
+    elif has_soft_exceptions:
+        status = "COMPLETE_WITH_EXCEPTIONS"
+    else:
+        status = "COMPLETE"
+    assigned_job_count = len(jobs) - len(partial_unassigned)
     route_df.attrs.update(
         sanitize_for_output(
             {
@@ -1515,7 +1564,7 @@ def run_optimiser_v2(
             "hard_constraint_validation": {
                 "is_valid": True,
                 "hard_violation_count": 0,
-                "assigned_job_count": len(jobs),
+                "assigned_job_count": assigned_job_count,
                 "unique_job_count": len(jobs),
                 "violations": [],
             },
@@ -1529,21 +1578,27 @@ def run_optimiser_v2(
         status,
         capacity,
         explanations,
-        [],
-        [],
+        list(partial_unassigned),
+        list(dict.fromkeys(partial_reasons))[:10],
         best.metrics.objective(),
         matrix.metrics(),
         time.monotonic() - started,
+    )
+    finished_status = (
+        f"{status}: assigned {assigned_job_count} of {len(jobs)} jobs, "
+        f"{len(partial_unassigned)} left unassigned."
+        if partial_unassigned
+        else f"{status}: assigned all {len(jobs)} jobs."
     )
     _emit_progress(
         progress_callback,
         phase="Finished",
         event_type="v2_finished",
-        status=f"{status}: assigned all {len(jobs)} jobs.",
+        status=finished_status,
         progress=1.0,
-        assigned_jobs=len(jobs),
+        assigned_jobs=assigned_job_count,
         total_jobs=len(jobs),
-        remaining_jobs=0,
+        remaining_jobs=len(partial_unassigned),
         comparison_count=candidate_evaluations,
         estimated_comparisons=max(estimated_evaluations, candidate_evaluations),
         retained_plans=len(beam),

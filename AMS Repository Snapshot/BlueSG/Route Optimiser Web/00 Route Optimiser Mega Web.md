@@ -7,7 +7,7 @@ tags: [bluesg, route-optimiser, graph-hub]
 
 This is the atomic, graph-first bridge for the BlueSG Route Optimiser. Return to [[../00 BlueSG Index]].
 
-At creation this subgraph contains 59 connected notes and 381 internal note-to-note edges. Every node has at least five connections, so the local graph forms a dependency mesh rather than isolated leaves.
+At creation this subgraph contained 59 connected notes and 381 internal note-to-note edges; every node has at least five connections, so the local graph forms a dependency mesh rather than isolated leaves. [[94 Hourly Rolling Dispatch]], [[95 Standby Driver Advisor]], and [[96 Local Dispatch Ledger]] were added afterward for the rolling-shift page and are not yet reflected in those creation-time counts.
 
 ## Enter the web
 
@@ -22,6 +22,7 @@ At creation this subgraph contains 59 connected notes and 381 internal note-to-n
 - Active V2 solver cluster → [[40 V2 Capacity Gate]]
 - Shared V1/provider cluster → [[50 V1 Compatibility Surface]]
 - Streamlit/output cluster → [[60 Optimiser Page Orchestrator]]
+- Rolling hourly dispatch → [[94 Hourly Rolling Dispatch]]
 - Manual planning cluster → [[70 Route Planner Bridge]]
 - Cloud cluster → [[80 BlueSG Cloud Entry]]
 - Behavioral guarantees → [[90 Behaviour Contract Map]]

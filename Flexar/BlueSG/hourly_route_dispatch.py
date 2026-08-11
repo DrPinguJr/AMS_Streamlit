@@ -21,6 +21,11 @@ from Flexar.BlueSG.build_optimised_vehicle_routes import (
     stable_job_id_from_job,
     stable_job_id_from_route_row,
 )
+from Flexar.BlueSG.gemini_standby_advisor import (
+    StandbyAdvisorResult,
+    build_standby_context,
+    recommend_standby_activation,
+)
 from Flexar.BlueSG.job_import_staging import commit_staged_jobs, validate_staged_jobs
 from Flexar.BlueSG.manual_route_assignment_editing_and_recalculation import (
     RecalculationResult,
@@ -33,10 +38,44 @@ from Flexar.BlueSG.vehicle_route_optimiser_v2 import (
     Rider,
     V2OptimisationResult,
     WorkStyle,
+    build_v2_travel_matrix,
+    jobs_from_dataframe,
     normalise_v2_roster,
     run_optimiser_v2,
     validate_v2_roster,
 )
+
+
+class RouteSchemaAdapter:
+    """Centralises the ROUTE_COLUMNS field names this module reads.
+
+    `residual_riders` and `archive_completed_prefix` used to reach into route
+    rows with scattered string literals ("Rider", "Drop-off Address", "Final
+    Completion ETA", ...). A `ROUTE_COLUMNS` rename would silently break them
+    one at a time. Routing every read through this adapter makes a schema
+    change a one-place edit, and gives each lookup a documented purpose.
+    """
+
+    RIDER_FIELD = "Rider"
+    SEQUENCE_FIELD = "Sequence"
+    DROPOFF_ADDRESS_FIELD = "Drop-off Address"
+    COMPLETION_ETA_FIELD = "Final Completion ETA"
+
+    @classmethod
+    def rider_name(cls, route_row: object) -> str:
+        return clean_text(route_row.get(cls.RIDER_FIELD))
+
+    @classmethod
+    def sequence(cls, route_row: object) -> object:
+        return route_row.get(cls.SEQUENCE_FIELD)
+
+    @classmethod
+    def dropoff_address(cls, route_row: object) -> str:
+        return clean_text(route_row.get(cls.DROPOFF_ADDRESS_FIELD))
+
+    @classmethod
+    def completion_eta(cls, route_row: object) -> object:
+        return route_row.get(cls.COMPLETION_ETA_FIELD)
 
 
 @dataclass(frozen=True)
@@ -190,6 +229,30 @@ def live_shift_timeline(roster_df: pd.DataFrame, dispatch_at: datetime) -> pd.Da
     return pd.DataFrame(rows)
 
 
+def standby_riders_for_dispatch(roster_df: pd.DataFrame, dispatch_at: datetime) -> list[Rider]:
+    """Riders left un-ticked (`Active=False`) but with a parseable shift
+    window: the pool a dispatcher can choose to activate for leftover jobs.
+
+    Reuses `validate_v2_roster`'s parsing by temporarily flipping `Active` to
+    True, since that function only returns `Rider` objects for active rows.
+    A row with no Shift Start/End is excluded rather than treated as
+    "always available" - a standby candidate needs a declared window for the
+    shift-end buffer check to mean anything.
+    """
+
+    roster = normalise_riders(roster_df)
+    if "Active" not in roster:
+        return []
+    inactive = roster[~roster["Active"].fillna(False).astype(bool)].copy()
+    if inactive.empty:
+        return []
+    inactive["Active"] = True
+    validation = validate_v2_roster(inactive, dispatch_at.date())
+    if not validation.is_valid:
+        return []
+    return [rider for rider in validation.riders if rider.available_from is not None]
+
+
 def active_riders_for_dispatch(roster_df: pd.DataFrame, dispatch_at: datetime) -> list[Rider]:
     validation = validate_v2_roster(normalise_riders(roster_df), dispatch_at.date())
     if not validation.is_valid:
@@ -216,9 +279,11 @@ def archive_completed_prefix(
     if current.empty or not completed_job_ids:
         return archive, current
     move_indices: list[Any] = []
-    for rider, routes in current.groupby("Rider", sort=False):
+    for rider, routes in current.groupby(RouteSchemaAdapter.RIDER_FIELD, sort=False):
         ordered = routes.assign(
-            _dispatch_seq=pd.to_numeric(routes["Sequence"], errors="coerce")
+            _dispatch_seq=pd.to_numeric(
+                routes[RouteSchemaAdapter.SEQUENCE_FIELD], errors="coerce"
+            )
         ).sort_values("_dispatch_seq", kind="stable")
         seen_open = False
         for index, row in ordered.iterrows():
@@ -238,7 +303,7 @@ def archive_completed_prefix(
 
 
 def _completion_time(row: pd.Series, dispatch_at: datetime) -> datetime:
-    parsed = pd.to_datetime(row.get("Final Completion ETA"), errors="coerce")
+    parsed = pd.to_datetime(RouteSchemaAdapter.completion_eta(row), errors="coerce")
     if pd.isna(parsed):
         return dispatch_at
     value = parsed.to_pydatetime()
@@ -254,8 +319,8 @@ def residual_riders(
     residual: list[Rider] = []
     for rider in riders:
         rows = (
-            archive[archive["Rider"].apply(clean_text) == rider.name].copy()
-            if not archive.empty and "Rider" in archive
+            archive[archive[RouteSchemaAdapter.RIDER_FIELD].apply(clean_text) == rider.name].copy()
+            if not archive.empty and RouteSchemaAdapter.RIDER_FIELD in archive
             else pd.DataFrame()
         )
         completed = len(rows)
@@ -268,7 +333,7 @@ def residual_riders(
                 lambda row: _completion_time(row, dispatch_at), axis=1
             )
             last = rows.sort_values("_completion", kind="stable").iloc[-1]
-            start_location = clean_text(last.get("Drop-off Address")) or start_location
+            start_location = RouteSchemaAdapter.dropoff_address(last) or start_location
             last_completion = last["_completion"]
         available_from = max(
             dispatch_at,
@@ -362,6 +427,45 @@ def combine_dispatch_routes(
     return combined.drop(columns="_dispatch_order").reset_index(drop=True)
 
 
+def open_jobs_for_dispatch(
+    committed_jobs: pd.DataFrame,
+    archived_routes: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """Committed jobs minus whatever is already archived (locked, completed)."""
+
+    archive = archived_routes.copy(deep=True) if isinstance(archived_routes, pd.DataFrame) else pd.DataFrame()
+    completed_ids = {stable_job_id_from_route_row(row) for _, row in archive.iterrows()}
+    jobs = _with_dispatch_identity(committed_jobs)
+    open_mask = jobs.apply(
+        lambda row: stable_job_id_from_job(row.to_dict()) not in completed_ids,
+        axis=1,
+    )
+    return jobs[open_mask].reset_index(drop=True)
+
+
+def operation_context_for_riders(
+    riders: list[Rider],
+    dispatch_at: datetime,
+    *,
+    operation_end: datetime | None = None,
+    fallback_hours: float = 3.0,
+) -> OperationContext:
+    """An operation window running from now to the latest rider shift end."""
+
+    latest_shift_end = max(
+        (
+            _aware(rider.available_until, dispatch_at)
+            for rider in riders
+            if rider.available_until is not None
+        ),
+        default=dispatch_at + timedelta(hours=fallback_hours),
+    )
+    return OperationContext(
+        operation_start=dispatch_at,
+        operation_end=operation_end or latest_shift_end,
+    )
+
+
 def run_hourly_dispatch(
     *,
     committed_jobs: pd.DataFrame,
@@ -383,32 +487,13 @@ def run_hourly_dispatch(
         if isinstance(confirmed_open_routes, pd.DataFrame)
         else pd.DataFrame(columns=ROUTE_COLUMNS)
     )
-    completed_ids = {
-        stable_job_id_from_route_row(row) for _, row in archive.iterrows()
-    }
-    jobs = _with_dispatch_identity(committed_jobs)
-    open_mask = jobs.apply(
-        lambda row: stable_job_id_from_job(row.to_dict()) not in completed_ids,
-        axis=1,
-    )
-    open_jobs = jobs[open_mask].reset_index(drop=True)
+    open_jobs = open_jobs_for_dispatch(committed_jobs, archive)
     active = active_riders_for_dispatch(roster_df, dispatch_at)
     residual = residual_riders(active, archive, dispatch_at)
     if not open_jobs.empty and not residual:
         raise ValueError("No activated rider is currently inside an available shift window.")
 
-    latest_shift_end = max(
-        (
-            _aware(rider.available_until, dispatch_at)
-            for rider in residual
-            if rider.available_until is not None
-        ),
-        default=dispatch_at + timedelta(hours=3),
-    )
-    context = OperationContext(
-        operation_start=dispatch_at,
-        operation_end=operation_end or latest_shift_end,
-    )
+    context = operation_context_for_riders(residual, dispatch_at, operation_end=operation_end)
     solver = run_optimiser_v2(
         open_jobs,
         residual,
@@ -478,3 +563,103 @@ def run_hourly_dispatch(
         recalculation,
         tuple(rider.name for rider in residual),
     )
+
+
+@dataclass(frozen=True)
+class StandbyDispatchOptions:
+    """Two comparable views of the same shortfall, for a dual-option UI.
+
+    Option A is `partial_result`: whatever the active roster could place,
+    with the rest explicitly listed in `unassigned_jobs`. Option B is
+    `standby_recommendation`: Gemini's read on whether to activate a standby
+    rider for those leftovers, or None if there was nothing to decide (no
+    leftovers, or no standby riders to consider).
+    """
+
+    partial_result: V2OptimisationResult
+    unassigned_jobs: tuple[dict[str, Any], ...]
+    standby_recommendation: StandbyAdvisorResult | None
+
+
+def _idle_minutes(rider: Rider, dispatch_at: datetime) -> float:
+    if rider.available_from is None:
+        return 0.0
+    elapsed = (dispatch_at - _aware(rider.available_from, dispatch_at)).total_seconds() / 60
+    return max(0.0, elapsed)
+
+
+def solve_with_standby_options(
+    *,
+    open_jobs: pd.DataFrame,
+    active_riders: list[Rider],
+    standby_riders: list[Rider],
+    dispatch_at: datetime,
+    operation_context: OperationContext,
+    use_onemap: bool = True,
+    token: str | None = None,
+    beam_width: int = 80,
+    time_limit_seconds: float = 30.0,
+    gemini_api_key: str | None = None,
+) -> StandbyDispatchOptions:
+    """Solve the active roster allowing partial coverage ("N of M placed"),
+    then - only if jobs are left over and standby riders exist - ask the
+    Gemini advisor whether activating one of them is worth it.
+
+    This is deliberately separate from `run_hourly_dispatch`: the rolling
+    lock-and-archive path stays all-or-nothing (coverage is mandatory there),
+    while this is an explicit, operator-triggered "what if" review.
+    """
+
+    partial_result = run_optimiser_v2(
+        open_jobs,
+        active_riders,
+        operation_context=operation_context,
+        use_onemap=use_onemap,
+        token=token,
+        beam_width=beam_width,
+        time_limit_seconds=time_limit_seconds,
+        allow_partial_assignment=True,
+    )
+    unassigned = tuple(partial_result.unassigned_jobs)
+    if not unassigned or not standby_riders:
+        return StandbyDispatchOptions(partial_result, unassigned, None)
+
+    leftover_jobs = jobs_from_dataframe(pd.DataFrame(list(unassigned)))
+    travel_matrix = build_v2_travel_matrix(
+        leftover_jobs,
+        standby_riders,
+        operation_context,
+        use_onemap=use_onemap,
+        token=token,
+    )
+    travel_minutes: dict[str, dict[str, float]] = {}
+    standby_payload: list[dict[str, Any]] = []
+    for rider in standby_riders:
+        shift_window = (
+            f"{rider.available_from:%H:%M}-{rider.available_until:%H:%M}"
+            if rider.available_from and rider.available_until
+            else "unspecified"
+        )
+        standby_payload.append(
+            {
+                "name": rider.name,
+                "home_zone": rider.start_zone,
+                "shift_window": shift_window,
+                "idle_minutes": round(_idle_minutes(rider, dispatch_at), 1),
+            }
+        )
+        travel_minutes[rider.name] = {
+            job.job_id: (
+                travel_matrix.empty_cost(rider.start_location, job.pickup_address).duration_min or 0.0
+            )
+            for job in leftover_jobs
+        }
+
+    context = build_standby_context(
+        dispatch_at=dispatch_at,
+        leftover_jobs=list(unassigned),
+        standby_riders=standby_payload,
+        travel_minutes=travel_minutes,
+    )
+    recommendation = recommend_standby_activation(context, api_key=gemini_api_key)
+    return StandbyDispatchOptions(partial_result, unassigned, recommendation)

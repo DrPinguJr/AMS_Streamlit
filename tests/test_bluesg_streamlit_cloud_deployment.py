@@ -17,12 +17,14 @@ SHARED_ROUTER = BLUESG_DIR / "cloud_streamlit_router.py"
 EXPECTED_PAGE_TARGETS = {
     "create_optimised_vehicle_routes_page.py",
     "review_map_and_manually_adjust_route_assignments_page.py",
+    "hourly_route_optimiser_page.py",
 }
 EXPECTED_REQUIREMENTS = [
     "streamlit==1.57.0",
     "pandas==3.0.3",
     "openpyxl==3.1.5",
     "pydeck==0.9.2",
+    "google-genai==2.17.0",
 ]
 
 

@@ -11,7 +11,8 @@ Upstream: [[40 V2 Capacity Gate]], [[45 Beam Search Expansion]], and [[47 Lexico
 
 - COMPLETE: all jobs assigned without tracked soft exceptions.
 - COMPLETE_WITH_EXCEPTIONS: complete/hard-feasible with severity, overage, Area Lead, or similar soft exceptions.
-- INFEASIBLE: capacity shortfall or no complete hard-feasible plan.
+- INFEASIBLE: capacity shortfall or no complete hard-feasible plan. Default behaviour for every caller.
+- PARTIAL: only reachable when a caller opts in with `allow_partial_assignment=True` (currently only [[94 Hourly Rolling Dispatch]]'s standby review). A job that cannot be hard-feasibly placed is skipped instead of aborting the search; `route_df` covers everything that *could* be placed, and the skipped jobs come back on `unassigned_jobs`/`infeasible_reasons`. See [[95 Standby Driver Advisor]].
 
 ## Per-job explanation
 

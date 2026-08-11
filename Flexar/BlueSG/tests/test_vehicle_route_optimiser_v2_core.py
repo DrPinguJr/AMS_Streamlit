@@ -231,6 +231,50 @@ def test_last_job_before_four_is_invalid_if_return_is_after_four() -> None:
     assert any("Required destination arrival" in reason for reason in result.infeasible_reasons)
 
 
+def test_partial_assignment_off_by_default_returns_infeasible() -> None:
+    jobs = _jobs(2)
+    riders = [Rider("A", "East pickup 1", "East", 1, 1, WorkStyle.FLEXIBLE)]
+    matrix = _matrix(jobs, riders)
+    result = run_optimiser_v2(jobs, riders, operation_context=CONTEXT, travel_matrix=matrix)
+    assert result.status == "INFEASIBLE"
+    assert result.route_df.empty
+    assert len(result.unassigned_jobs) == 2
+
+
+def test_allow_partial_assignment_places_what_fits_and_lists_the_rest() -> None:
+    jobs = _jobs(2)
+    riders = [Rider("A", "East pickup 1", "East", 1, 1, WorkStyle.FLEXIBLE)]
+    matrix = _matrix(jobs, riders)
+    result = run_optimiser_v2(
+        jobs,
+        riders,
+        operation_context=CONTEXT,
+        travel_matrix=matrix,
+        allow_partial_assignment=True,
+    )
+    assert result.status == "PARTIAL"
+    assert len(result.route_df) == 1
+    assert len(result.unassigned_jobs) == 1
+    assert result.unassigned_jobs[0]["Job ID"] == "J2"
+    assert result.infeasible_reasons
+
+
+def test_allow_partial_assignment_still_completes_when_everything_fits() -> None:
+    jobs = _jobs(1)
+    riders = [Rider("A", "East pickup 1", "East", 1, 1, WorkStyle.FLEXIBLE)]
+    matrix = _matrix(jobs, riders)
+    result = run_optimiser_v2(
+        jobs,
+        riders,
+        operation_context=CONTEXT,
+        travel_matrix=matrix,
+        allow_partial_assignment=True,
+    )
+    assert result.status == "COMPLETE"
+    assert not result.unassigned_jobs
+    assert len(result.route_df) == 1
+
+
 def test_zero_minute_empty_route_is_valid() -> None:
     jobs = _jobs(1)
     jobs.loc[0, "Pickup Address"] = "Tampines"

@@ -22,7 +22,8 @@ Core keys include imported source data, job draft, committed jobs, rider draft, 
 - rider transaction: [[23 Rider Draft Transaction]];
 - result fingerprint: [[21 Result Staleness Signature]];
 - operation/run: [[60 Optimiser Page Orchestrator]];
-- cross-page handoff: [[70 Route Planner Bridge]].
+- cross-page handoff: [[70 Route Planner Bridge]];
+- rolling-shift reuse of `committed_jobs`/`committed_riders`: [[94 Hourly Rolling Dispatch]].
 
 ## Streamlit boundary
 

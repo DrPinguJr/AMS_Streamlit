@@ -22,11 +22,21 @@ from Flexar.BlueSG.build_optimised_vehicle_routes import (
     get_cached_geocode,
     stable_job_id_from_route_row,
 )
+from Flexar.BlueSG.hourly_dispatch_ledger import (
+    HourlyLedgerState,
+    load_hourly_ledger,
+    save_hourly_ledger,
+)
 from Flexar.BlueSG.hourly_route_dispatch import (
+    active_riders_for_dispatch,
     append_hourly_jobs,
     archive_completed_prefix,
     live_shift_timeline,
+    open_jobs_for_dispatch,
+    operation_context_for_riders,
     run_hourly_dispatch,
+    solve_with_standby_options,
+    standby_riders_for_dispatch,
 )
 from Flexar.BlueSG.job_import_staging import ImportResult, parse_job_source, validate_staged_jobs
 from Flexar.BlueSG.optimiser_workflow_state import (
@@ -141,6 +151,7 @@ def render_job_importer(dispatch_at: datetime) -> None:
             if result.ignored_job_ids:
                 message += f" Ignored {len(result.ignored_job_ids)} already-committed job(s)."
             st.session_state.hourly_notice = message
+            persist_hourly_ledger()
             st.rerun()
 
 
@@ -233,6 +244,36 @@ def show_route_map(route_df: pd.DataFrame) -> None:
     st.pydeck_chart(deck, width="stretch")
 
 
+def configured_gemini_api_key() -> str:
+    """Return the optional Gemini API key without requiring secrets to exist."""
+
+    try:
+        return clean_text(st.secrets.get("GEM_KEY", ""))
+    except Exception:
+        return ""
+
+
+def persist_hourly_ledger() -> None:
+    """Best-effort same-day save. A write failure never blocks the operator;
+    it only means the next rerun/restart won't resume from this point."""
+
+    try:
+        save_hourly_ledger(
+            HourlyLedgerState(
+                committed_jobs=st.session_state.committed_jobs,
+                committed_riders=st.session_state.committed_riders,
+                open_routes=st.session_state.hourly_open_routes,
+                archived_routes=st.session_state.hourly_archived_routes,
+                dispatch_at=st.session_state.hourly_dispatch_at,
+            ),
+            st.session_state.hourly_dispatch_at.date(),
+        )
+    except Exception as exc:
+        st.session_state.hourly_ledger_error = f"Could not save the local dispatch ledger: {exc}"
+    else:
+        st.session_state.hourly_ledger_error = ""
+
+
 now = pd.Timestamp.now(tz="Asia/Singapore").to_pydatetime()
 default_dispatch = now.replace(minute=0, second=0, microsecond=0)
 default_day = default_dispatch.strftime("%A")
@@ -246,6 +287,28 @@ st.session_state.setdefault("hourly_notice", "")
 st.session_state.setdefault("hourly_open_routes", pd.DataFrame())
 st.session_state.setdefault("hourly_archived_routes", pd.DataFrame())
 st.session_state.setdefault("hourly_dispatch_result", None)
+st.session_state.setdefault("hourly_standby_options", None)
+st.session_state.setdefault("hourly_ledger_error", "")
+st.session_state.setdefault("hourly_ledger_resumed", False)
+
+if not st.session_state.hourly_ledger_resumed:
+    st.session_state.hourly_ledger_resumed = True
+    try:
+        saved_ledger = load_hourly_ledger(now.date())
+    except Exception:
+        saved_ledger = None
+    if saved_ledger is not None:
+        if isinstance(saved_ledger.committed_jobs, pd.DataFrame) and not saved_ledger.committed_jobs.empty:
+            st.session_state.committed_jobs = saved_ledger.committed_jobs
+            st.session_state.job_draft = saved_ledger.committed_jobs.copy(deep=True)
+        if isinstance(saved_ledger.committed_riders, pd.DataFrame) and not saved_ledger.committed_riders.empty:
+            st.session_state.committed_riders = saved_ledger.committed_riders
+            st.session_state.rider_draft = saved_ledger.committed_riders.copy(deep=True)
+        st.session_state.hourly_open_routes = saved_ledger.open_routes
+        st.session_state.hourly_archived_routes = saved_ledger.archived_routes
+        if saved_ledger.dispatch_at is not None:
+            st.session_state.hourly_dispatch_at = saved_ledger.dispatch_at
+        st.session_state.hourly_notice = "Resumed today's saved dispatch state from the local ledger."
 
 st.title("Hourly Route Optimiser")
 st.caption(
@@ -270,6 +333,8 @@ st.session_state.hourly_dispatch_at = dispatch_at
 if st.session_state.hourly_notice:
     st.success(st.session_state.hourly_notice)
     st.session_state.hourly_notice = ""
+if st.session_state.hourly_ledger_error:
+    st.warning(st.session_state.hourly_ledger_error)
 
 render_job_importer(dispatch_at)
 
@@ -314,6 +379,7 @@ if save_roster:
     else:
         st.session_state.rider_draft = edited_roster
         save_rider_draft(st.session_state, edited_roster)
+        persist_hourly_ledger()
         st.success("Shift roster saved for this session.")
 
 timeline = live_shift_timeline(st.session_state.committed_riders, dispatch_at)
@@ -380,6 +446,8 @@ if isinstance(open_routes, pd.DataFrame) and not open_routes.empty:
         else:
             st.session_state.hourly_archived_routes = archive
             st.session_state.hourly_open_routes = remaining
+            st.session_state.hourly_standby_options = None
+            persist_hourly_ledger()
             st.success(f"Committed {len(selected_ids)} completed job(s).")
             st.rerun()
 
@@ -441,8 +509,10 @@ if st.button(
         st.error(f"Hourly dispatch failed: {exc}")
     else:
         st.session_state.hourly_dispatch_result = result
+        st.session_state.hourly_standby_options = None
         if result.solver_result.status != "INFEASIBLE":
             st.session_state.hourly_open_routes = result.open_route_df
+        persist_hourly_ledger()
         st.rerun()
 
 latest = st.session_state.hourly_dispatch_result
@@ -452,6 +522,93 @@ if latest is not None:
         st.error("No hard-feasible plan was found.")
         for reason in latest.solver_result.infeasible_reasons:
             st.warning(reason)
+
+        st.subheader("Standby driver review")
+        st.caption(
+            "See how much of the shortfall the active roster can actually cover, and "
+            "whether a Gemini-reviewed standby rider (Active unticked above, shift "
+            "window set) is worth activating for the rest."
+        )
+        if st.button(
+            "Check partial coverage + standby options",
+            icon=":material/support_agent:",
+            key="hourly_standby_check",
+        ):
+            try:
+                standby_open_jobs = open_jobs_for_dispatch(
+                    st.session_state.committed_jobs, st.session_state.hourly_archived_routes
+                )
+                active_for_standby = active_riders_for_dispatch(
+                    st.session_state.committed_riders, dispatch_at
+                )
+                standby_pool = standby_riders_for_dispatch(
+                    st.session_state.committed_riders, dispatch_at
+                )
+                standby_context = operation_context_for_riders(
+                    active_for_standby + standby_pool, dispatch_at
+                )
+                with st.spinner("Checking partial coverage and standby options…"):
+                    options = solve_with_standby_options(
+                        open_jobs=standby_open_jobs,
+                        active_riders=active_for_standby,
+                        standby_riders=standby_pool,
+                        dispatch_at=dispatch_at,
+                        operation_context=standby_context,
+                        use_onemap=use_onemap,
+                        beam_width=int(beam_width),
+                        time_limit_seconds=float(time_limit),
+                        gemini_api_key=configured_gemini_api_key(),
+                    )
+            except Exception as exc:
+                st.error(f"Standby review failed: {exc}")
+            else:
+                st.session_state.hourly_standby_options = options
+                st.rerun()
+
+        standby_options = st.session_state.hourly_standby_options
+        if standby_options is not None:
+            partial = standby_options.partial_result
+            assigned_count = len(partial.route_df)
+            unassigned_count = len(standby_options.unassigned_jobs)
+            total = assigned_count + unassigned_count
+            option_columns = st.columns(2)
+            with option_columns[0]:
+                st.markdown(f"**Option A · Dispatch now — {assigned_count} of {total} covered**")
+                if unassigned_count:
+                    st.warning(f"{unassigned_count} job(s) would stay unassigned this hour.")
+                    for job in standby_options.unassigned_jobs:
+                        st.caption(
+                            f"• {clean_text(job.get('Car Plate'))}: "
+                            f"{clean_text(job.get('Pickup Address'))} → "
+                            f"{clean_text(job.get('Drop-off Address'))}"
+                        )
+                else:
+                    st.success("Every open job can be covered by the active roster.")
+                if not partial.route_df.empty:
+                    st.dataframe(partial.route_df, hide_index=True, height=220)
+            with option_columns[1]:
+                st.markdown("**Option B · Activate a standby driver**")
+                recommendation = standby_options.standby_recommendation
+                if recommendation is None:
+                    st.info(
+                        "No standby riders are available to consider (need Active "
+                        "unticked with a shift window set)."
+                    )
+                elif recommendation.activate_driver:
+                    st.success(
+                        f"Gemini recommends activating "
+                        f"**{recommendation.recommended_driver_name or 'a standby rider'}** "
+                        f"for job {recommendation.recommended_job_id or '-'}."
+                    )
+                    st.caption(recommendation.business_reasoning)
+                else:
+                    st.info("Gemini does not recommend activating a standby rider right now.")
+                    st.caption(recommendation.business_reasoning)
+            st.caption(
+                "This review does not change the committed plan by itself. To act on "
+                "Option A, rerun the solve after clearing the unassigned job(s); to act "
+                "on Option B, tick Active for the recommended rider above and rerun."
+            )
     else:
         st.success(
             f"{latest.solver_result.status.replace('_', ' ').title()} · "

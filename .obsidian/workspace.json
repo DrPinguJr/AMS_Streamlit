@@ -11,10 +11,14 @@
             "id": "a6b999d042b6ea30",
             "type": "leaf",
             "state": {
-              "type": "graph",
-              "state": {},
-              "icon": "lucide-git-fork",
-              "title": "Graph view"
+              "type": "markdown",
+              "state": {
+                "file": "AMS Repository Snapshot/BlueSG/Route Optimiser Web/05 Graph View Setup.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "05 Graph View Setup"
             }
           }
         ]
@@ -181,12 +185,15 @@
       "bases:Create new base": false
     }
   },
-  "active": "a6b999d042b6ea30",
+  "active": "11d1ea28ced2ba19",
   "lastOpenFiles": [
+    "Untitled",
+    "Untitled.base",
+    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/05 Graph View Setup.md",
+    "Untitled.md",
     "runs/2026-08-05/130543_severity_area_lead_beam_search_run_summary.json",
     "runs/2026-08-05",
     "AMS Repository Snapshot.zip",
-    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/05 Graph View Setup.md",
     "AMS Repository Snapshot/BlueSG/Route Optimiser Web/91 Change Impact Routes.md",
     "AMS Repository Snapshot/BlueSG/Route Optimiser Web/93 Acceptance Scenarios.md",
     "AMS Repository Snapshot/BlueSG/Route Optimiser Web/92 Known Technical Debt.md",
@@ -211,14 +218,11 @@
     "AMS Repository Snapshot/BlueSG/Route Optimiser Web/58 Optional Local Improvement.md",
     "AMS Repository Snapshot/BlueSG/Route Optimiser Web/57 Route Reconstruction and Integrity.md",
     "AMS Repository Snapshot/BlueSG/Route Optimiser Web/56 V1 Regional Overflow Policy.md",
-    "AMS Repository Snapshot/BlueSG/Route Optimiser Web/55 Seven Zone Adjacency.md",
     "AMS Repository Snapshot/BlueSG/Route Optimiser Web",
     "AMS Repository Snapshot/Subsystems",
     "AMS Repository Snapshot/BlueSG",
     "AMS Repository Snapshot",
     "Flexar/whatsapp_request_processor/scripts/__pycache__/ams_supervisor.cpython-314.pyc",
-    "Flexar/whatsapp_request_processor/scripts/__pycache__",
-    "Flexar/whatsapp_request_processor/__pycache__/ui_components.cpython-314.pyc",
     "Flexar/whatsapp_request_processor/data/placeholder_12.gif",
     "Flexar/whatsapp_request_processor/data/placeholder_11.gif",
     "Flexar/whatsapp_request_processor/data/placeholder_10.gif",
