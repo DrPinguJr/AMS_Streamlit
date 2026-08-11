@@ -150,6 +150,82 @@ def test_convert_docx_to_pdf_reports_unavailable_converter(
         pdf_utils.convert_docx_to_pdf(source)
 
 
+def test_convert_docx_to_pdf_uses_libreoffice_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "Sample Contract.docx"
+    source.write_bytes(b"test docx")
+    output_dir = tmp_path / "pdfs"
+    status = pdf_utils.PdfConverterStatus(
+        available=True,
+        converter=pdf_utils.LIBREOFFICE_CONVERTER_NAME,
+        executable="/usr/bin/soffice",
+    )
+    monkeypatch.setattr(pdf_utils, "get_pdf_converter_status", lambda: status)
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append((command, kwargs))
+        outdir = Path(command[command.index("--outdir") + 1])
+        source_path = Path(command[-1])
+        outdir.mkdir(parents=True, exist_ok=True)
+        (outdir / f"{source_path.stem}.pdf").write_bytes(b"%PDF-1.7\nlibreoffice")
+        return SimpleNamespace(returncode=0, stdout="converted", stderr="")
+
+    monkeypatch.setattr(pdf_utils.subprocess, "run", fake_run)
+
+    result = pdf_utils.convert_docx_to_pdf(source, output_dir)
+
+    assert result == output_dir.resolve() / "Sample Contract.pdf"
+    assert result.read_bytes().startswith(b"%PDF")
+    assert calls
+    command, kwargs = calls[0]
+    assert command == [
+        "/usr/bin/soffice",
+        "--headless",
+        "--nologo",
+        "--nofirststartwizard",
+        "--norestore",
+        "--convert-to",
+        "pdf",
+        "--outdir",
+        str(output_dir.resolve()),
+        str(source.resolve()),
+    ]
+    assert kwargs["check"] is False
+    assert kwargs["text"] is True
+    assert kwargs["timeout"] == 120
+
+
+def test_convert_docx_to_pdf_reports_libreoffice_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "contract.docx"
+    source.write_bytes(b"test docx")
+    status = pdf_utils.PdfConverterStatus(
+        available=True,
+        converter=pdf_utils.LIBREOFFICE_CONVERTER_NAME,
+        executable="/usr/bin/soffice",
+    )
+    monkeypatch.setattr(pdf_utils, "get_pdf_converter_status", lambda: status)
+    monkeypatch.setattr(
+        pdf_utils.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="simulated LibreOffice failure",
+        ),
+    )
+
+    with pytest.raises(pdf_utils.DocxToPdfConversionError) as exc_info:
+        pdf_utils.convert_docx_to_pdf(source)
+
+    assert "simulated LibreOffice failure" in str(exc_info.value)
+
+
 def test_convert_docx_to_pdf_validates_input(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="DOCX file was not found"):
         pdf_utils.convert_docx_to_pdf(tmp_path / "missing.docx")
@@ -191,6 +267,32 @@ def test_find_microsoft_word_checks_registered_then_standard_paths(
     assert pdf_utils.find_microsoft_word() == str(standard.resolve())
 
 
+def test_find_libreoffice_prefers_configured_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured = tmp_path / "soffice"
+    configured.write_bytes(b"libreoffice")
+    monkeypatch.setenv("LIBREOFFICE_PATH", str(configured))
+    monkeypatch.setattr(pdf_utils.shutil, "which", lambda command: None)
+
+    assert pdf_utils.find_libreoffice() == str(configured.resolve())
+
+
+def test_find_libreoffice_checks_path_then_standard_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    standard = tmp_path / "LibreOffice" / "program" / "soffice.exe"
+    standard.parent.mkdir(parents=True)
+    standard.write_bytes(b"libreoffice")
+    monkeypatch.delenv("LIBREOFFICE_PATH", raising=False)
+    monkeypatch.setattr(pdf_utils.shutil, "which", lambda command: None)
+    monkeypatch.setattr(pdf_utils, "_standard_libreoffice_paths", lambda: (standard,))
+
+    assert pdf_utils.find_libreoffice() == str(standard.resolve())
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Microsoft Word automation is Windows-only")
 def test_pdf_converter_status_reports_word_without_starting_it(
     monkeypatch: pytest.MonkeyPatch,
@@ -207,14 +309,30 @@ def test_pdf_converter_status_reports_word_without_starting_it(
     assert status.error is None
 
 
+def test_pdf_converter_status_reports_libreoffice_off_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    libreoffice_path = "/usr/bin/soffice"
+    monkeypatch.setattr(pdf_utils.os, "name", "posix")
+    monkeypatch.setattr(pdf_utils, "find_libreoffice", lambda: libreoffice_path)
+
+    status = pdf_utils.get_pdf_converter_status()
+
+    assert status.available is True
+    assert status.converter == pdf_utils.LIBREOFFICE_CONVERTER_NAME
+    assert status.executable == libreoffice_path
+    assert status.error is None
+
+
 def test_pdf_converter_status_reports_unavailable_off_windows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(pdf_utils.os, "name", "posix")
+    monkeypatch.setattr(pdf_utils, "find_libreoffice", lambda: None)
 
     status = pdf_utils.get_pdf_converter_status()
 
     assert status.available is False
-    assert status.converter == "Microsoft Word"
+    assert status.converter == pdf_utils.PDF_CONVERTER_NAME
     assert status.executable is None
-    assert "requires Microsoft Word on Windows" in (status.error or "")
+    assert "LibreOffice" in (status.error or "")

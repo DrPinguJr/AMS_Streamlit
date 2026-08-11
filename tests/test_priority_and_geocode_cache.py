@@ -166,6 +166,61 @@ def test_geocode_batch_deduplicates_places_and_runs_distinct_places_in_parallel(
     assert sum("313@somerset" in address for address in calls) == 1
 
 
+def test_geocode_search_values_preserve_postal_address_after_near_label() -> None:
+    values = optimizer.geocode_search_values(
+        "Near Teck Ghee Market & Food Centre - 410 Ang Mo Kio Avenue 10 S560410"
+    )
+
+    assert values[0].startswith("Near Teck Ghee Market")
+    assert "410 Ang Mo Kio Avenue 10 S560410" in values
+    assert "560410" in values
+    assert optimizer.clean_address_for_geocoding(
+        "Near Bedok Mall - 220 Bedok Central S460220"
+    ) == "220 Bedok Central S460220"
+
+
+def test_geocode_search_values_try_comma_postal_fallback() -> None:
+    values = optimizer.geocode_search_values("313@somerset, 313 Orchard Road S238895")
+
+    assert "313 Orchard Road S238895" in values
+    assert "238895" in values
+
+
+def test_common_wealth_typo_is_normalised_for_geocoding() -> None:
+    assert optimizer.clean_address_for_geocoding("Common Wealth") == "Commonwealth MRT"
+
+
+def test_geocode_address_onemap_tries_cleaned_fallbacks(monkeypatch) -> None:
+    calls: list[str] = []
+
+    def fake_fetch_json(_url, params, token=None, timeout=15):
+        search_value = params["searchVal"]
+        calls.append(search_value)
+        if search_value == "410 Ang Mo Kio Avenue 10 S560410":
+            return {
+                "results": [
+                    {
+                        "LATITUDE": "1.36271541988052",
+                        "LONGITUDE": "103.854644986527",
+                    }
+                ]
+            }
+        return {"results": []}
+
+    monkeypatch.setattr(optimizer, "_fetch_json", fake_fetch_json)
+
+    result = optimizer.geocode_address_onemap(
+        "Near Teck Ghee Market & Food Centre - 410 Ang Mo Kio Avenue 10 S560410"
+    )
+
+    assert result.is_available
+    assert result.source == "OneMap cleaned address"
+    assert calls[:2] == [
+        "Near Teck Ghee Market & Food Centre - 410 Ang Mo Kio Avenue 10 S560410",
+        "410 Ang Mo Kio Avenue 10 S560410",
+    ]
+
+
 def test_streamlit_context_probe_is_silent_in_geocode_workers(monkeypatch) -> None:
     suppress_warning_values: list[bool] = []
     state_lock = Lock()

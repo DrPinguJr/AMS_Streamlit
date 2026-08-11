@@ -7,6 +7,7 @@ import hashlib
 from datetime import time as clock_time
 from io import BytesIO
 from pathlib import Path
+from urllib.error import HTTPError
 
 import pandas as pd
 import pydeck as pdk
@@ -85,8 +86,10 @@ from Flexar.BlueSG.build_optimised_vehicle_routes import (
     build_unassigned_jobs_df,
     get_cost_explanation,
     get_cached_geocode,
+    get_onemap_token,
     load_rider_roster,
     normalise_rider_load_level,
+    onemap_credentials_configured,
     optimisation_integrity_report,
     optimise_vehicle_routes,
     improve_route_dataframe,
@@ -1403,6 +1406,73 @@ def configure_riders_dialog(default_roster_day: str) -> None:
                 st.rerun()
 
 
+def current_onemap_token() -> str:
+    return clean_text(st.session_state.get("onemap_token", ""))
+
+
+def onemap_access_configured(session_token: str | None = None) -> bool:
+    return bool(
+        clean_text(session_token)
+        or get_onemap_token()
+        or onemap_credentials_configured()
+    )
+
+
+def store_onemap_session_token(token: str) -> None:
+    token = clean_text(token)
+    st.session_state["onemap_token"] = token
+    st.session_state["onemap_token_expiry"] = None
+    store_active_token = getattr(_route_optimizer_backend, "_store_active_onemap_token", None)
+    if callable(store_active_token):
+        store_active_token(token, None)
+        return
+    _route_optimizer_backend.ONEMAP_MEMORY_TOKEN = token
+    _route_optimizer_backend.ONEMAP_MEMORY_TOKEN_EXPIRY = None
+
+
+def clear_onemap_session_token() -> None:
+    st.session_state.pop("onemap_token", None)
+    st.session_state.pop("onemap_token_expiry", None)
+    _route_optimizer_backend.ONEMAP_MEMORY_TOKEN = ""
+    _route_optimizer_backend.ONEMAP_MEMORY_TOKEN_EXPIRY = None
+
+
+@st.dialog("OneMap token", width="small")
+def configure_onemap_token_dialog() -> None:
+    session_token = current_onemap_token()
+    if session_token:
+        st.success("A OneMap token is saved for this browser session.")
+    elif onemap_access_configured():
+        st.info("OneMap access is already configured for this app.")
+    else:
+        st.warning("No OneMap token or credentials are configured.")
+
+    with st.form("bluesg_onemap_token_form", border=False):
+        token_input = st.text_input(
+            "OneMap API token",
+            type="password",
+            placeholder="Paste OneMap access token",
+            help="Stored only in this Streamlit browser session.",
+        )
+        action_columns = st.columns(2)
+        save_clicked = action_columns[0].form_submit_button("Save token", type="primary")
+        clear_clicked = action_columns[1].form_submit_button("Clear token")
+
+    if save_clicked:
+        token = clean_text(token_input)
+        if not token:
+            st.error("Paste a OneMap token before saving.")
+            return
+        store_onemap_session_token(token)
+        st.session_state.bluesg_onemap_token_message = "OneMap token saved for this session."
+        st.rerun()
+
+    if clear_clicked:
+        clear_onemap_session_token()
+        st.session_state.bluesg_onemap_token_message = "OneMap token cleared."
+        st.rerun()
+
+
 def build_summary_from_route_rows(route_df: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     if route_df is None or route_df.empty:
@@ -1937,13 +2007,20 @@ refresh_stale_flag(st.session_state)
 
 header_columns = st.columns([5, 1.25], vertical_alignment="center")
 header_columns[0].title("Vehicle Route Optimiser — Version 2.0")
-if header_columns[1].button(
-    "Today's riders",
-    icon=":material/menu:",
-    width="stretch",
-):
-    begin_rider_draft(st.session_state)
-    configure_riders_dialog(today_name)
+with header_columns[1]:
+    if st.button(
+        "Today's riders",
+        icon=":material/menu:",
+        width="stretch",
+    ):
+        begin_rider_draft(st.session_state)
+        configure_riders_dialog(today_name)
+    if st.button(
+        "OneMap token",
+        icon=":material/key:",
+        width="stretch",
+    ):
+        configure_onemap_token_dialog()
 
 active_count = int(normalise_riders(st.session_state.committed_riders)["Active"].sum())
 st.caption(
@@ -1952,6 +2029,8 @@ st.caption(
 )
 if st.session_state.get("bluesg_rider_save_message"):
     st.success(st.session_state.pop("bluesg_rider_save_message"))
+if st.session_state.get("bluesg_onemap_token_message"):
+    st.success(st.session_state.pop("bluesg_onemap_token_message"))
 
 with st.expander("How the route optimiser works", expanded=False):
     st.write(
@@ -1995,7 +2074,8 @@ with action_col:
     st.subheader("2. Run optimiser")
     optimise_by = "duration"
     use_onemap = True
-    onemap_token = ""
+    onemap_token = current_onemap_token()
+    onemap_ready = onemap_access_configured(onemap_token)
     operation_date = selected_job_date
     operation_start_time = clock_time(14, 0)
     operation_end_time = clock_time(17, 0)
@@ -2048,11 +2128,17 @@ with action_col:
             and active_count > 0
             and not roster_preview_errors
             and preview_capacity.feasible_by_job_count
+            and (not use_onemap or onemap_ready)
         )
         if not file_is_valid:
             st.warning("Upload at least one valid job before running the optimiser.")
         elif active_count <= 0:
             st.warning("Activate at least one rider in Today's riders before running the optimiser.")
+        elif use_onemap and not onemap_ready:
+            st.warning(
+                "Enter a OneMap token before running the optimiser, or configure "
+                "ONEMAP_EMAIL and ONEMAP_PASSWORD in Streamlit Cloud secrets."
+            )
         optimise_clicked = st.button(
             "Run Optimiser V2.0",
             type="primary",
@@ -2627,6 +2713,7 @@ if optimise_clicked or optimise_new_route_clicked:
             "jobs_uploaded": int(jobs_df.attrs.get("uploaded_count", len(jobs_df))),
             "use_onemap": use_onemap,
             "onemap_token_configured": bool(onemap_token),
+            "onemap_access_configured": onemap_ready,
             "optimise_by": optimise_by,
             "empty_weight": empty_weight,
             "loaded_weight": loaded_weight,
@@ -2772,6 +2859,23 @@ if optimise_clicked or optimise_new_route_clicked:
                     )
         except ValueError as exc:
             st.error(str(exc))
+            st.stop()
+        except RuntimeError as exc:
+            message = str(exc)
+            if "OneMap" not in message and "ONEMAP" not in message:
+                raise
+            st.error(
+                f"{message} Enter a OneMap token with the OneMap token button, "
+                "or configure ONEMAP_EMAIL and ONEMAP_PASSWORD in Streamlit Cloud secrets."
+            )
+            st.stop()
+        except HTTPError as exc:
+            if exc.code not in (401, 403):
+                raise
+            st.error(
+                "OneMap rejected the current token. Enter a new OneMap token with "
+                "the OneMap token button, or update the configured Streamlit Cloud secrets."
+            )
             st.stop()
         finally:
             progress_bar.progress(1.0, text="Finished optimisation.")

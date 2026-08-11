@@ -331,6 +331,10 @@ DEFAULT_GEOCODE_WORKERS = 4
 SINGAPORE_TZ = timezone(timedelta(hours=8))
 ONEMAP_MEMORY_TOKEN: str = ""
 ONEMAP_MEMORY_TOKEN_EXPIRY: datetime | None = None
+SINGAPORE_POSTAL_CODE_PATTERN = re.compile(
+    r"\b(?:S(?:INGAPORE)?\s*)?(\d{6})\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -847,10 +851,17 @@ def clean_address_for_geocoding(address: Any) -> str:
         "park place residences": "Park Place Residences PLQ",
         "paya lebar quarter": "Paya Lebar Quarter",
         "plq mall": "PLQ Mall",
+        "common wealth": "Commonwealth MRT",
     }
     for keyword, alias in named_location_aliases.items():
         if keyword in lowered:
             return alias
+
+    near_label_match = re.match(r"^\s*Near\b.*?\s+-\s*(.+)$", text, flags=re.IGNORECASE)
+    if near_label_match:
+        text = near_label_match.group(1)
+    else:
+        text = re.sub(r"^\s*Near\s+", " ", text, flags=re.IGNORECASE)
 
     text = re.sub(r"\[[^\]]*\]", " ", text)
     text = re.sub(r",?\s+\bL\d+[A-Z]?\b.*$", " ", text, flags=re.IGNORECASE)
@@ -858,9 +869,52 @@ def clean_address_for_geocoding(address: Any) -> str:
     text = re.sub(r"\b(MSCP|Surface|Basement)\b.*$", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"\bDeck\b.*$", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"\bLot\b.*$", " ", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bNear\b.*$", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+", " ", text)
     return text.strip(" ,")
+
+
+def geocode_search_values(address: Any) -> list[str]:
+    """Return ordered OneMap search fallbacks for noisy exported labels."""
+    text = clean_text(address)
+    if not text:
+        return []
+
+    candidates = [text]
+    cleaned = clean_address_for_geocoding(text)
+    if cleaned:
+        candidates.append(cleaned)
+
+    for delimiter in (" - ", " – ", " — "):
+        if delimiter not in text:
+            continue
+        suffix = text.rsplit(delimiter, 1)[-1].strip(" ,")
+        if suffix:
+            candidates.append(suffix)
+            cleaned_suffix = clean_address_for_geocoding(suffix)
+            if cleaned_suffix:
+                candidates.append(cleaned_suffix)
+
+    if "," in text:
+        for suffix in text.split(",")[1:]:
+            suffix = suffix.strip(" ,")
+            if suffix and SINGAPORE_POSTAL_CODE_PATTERN.search(suffix):
+                candidates.append(suffix)
+                cleaned_suffix = clean_address_for_geocoding(suffix)
+                if cleaned_suffix:
+                    candidates.append(cleaned_suffix)
+
+    for match in SINGAPORE_POSTAL_CODE_PATTERN.finditer(text):
+        candidates.append(match.group(1))
+
+    unique_candidates: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        candidate = clean_text(candidate)
+        key = candidate.casefold()
+        if candidate and key not in seen:
+            unique_candidates.append(candidate)
+            seen.add(key)
+    return unique_candidates
 
 
 def _normalise_header(value: Any) -> str:
@@ -1075,10 +1129,7 @@ def geocode_address_onemap(address: str, token: str | None = None) -> GeocodeRes
     if not address:
         return GeocodeResult(address, None, None, "fallback estimate", "Blank address")
 
-    search_values = [address]
-    cleaned_address = clean_address_for_geocoding(address)
-    if cleaned_address and cleaned_address.casefold() != address.casefold():
-        search_values.append(cleaned_address)
+    search_values = geocode_search_values(address)
 
     last_error = "No OneMap geocoding result"
     for search_value in search_values:

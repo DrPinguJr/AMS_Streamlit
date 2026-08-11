@@ -266,6 +266,8 @@ def test_page_uses_automatic_import_rider_dialog_and_single_column_steps() -> No
     assert "Validate Jobs" not in page
     assert "Commit Job List" not in page
     assert '@st.dialog("Today\'s riders", width="large")' in page
+    assert '@st.dialog("OneMap token", width="small")' in page
+    assert '"OneMap token"' in page
     assert 'st.subheader("1. Upload jobs")' in page
     assert 'st.subheader("2. Run optimiser")' in page
     assert 'st.subheader("3. Review results")' in page
