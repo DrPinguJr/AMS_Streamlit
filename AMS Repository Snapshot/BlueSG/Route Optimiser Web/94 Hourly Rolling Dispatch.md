@@ -5,7 +5,18 @@ tags: [bluesg, route-optimiser, hourly, streamlit]
 
 # Hourly rolling dispatch
 
-Gateway from [[00 Route Optimiser Mega Web]]. Sibling UI to [[60 Optimiser Page Orchestrator]]; owns `pages/hourly_route_optimiser_page.py` (466 lines) and the pure engine `hourly_route_dispatch.py` (480 lines, no Streamlit import — unit-testable directly).
+Gateway from [[00 Route Optimiser Mega Web]]. Sibling UI to [[60 Optimiser Page Orchestrator]]; owns `pages/hourly_route_optimiser_page.py` and the pure engine `hourly_route_dispatch.py` (no Streamlit import — unit-testable directly).
+
+## Page shape (post-redesign)
+
+The page is a header + two primary actions + a two-column body, not a stack of forms:
+
+- Header: title + three `@st.dialog` buttons — Today's riders (two tabs, see below), OneMap key ([[51 OneMap Credential and Token Flow]] session override, shared via `onemap_token_session.py`), Gemini key (session override for [[95 Standby Driver Advisor]], via `gemini_key_session.py`).
+- Primary actions: Upload (dialog: file only, no paste-text path) and Optimise (runs `run_hourly_dispatch`, settings tucked in an `st.popover`).
+- Left column: a plain-text run log (`st.code`, last 16 lines) plus the latest dispatch output, map, and a "Mark jobs complete" expander.
+- Right column: one card per full-day driver (current location + remaining stop chain, from `driver_route_snapshot`), then the Backup pool cards ([[95 Standby Driver Advisor]]'s standby pool) with a "Check standby options" button that opens that review as a dialog.
+
+**"Today's riders" tabs *are* the Active flag.** Full day drivers tab = `Active=True` rows; Half day / Ad hoc pool tab = `Active=False` rows. The dialog hides the Active checkbox entirely and reconstructs it on save from which tab a row was edited in (`full_day_edit.assign(Active=True)` + `pool_edit.assign(Active=False)`). This was a deliberate operator-facing simplification — see [[20 Workflow State Machine]] for the underlying `committed_riders` shape it still writes to.
 
 ## Why it exists
 

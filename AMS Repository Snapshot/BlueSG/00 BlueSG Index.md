@@ -57,6 +57,8 @@ The live developer switch is `OPTIMISER_VERSION = "v2"`. The V2 solver is active
 | `hourly_route_dispatch.py` | pure engine behind the hourly page: append/dedupe, archive contiguous completions, residual-rider shrink, incremental re-solve, standby-options orchestration |
 | `gemini_standby_advisor.py` | pure Gemini (`google-genai`) call for the standby-driver activation recommendation; never raises |
 | `hourly_dispatch_ledger.py` | local Excel same-day resume ledger for the hourly page; not durable across a Cloud redeploy |
+| `onemap_token_session.py` | shared per-session OneMap token override + dialog; used by the hourly page, duplicated (not shared) in the main optimiser page |
+| `gemini_key_session.py` | shared per-session Gemini API key override + dialog, mirroring `onemap_token_session.py` |
 | `components/.../index.html` | drag/drop lane board UI |
 | `components/register_...py` | component registration; currently legacy `streamlit.components.v1` |
 | `cloud_access_control.py` | shared password gate |

@@ -35,7 +35,7 @@ run_optimiser_v2(..., allow_partial_assignment=True)
 
 ## UI contract
 
-The review is read-only: it does not mutate `committed_jobs`/`hourly_open_routes` by itself. Acting on Option A means rerunning the solve after resolving the shortfall; acting on Option B means ticking `Active` for the recommended rider in the roster editor and rerunning. See [[20 Workflow State Machine]].
+Opens as its own `@st.dialog` ("Standby coverage options") from a "Check standby options" button under the hourly page's Backup pool panel — not gated behind a failed solve anymore; the operator can check it any time there are ad hoc riders to consider. The review is read-only: it does not mutate `committed_jobs`/`hourly_open_routes` by itself. Acting on Option A means resolving the shortfall and rerunning Optimise; acting on Option B means moving the recommended rider from the Half day/Ad hoc pool tab to the Full day tab in Today's riders and rerunning. See [[20 Workflow State Machine]] and [[94 Hourly Rolling Dispatch]].
 
 ## Change risk
 

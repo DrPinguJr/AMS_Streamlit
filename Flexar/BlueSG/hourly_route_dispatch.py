@@ -581,7 +581,14 @@ class StandbyDispatchOptions:
     standby_recommendation: StandbyAdvisorResult | None
 
 
-def _idle_minutes(rider: Rider, dispatch_at: datetime) -> float:
+def idle_minutes_for_rider(rider: Rider, dispatch_at: datetime) -> float:
+    """Minutes since a rider's shift started, floored at zero.
+
+    Public (not just an internal helper of `solve_with_standby_options`)
+    because the hourly page's backup-pool panel shows this per standby rider
+    too, independent of whether a standby review has been run.
+    """
+
     if rider.available_from is None:
         return 0.0
     elapsed = (dispatch_at - _aware(rider.available_from, dispatch_at)).total_seconds() / 60
@@ -645,7 +652,7 @@ def solve_with_standby_options(
                 "name": rider.name,
                 "home_zone": rider.start_zone,
                 "shift_window": shift_window,
-                "idle_minutes": round(_idle_minutes(rider, dispatch_at), 1),
+                "idle_minutes": round(idle_minutes_for_rider(rider, dispatch_at), 1),
             }
         )
         travel_minutes[rider.name] = {
