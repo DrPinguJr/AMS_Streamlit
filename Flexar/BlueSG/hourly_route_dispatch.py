@@ -8,7 +8,7 @@ browser session.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Any
 
 import pandas as pd
@@ -16,6 +16,7 @@ import pandas as pd
 from Flexar.BlueSG.build_optimised_vehicle_routes import (
     ROUTE_COLUMNS,
     SUMMARY_COLUMNS,
+    build_jobs_by_stable_id,
     clean_text,
     format_summary_output,
     stable_job_id_from_job,
@@ -28,9 +29,11 @@ from Flexar.BlueSG.gemini_standby_advisor import (
 )
 from Flexar.BlueSG.job_import_staging import commit_staged_jobs, validate_staged_jobs
 from Flexar.BlueSG.manual_route_assignment_editing_and_recalculation import (
+    Assignment,
     RecalculationResult,
     assignment_from_routes,
     incremental_recalculate,
+    validate_assignment_board,
 )
 from Flexar.BlueSG.optimiser_workflow_state import normalise_riders
 from Flexar.BlueSG.route_operation_time_window_settings import OperationContext
@@ -99,6 +102,22 @@ def _aware(value: datetime, reference: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=reference.tzinfo)
     return value.astimezone(reference.tzinfo)
+
+
+def business_day_for(timestamp: datetime, rollover_hour: int = 11) -> date:
+    """The operating "day" this timestamp belongs to, with the boundary at
+    `rollover_hour` local time instead of midnight.
+
+    A dispatch made at 9am is still finishing yesterday's business day - it
+    only rolls over to a new day once the clock passes `rollover_hour`. This
+    lets the page detect "a new day has started" and export/reset the
+    rolling ledger at 11am rather than at midnight, matching how the
+    operator actually thinks about a shift.
+    """
+
+    if timestamp.time() < time(hour=rollover_hour):
+        return (timestamp - timedelta(days=1)).date()
+    return timestamp.date()
 
 
 def _with_dispatch_identity(dataframe: pd.DataFrame) -> pd.DataFrame:
@@ -335,19 +354,19 @@ def residual_riders(
             last = rows.sort_values("_completion", kind="stable").iloc[-1]
             start_location = RouteSchemaAdapter.dropoff_address(last) or start_location
             last_completion = last["_completion"]
-        available_from = max(
-            dispatch_at,
-            *(
-                [_aware(rider.available_from, dispatch_at)]
-                if rider.available_from is not None
-                else []
-            ),
-            *(
-                [_aware(last_completion, dispatch_at)]
-                if last_completion is not None
-                else []
-            ),
-        )
+        # `max(dispatch_at, *maybe_a, *maybe_b)` degenerates to `max(dispatch_at)`
+        # when both optional candidates are empty - a single non-iterable
+        # positional argument, which `max()` treats as "iterate this" rather
+        # than "here is the one candidate," raising `'datetime' object is not
+        # iterable`. Building an explicit candidate list and always calling
+        # `max()` on it avoids that arity trap regardless of how many
+        # optional values are present.
+        available_candidates = [dispatch_at]
+        if rider.available_from is not None:
+            available_candidates.append(_aware(rider.available_from, dispatch_at))
+        if last_completion is not None:
+            available_candidates.append(_aware(last_completion, dispatch_at))
+        available_from = max(available_candidates)
         if rider.available_until is not None and available_from >= _aware(rider.available_until, dispatch_at):
             continue
         residual.append(
@@ -389,7 +408,7 @@ def _summary_from_routes(route_df: pd.DataFrame) -> pd.DataFrame:
     return format_summary_output(frame[SUMMARY_COLUMNS], route_df)
 
 
-def _v1_rider_frame(riders: list[Rider]) -> pd.DataFrame:
+def v1_rider_frame(riders: list[Rider]) -> pd.DataFrame:
     load = {
         WorkStyle.LOCAL: "Low",
         WorkStyle.FLEXIBLE: "Medium",
@@ -478,13 +497,31 @@ def run_hourly_dispatch(
     token: str | None = None,
     beam_width: int = 80,
     time_limit_seconds: float = 30.0,
+    guarantee_minimum_coverage: bool = True,
 ) -> HourlyDispatchResult:
-    """Solve all unfinished jobs, then incrementally rebuild changed open routes."""
+    """Solve all unfinished jobs, then incrementally rebuild changed open routes.
+
+    `guarantee_minimum_coverage` defaults to True: every active rider gets at
+    least one job if any rider has a spare one to give up, even overriding
+    that specific rider's shift-end buffer or Max Jobs if it comes to that
+    (see `run_optimiser_v2`'s docstring). This is a deliberate operator
+    decision for the hourly page - every override lands on
+    `solver_result.forced_assignments` and pushes `solver_result.status` to
+    `"COMPLETE_WITH_FORCED_COVERAGE"` so it's never silent. Pass False to get
+    the strictly hard-feasible behaviour every other caller uses.
+    """
 
     archive = archived_routes.copy(deep=True) if isinstance(archived_routes, pd.DataFrame) else pd.DataFrame()
+    # A bare `pd.DataFrame()` - exactly what `st.session_state`'s default
+    # looks like before the first solve of a session - is still a DataFrame
+    # instance, but has zero columns, not the ROUTE_COLUMNS shape. Trusting
+    # it as-is used to crash downstream in `incremental_recalculate` on
+    # `confirmed_routes["Rider"]`. Only an already-populated, correctly
+    # shaped frame is trusted; anything empty is rebuilt with the right
+    # columns instead.
     confirmed = (
         confirmed_open_routes.copy(deep=True)
-        if isinstance(confirmed_open_routes, pd.DataFrame)
+        if isinstance(confirmed_open_routes, pd.DataFrame) and not confirmed_open_routes.empty
         else pd.DataFrame(columns=ROUTE_COLUMNS)
     )
     open_jobs = open_jobs_for_dispatch(committed_jobs, archive)
@@ -502,6 +539,7 @@ def run_hourly_dispatch(
         token=token,
         beam_width=beam_width,
         time_limit_seconds=time_limit_seconds,
+        guarantee_minimum_coverage=guarantee_minimum_coverage,
     )
     if open_jobs.empty:
         combined = combine_dispatch_routes(archive, pd.DataFrame(columns=ROUTE_COLUMNS))
@@ -544,7 +582,7 @@ def run_hourly_dispatch(
         confirmed_routes=confirmed,
         confirmed_assignment=confirmed_assignment,
         draft_assignment=draft_assignment,
-        rider_df=_v1_rider_frame(residual),
+        rider_df=v1_rider_frame(residual),
         jobs_df=open_jobs,
         settings={
             "operation_context": context,
@@ -562,6 +600,67 @@ def run_hourly_dispatch(
         solver,
         recalculation,
         tuple(rider.name for rider in residual),
+    )
+
+
+def apply_manual_dispatch_edits(
+    *,
+    draft_assignment: Assignment,
+    residual: list[Rider],
+    open_jobs: pd.DataFrame,
+    archived_routes: pd.DataFrame | None,
+    operation_context: OperationContext,
+    solver_result: V2OptimisationResult,
+    use_onemap: bool = True,
+    token: str | None = None,
+    matching_preview_routes: pd.DataFrame | None = None,
+) -> HourlyDispatchResult:
+    """Rebuild this hour's routes from an operator-edited assignment board.
+
+    Used by the hourly page's review popup "Save" action after the operator
+    has drag-and-dropped the board `run_hourly_dispatch` seeded.
+    `confirmed_assignment` is deliberately every rider mapped to an empty
+    list - none of `open_jobs` has a committed route yet this hour, so every
+    rider the operator gave a job to is "affected" and gets a full,
+    cache-friendly rebuild via `incremental_recalculate` (reusing legs from
+    `matching_preview_routes` - typically the solver's own `route_df` -
+    wherever the operator's edit left that leg unchanged). `residual` must be
+    the same rider list used to seed the original solve/board, so each
+    rider's current position and remaining capacity match what the operator
+    saw on-screen. `solver_result` is passed straight through unchanged: it
+    still reflects what the automatic solve found (status, unassigned jobs,
+    forced assignments) since a manual board edit does not re-run the search.
+    """
+
+    archive = archived_routes.copy(deep=True) if isinstance(archived_routes, pd.DataFrame) else pd.DataFrame()
+    rider_names = [rider.name for rider in residual]
+    known_job_ids = build_jobs_by_stable_id(open_jobs)
+    validation = validate_assignment_board(draft_assignment, known_job_ids, rider_names)
+    if not validation.is_valid:
+        raise ValueError("; ".join(validation.errors))
+    confirmed_assignment: Assignment = {name: [] for name in rider_names}
+    recalculation = incremental_recalculate(
+        confirmed_routes=pd.DataFrame(columns=ROUTE_COLUMNS),
+        confirmed_assignment=confirmed_assignment,
+        draft_assignment=draft_assignment,
+        rider_df=v1_rider_frame(residual),
+        jobs_df=open_jobs,
+        settings={
+            "operation_context": operation_context,
+            "use_onemap": use_onemap,
+            "token": token,
+        },
+        summary_builder=_summary_from_routes,
+        matching_preview_routes=matching_preview_routes,
+    )
+    combined = combine_dispatch_routes(archive, recalculation.route_df)
+    return HourlyDispatchResult(
+        combined,
+        _summary_from_routes(combined),
+        recalculation.route_df,
+        solver_result,
+        recalculation,
+        tuple(rider_names),
     )
 
 

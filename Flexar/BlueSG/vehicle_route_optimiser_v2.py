@@ -323,6 +323,7 @@ class V2OptimisationResult:
     runtime_seconds: float
     algorithm_name: str = V2_ALGORITHM_NAME
     algorithm_version: str = V2_ALGORITHM_VERSION
+    forced_assignments: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _emit_progress(
@@ -1281,6 +1282,95 @@ def _compatible_outputs(best: _Plan, riders: list[Rider]) -> tuple[pd.DataFrame,
     return compatibility, summary
 
 
+def _force_minimum_coverage(
+    best: _Plan,
+    riders: list[Rider],
+    jobs_by_id: dict[str, V2Job],
+    matrix: TravelMatrix,
+    operation_context: OperationContext,
+    total_jobs: int,
+) -> tuple[_Plan, list[dict[str, Any]]]:
+    """Top up any rider left with zero jobs by reassigning one job away from
+    a rider who has more than one - even if that specific rider/job pairing
+    is hard-infeasible (past their shift-end buffer, over their Max Jobs).
+
+    Only runs when the caller explicitly opts in via
+    `run_optimiser_v2(..., guarantee_minimum_coverage=True)` - the default
+    search never does this, since a hard-feasible plan is what every other
+    caller (the main optimiser page, the standby advisor) relies on. Every
+    override is reported back in the returned list rather than silently
+    accepted, so the caller can flag it.
+
+    A rider stays at zero only when no other rider has a spare job to give up
+    - i.e. there genuinely aren't enough jobs to go around, which this
+    function treats as acceptable rather than inventing work.
+    """
+
+    routes = list(best.routes)
+    evaluations = list(best.evaluations)
+    forced: list[dict[str, Any]] = []
+
+    zero_indices = [index for index, route in enumerate(routes) if not route]
+    for target_index in zero_indices:
+        target_rider = riders[target_index]
+        if target_rider.maximum_jobs < 1:
+            continue
+        donor_candidates = sorted(
+            (index for index, route in enumerate(routes) if index != target_index and len(route) > 1),
+            key=lambda index: -len(routes[index]),
+        )
+        best_choice: tuple[bool, int, int, str, RouteEvaluation, RouteEvaluation] | None = None
+        for donor_index in donor_candidates:
+            job_id = routes[donor_index][-1]
+            donor_eval = evaluate_v2_route(
+                riders[donor_index], routes[donor_index][:-1], jobs_by_id, matrix, operation_context
+            )
+            if not donor_eval.feasibility.feasible:
+                # Removing a job should never make a route less feasible; if
+                # it somehow does, skip this donor rather than compound it.
+                continue
+            target_eval = evaluate_v2_route(target_rider, (job_id,), jobs_by_id, matrix, operation_context)
+            if len(target_eval.rows) < 1:
+                continue  # genuinely unusable (e.g. no travel route at all)
+            candidate = (
+                target_eval.feasibility.feasible,
+                -len(target_eval.feasibility.reasons),
+                donor_index,
+                job_id,
+                donor_eval,
+                target_eval,
+            )
+            if best_choice is None or candidate[:2] > best_choice[:2]:
+                best_choice = candidate
+            if target_eval.feasibility.feasible:
+                break  # a fully feasible reassignment can't be beaten; stop searching
+        if best_choice is None:
+            continue  # no donor had a spare job - a genuine job shortage
+        feasible, _, donor_index, job_id, donor_eval, target_eval = best_choice
+        routes[donor_index] = routes[donor_index][:-1]
+        evaluations[donor_index] = donor_eval
+        routes[target_index] = (job_id,)
+        evaluations[target_index] = target_eval
+        forced.append(
+            {
+                "rider": target_rider.name,
+                "job_id": job_id,
+                "donor": riders[donor_index].name,
+                "feasible": feasible,
+                "reasons": list(target_eval.feasibility.reasons),
+            }
+        )
+
+    if not forced:
+        return best, []
+    route_tuple = tuple(routes)
+    evaluation_tuple = tuple(evaluations)
+    metrics = _plan_metrics(
+        route_tuple, evaluation_tuple, riders, jobs_by_id, total_jobs, matrix, operation_context
+    )
+    return _Plan(route_tuple, evaluation_tuple, metrics), forced
+
+
 def run_optimiser_v2(
     jobs_df: pd.DataFrame,
     riders: list[Rider],
@@ -1295,6 +1385,7 @@ def run_optimiser_v2(
     empty_wait_buffer_min: float = 6.0,
     progress_callback: V2ProgressCallback | None = None,
     allow_partial_assignment: bool = False,
+    guarantee_minimum_coverage: bool = False,
 ) -> V2OptimisationResult:
     """Solve for the best hard-feasible plan.
 
@@ -1307,12 +1398,41 @@ def run_optimiser_v2(
     genuine ``route_df`` for everything that *could* be placed, with status
     ``"PARTIAL"``. This exists for flows (e.g. the hourly standby-driver
     review) that want to see "N of M placed" rather than nothing at all.
+
+    When ``guarantee_minimum_coverage`` is True, a post-processing pass runs
+    after the normal (hard-feasible) search: any rider left with zero jobs is
+    topped up with one job taken from another rider who has more than one,
+    *even if* that specific pairing is hard-infeasible for the receiving
+    rider (past their shift-end buffer, over their Max Jobs). This is an
+    intentional override of the search's own safety constraints for
+    operators who have decided every active rider must be given something to
+    do - every override is reported on the result's ``forced_assignments``
+    and the status becomes ``"COMPLETE_WITH_FORCED_COVERAGE"`` if any
+    override was not itself feasible. A rider stays uncovered only when no
+    other rider has a spare job to give up.
+
+    This redistributes existing capacity; it cannot create capacity that
+    doesn't exist. If total jobs exceed every rider's combined Max Jobs,
+    ``guarantee_minimum_coverage`` also tolerates leaving the surplus job(s)
+    unassigned (the same capacity-shortfall and per-job placement gates that
+    ``allow_partial_assignment`` relaxes) rather than reporting INFEASIBLE
+    outright - riders still get spread one job each up to what capacity
+    allows, and the jobs that truly don't fit anywhere land on
+    ``unassigned_jobs`` for the operator to hold for next hour or route to a
+    standby driver, same as the partial-assignment flow.
     """
 
     started = time.monotonic()
     context = operation_context or OperationContext()
     jobs = jobs_from_dataframe(jobs_df)
     capacity = capacity_summary(jobs, riders)
+    # `guarantee_minimum_coverage` redistributes what capacity exists but
+    # cannot invent more of it: a real shortfall (fewer total Max Jobs slots
+    # than jobs) must be tolerated the same way `allow_partial_assignment`
+    # tolerates an unplaceable job, or every guaranteed-coverage run would
+    # abort outright the moment jobs > capacity - exactly the case this
+    # feature exists for.
+    tolerate_unplaceable_jobs = allow_partial_assignment or guarantee_minimum_coverage
     _emit_progress(
         progress_callback,
         phase="Capacity check",
@@ -1328,7 +1448,7 @@ def run_optimiser_v2(
         comparison_count=0,
         estimated_comparisons=0,
     )
-    if not capacity.feasible_by_job_count and not allow_partial_assignment:
+    if not capacity.feasible_by_job_count and not tolerate_unplaceable_jobs:
         reason = (
             f"{capacity.job_count} jobs must be completed. The current riders can perform at most "
             f"{capacity.maximum_capacity} jobs. Capacity shortfall: {capacity.shortfall} jobs."
@@ -1455,7 +1575,7 @@ def run_optimiser_v2(
                     )
                     next_plans.append(_Plan(route_tuple, evaluation_tuple, metrics))
         if not next_plans:
-            if allow_partial_assignment:
+            if tolerate_unplaceable_jobs:
                 # Skip this job and keep searching for the rest; it comes back
                 # as an explicit unassigned entry on the final result instead
                 # of aborting the whole plan. Reasons are scoped to just this
@@ -1535,6 +1655,11 @@ def run_optimiser_v2(
             # Continue deterministically with the best retained plan. Coverage remains mandatory.
             beam = beam[:1]
     best = min(beam, key=lambda plan: plan.metrics.objective())
+    forced_assignments: list[dict[str, Any]] = []
+    if guarantee_minimum_coverage:
+        best, forced_assignments = _force_minimum_coverage(
+            best, riders, jobs_by_id, matrix, context, len(jobs)
+        )
     route_df, summary_df = _compatible_outputs(best, riders)
     explanations = _build_explanations(best, riders, jobs_by_id, matrix)
     has_soft_exceptions = bool(
@@ -1544,13 +1669,17 @@ def run_optimiser_v2(
         or best.metrics.preferred_overage
         or best.metrics.area_lead_violations
     )
+    has_forced_violations = any(not entry["feasible"] for entry in forced_assignments)
     if partial_unassigned:
         status = "PARTIAL"
+    elif has_forced_violations:
+        status = "COMPLETE_WITH_FORCED_COVERAGE"
     elif has_soft_exceptions:
         status = "COMPLETE_WITH_EXCEPTIONS"
     else:
         status = "COMPLETE"
     assigned_job_count = len(jobs) - len(partial_unassigned)
+    forced_violation_count = sum(not entry["feasible"] for entry in forced_assignments)
     route_df.attrs.update(
         sanitize_for_output(
             {
@@ -1562,11 +1691,15 @@ def run_optimiser_v2(
             "algorithm_name": V2_ALGORITHM_NAME,
             "algorithm_version": V2_ALGORITHM_VERSION,
             "hard_constraint_validation": {
-                "is_valid": True,
-                "hard_violation_count": 0,
+                "is_valid": forced_violation_count == 0,
+                "hard_violation_count": forced_violation_count,
                 "assigned_job_count": assigned_job_count,
                 "unique_job_count": len(jobs),
-                "violations": [],
+                "violations": [
+                    f"{entry['rider']} forced onto {entry['job_id']}: {'; '.join(entry['reasons'])}"
+                    for entry in forced_assignments
+                    if not entry["feasible"]
+                ],
             },
             "operation_context": context.to_settings(),
             }
@@ -1583,6 +1716,7 @@ def run_optimiser_v2(
         best.metrics.objective(),
         matrix.metrics(),
         time.monotonic() - started,
+        forced_assignments=forced_assignments,
     )
     finished_status = (
         f"{status}: assigned {assigned_job_count} of {len(jobs)} jobs, "

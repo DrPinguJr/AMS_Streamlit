@@ -18,6 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from Flexar.BlueSG.build_optimised_vehicle_routes import (
+    build_jobs_by_stable_id,
     clean_text,
     get_cached_geocode,
     stable_job_id_from_route_row,
@@ -26,24 +27,33 @@ from Flexar.BlueSG.gemini_key_session import (
     configure_gemini_key_dialog,
     resolved_gemini_api_key,
 )
+from Flexar.BlueSG.hourly_daily_export import export_daily_dispatch_excel, list_daily_exports
 from Flexar.BlueSG.hourly_dispatch_ledger import (
     HourlyLedgerState,
+    clear_hourly_ledger,
     load_hourly_ledger,
+    load_hourly_ledger_ignoring_staleness,
     save_hourly_ledger,
 )
 from Flexar.BlueSG.hourly_route_dispatch import (
     active_riders_for_dispatch,
     append_hourly_jobs,
+    apply_manual_dispatch_edits,
     archive_completed_prefix,
+    business_day_for,
+    combine_dispatch_routes,
     idle_minutes_for_rider,
     live_shift_timeline,
     open_jobs_for_dispatch,
     operation_context_for_riders,
+    residual_riders,
     run_hourly_dispatch,
     solve_with_standby_options,
     standby_riders_for_dispatch,
+    v1_rider_frame,
 )
 from Flexar.BlueSG.job_import_staging import ImportResult, parse_job_source, validate_staged_jobs
+from Flexar.BlueSG.manual_route_assignment_editing_and_recalculation import assignment_from_routes
 from Flexar.BlueSG.onemap_token_session import configure_onemap_token_dialog
 from Flexar.BlueSG.optimiser_workflow_state import (
     initialise_workflow_state,
@@ -51,6 +61,7 @@ from Flexar.BlueSG.optimiser_workflow_state import (
     save_rider_draft,
     validate_rider_draft,
 )
+from Flexar.BlueSG.route_assignment_board_rendering import render_route_assignment_board
 from Flexar.BlueSG.v2_daily_roster_source import load_daily_v2_roster
 from Flexar.BlueSG.vehicle_route_optimiser_v2 import WorkStyle
 
@@ -106,6 +117,7 @@ def persist_hourly_ledger() -> None:
                 open_routes=st.session_state.hourly_open_routes,
                 archived_routes=st.session_state.hourly_archived_routes,
                 dispatch_at=st.session_state.hourly_dispatch_at,
+                business_day=st.session_state.get("hourly_business_day"),
             ),
             st.session_state.hourly_dispatch_at.date(),
         )
@@ -113,6 +125,63 @@ def persist_hourly_ledger() -> None:
         st.session_state.hourly_ledger_error = f"Could not save the local dispatch ledger: {exc}"
     else:
         st.session_state.hourly_ledger_error = ""
+
+
+def reset_hourly_jobs() -> None:
+    """Clear today's jobs, routes, and any pending review popup so the page
+    can be tested from a clean slate. Leaves the roster (committed_riders)
+    untouched - only jobs and whatever was solved from them are cleared."""
+
+    st.session_state.committed_jobs = pd.DataFrame()
+    st.session_state.job_draft = pd.DataFrame()
+    st.session_state.hourly_open_routes = pd.DataFrame()
+    st.session_state.hourly_archived_routes = pd.DataFrame()
+    st.session_state.hourly_dispatch_result = None
+    st.session_state.hourly_run_log = []
+    close_review_popup()
+    try:
+        clear_hourly_ledger()
+    except Exception as exc:
+        st.session_state.hourly_ledger_error = f"Could not clear the local ledger: {exc}"
+    else:
+        st.session_state.hourly_ledger_error = ""
+    st.session_state.hourly_notice = "Jobs and routes reset."
+    log_line("Jobs, routes, and draft reset for testing.")
+
+
+def render_solver_callouts(solver_result) -> None:
+    """Unassigned-job and forced-assignment warnings, shared between the
+    draft-review preview and the accepted-plan banner so they read the same
+    both places."""
+
+    unassigned = solver_result.unassigned_jobs
+    if unassigned:
+        st.warning(
+            f"{len(unassigned)} job(s) didn't fit anywhere this hour - riders are out of capacity, "
+            f"not a routing error. They stay in the queue for the next run."
+        )
+        for job in unassigned:
+            st.caption(
+                f"- {clean_text(job.get('Car Plate'))}: "
+                f"{clean_text(job.get('Pickup Address'))} -> {clean_text(job.get('Drop-off Address'))}"
+            )
+        st.caption("Raise a rider's Maximum in Today's riders, or check Standby options, to place these now.")
+    forced = solver_result.forced_assignments
+    if forced:
+        overridden = [entry for entry in forced if not entry["feasible"]]
+        if overridden:
+            st.warning(
+                f"{len(overridden)} driver(s) were given a job outside their normal limits "
+                f"(shift end / capacity) to make sure every full day driver has one - review these:"
+            )
+            for entry in overridden:
+                st.caption(f"- **{entry['rider']}** got {entry['job_id']} (from {entry['donor']}): {'; '.join(entry['reasons'])}")
+        topped_up = [entry for entry in forced if entry["feasible"]]
+        if topped_up:
+            st.caption(
+                "Also topped up without any violation: "
+                + ", ".join(f"{entry['rider']} (from {entry['donor']})" for entry in topped_up)
+            )
 
 
 @st.dialog("Upload jobs", width="large")
@@ -264,6 +333,264 @@ def driver_route_snapshot(rider_name: str, open_routes: pd.DataFrame) -> dict[st
         for _, row in ordered.iterrows()
     ]
     return {"location": location, "stops": stops}
+
+
+# ---------------------------------------------------------------------------
+# Review & confirm dispatch popup - opened by Optimise, frozen until Save.
+#
+# Two phases, tracked by `hourly_popup_phase`:
+#   "confirm" - every currently-open job is pre-checked as complete (assume
+#     finished unless told otherwise); the operator unchecks anything still
+#     genuinely in progress, then "Confirm & solve" archives the checked
+#     jobs and runs the normal hourly solve to seed a drag-and-drop board.
+#   "board"   - the solved board (new jobs only - prior jobs never enter it,
+#     they were already archived out in "confirm") can be dragged between
+#     riders, reordered within a rider, or sent to Unassigned. Nothing is
+#     written to `hourly_open_routes` until Save.
+# ---------------------------------------------------------------------------
+
+
+def close_review_popup() -> None:
+    """Discard whatever the popup was mid-way through and close it."""
+
+    st.session_state.hourly_popup_phase = None
+    st.session_state.hourly_popup_residual = None
+    st.session_state.hourly_popup_open_jobs = None
+    st.session_state.hourly_popup_solver_result = None
+    st.session_state.hourly_popup_draft_assignment = None
+    st.session_state.hourly_popup_error = ""
+
+
+def open_review_popup() -> None:
+    """Optimise was clicked: snapshot every open job as pre-checked complete
+    and open the popup on the "confirm" phase. Nothing is archived yet -
+    that only happens once the operator clicks "Confirm & solve"."""
+
+    st.session_state.hourly_popup_session_id = st.session_state.get("hourly_popup_session_id", 0) + 1
+    st.session_state.hourly_popup_phase = "confirm"
+    st.session_state.hourly_popup_residual = None
+    st.session_state.hourly_popup_open_jobs = None
+    st.session_state.hourly_popup_solver_result = None
+    st.session_state.hourly_popup_draft_assignment = None
+    st.session_state.hourly_popup_error = ""
+
+
+def _solve_and_seed_board(dispatch_at: datetime, use_onemap: bool, beam_width: int, time_limit: float) -> bool:
+    """Run the normal hourly solve, then seed the popup board from it.
+    Returns False (leaving `hourly_popup_error` set) if the solve raised."""
+
+    with st.spinner("Solving..."):
+        try:
+            result = run_hourly_dispatch(
+                committed_jobs=st.session_state.committed_jobs,
+                roster_df=st.session_state.committed_riders,
+                dispatch_at=dispatch_at,
+                archived_routes=st.session_state.hourly_archived_routes,
+                confirmed_open_routes=st.session_state.hourly_open_routes,
+                use_onemap=use_onemap,
+                beam_width=int(beam_width),
+                time_limit_seconds=float(time_limit),
+            )
+        except Exception as exc:
+            st.session_state.hourly_popup_error = f"Dispatch failed: {exc}"
+            return False
+
+    residual = residual_riders(
+        active_riders_for_dispatch(st.session_state.committed_riders, dispatch_at),
+        st.session_state.hourly_archived_routes,
+        dispatch_at,
+    )
+    open_jobs_now = open_jobs_for_dispatch(st.session_state.committed_jobs, st.session_state.hourly_archived_routes)
+    rider_names = [rider.name for rider in residual]
+    draft_assignment = assignment_from_routes(result.solver_result.route_df, open_jobs_now, rider_names)
+
+    st.session_state.hourly_popup_residual = residual
+    st.session_state.hourly_popup_open_jobs = open_jobs_now
+    st.session_state.hourly_popup_solver_result = result
+    st.session_state.hourly_popup_draft_assignment = draft_assignment
+    st.session_state.hourly_popup_error = ""
+    return True
+
+
+def confirm_completions_and_solve(dispatch_at: datetime, use_onemap: bool, beam_width: int, time_limit: float, completed_ids: set[str]) -> None:
+    open_routes = st.session_state.hourly_open_routes
+    if isinstance(open_routes, pd.DataFrame) and not open_routes.empty and completed_ids:
+        try:
+            archive, remaining = archive_completed_prefix(
+                st.session_state.hourly_open_routes, st.session_state.hourly_archived_routes, completed_ids
+            )
+        except ValueError as exc:
+            st.session_state.hourly_popup_error = str(exc)
+            return
+        st.session_state.hourly_archived_routes = archive
+        st.session_state.hourly_open_routes = remaining
+        log_line(f"Confirmed {len(completed_ids)} completed job(s) before solving.")
+
+    if not _solve_and_seed_board(dispatch_at, use_onemap, beam_width, time_limit):
+        return
+    st.session_state.hourly_popup_phase = "board"
+    persist_hourly_ledger()
+    log_line("Solved this hour's open jobs - review the board.")
+    st.rerun()
+
+
+def resolve_popup_board(dispatch_at: datetime, use_onemap: bool, beam_width: int, time_limit: float) -> None:
+    if _solve_and_seed_board(dispatch_at, use_onemap, beam_width, time_limit):
+        log_line("Re-solved - board refreshed.")
+        st.rerun()
+
+
+def save_popup_board(dispatch_at: datetime, use_onemap: bool) -> None:
+    residual = st.session_state.hourly_popup_residual
+    open_jobs = st.session_state.hourly_popup_open_jobs
+    solved = st.session_state.hourly_popup_solver_result
+    draft_assignment = st.session_state.hourly_popup_draft_assignment
+    context = operation_context_for_riders(residual, dispatch_at)
+    try:
+        edited = apply_manual_dispatch_edits(
+            draft_assignment=draft_assignment,
+            residual=residual,
+            open_jobs=open_jobs,
+            archived_routes=st.session_state.hourly_archived_routes,
+            operation_context=context,
+            solver_result=solved.solver_result,
+            use_onemap=use_onemap,
+            matching_preview_routes=solved.solver_result.route_df,
+        )
+    except ValueError as exc:
+        st.session_state.hourly_popup_error = str(exc)
+        return
+
+    st.session_state.hourly_dispatch_result = edited
+    st.session_state.hourly_open_routes = edited.open_route_df
+    close_review_popup()
+    persist_hourly_ledger()
+    log_line("Plan saved.")
+    st.session_state.hourly_run_toast = ("Plan saved.", "✅")
+    st.rerun()
+
+
+def render_confirm_phase(dispatch_at: datetime, use_onemap: bool, beam_width: int, time_limit: float) -> None:
+    st.caption(
+        "Every job already on a driver's plate is assumed finished. Uncheck a driver's "
+        "most recent job(s) below if they haven't actually finished yet, then confirm to solve "
+        "this hour's newly uploaded jobs."
+    )
+    open_routes = st.session_state.hourly_open_routes
+    completed_ids: set[str] = set()
+    if isinstance(open_routes, pd.DataFrame) and not open_routes.empty:
+        table = open_routes.copy()
+        table["Stable Job ID"] = table.apply(stable_job_id_from_route_row, axis=1)
+        table["Finished"] = True
+        display = table[
+            ["Finished", "Rider", "Sequence", "Car Plate", "Pickup Address", "Drop-off Address", "Stable Job ID"]
+        ]
+        edited = st.data_editor(
+            display,
+            hide_index=True,
+            disabled=["Rider", "Sequence", "Car Plate", "Pickup Address", "Drop-off Address", "Stable Job ID"],
+            column_config={"Finished": st.column_config.CheckboxColumn(), "Stable Job ID": None},
+            key=f"hourly_popup_completion_editor_{st.session_state.hourly_popup_session_id}",
+        )
+        completed_ids = set(edited.loc[edited["Finished"], "Stable Job ID"].astype(str))
+    else:
+        st.info("No drivers have any prior jobs on the board yet - nothing to confirm.")
+
+    st.subheader("Current driver status")
+    active = active_riders_for_dispatch(st.session_state.committed_riders, dispatch_at)
+    if not active:
+        st.caption("No active drivers right now.")
+    for rider in active:
+        snapshot = driver_route_snapshot(rider.name, open_routes)
+        st.caption(f"\U0001F4CD **{rider.name}** - {snapshot['location'] or rider.start_location}")
+
+    if st.session_state.hourly_popup_error:
+        st.error(st.session_state.hourly_popup_error)
+
+    action_columns = st.columns(2)
+    if action_columns[0].button("Confirm & solve", type="primary", icon=":material/route:", width="stretch"):
+        confirm_completions_and_solve(dispatch_at, use_onemap, beam_width, time_limit, completed_ids)
+    if action_columns[1].button("Cancel", width="stretch", key="hourly_popup_cancel_confirm"):
+        close_review_popup()
+        st.rerun()
+
+
+def render_board_phase(dispatch_at: datetime, use_onemap: bool, beam_width: int, time_limit: float) -> None:
+    solved = st.session_state.hourly_popup_solver_result
+    residual = st.session_state.hourly_popup_residual
+    open_jobs = st.session_state.hourly_popup_open_jobs
+
+    st.subheader("Current driver status")
+    status_columns = st.columns(min(3, max(1, len(residual))))
+    for index, rider in enumerate(residual):
+        snapshot = driver_route_snapshot(rider.name, st.session_state.hourly_open_routes)
+        with status_columns[index % len(status_columns)]:
+            st.caption(f"\U0001F4CD **{rider.name}**")
+            st.caption(snapshot["location"] or rider.start_location)
+
+    render_solver_callouts(solved.solver_result)
+
+    st.subheader("Drag jobs to reassign, reorder, or unassign")
+    st.caption("Nothing is saved until you click Save - drag freely.")
+    jobs_by_id = build_jobs_by_stable_id(open_jobs)
+    rider_df = v1_rider_frame(residual)
+    proposed = render_route_assignment_board(
+        st.session_state.hourly_popup_draft_assignment,
+        jobs_by_id,
+        solved.summary_df,
+        rider_df,
+        board_revision=st.session_state.hourly_popup_session_id,
+    )
+    if proposed is not None:
+        st.session_state.hourly_popup_draft_assignment = proposed
+
+    if st.session_state.hourly_popup_error:
+        st.error(st.session_state.hourly_popup_error)
+
+    action_columns = st.columns(3)
+    if action_columns[0].button("Save", type="primary", icon=":material/check_circle:", width="stretch"):
+        save_popup_board(dispatch_at, use_onemap)
+    if action_columns[1].button("Re-solve", icon=":material/refresh:", width="stretch"):
+        resolve_popup_board(dispatch_at, use_onemap, beam_width, time_limit)
+    if action_columns[2].button("Cancel", width="stretch", key="hourly_popup_cancel_board"):
+        close_review_popup()
+        st.rerun()
+
+
+@st.dialog("Review & confirm dispatch", width="large")
+def review_and_dispatch_dialog(dispatch_at: datetime, use_onemap: bool, beam_width: int, time_limit: float) -> None:
+    phase = st.session_state.hourly_popup_phase
+    if phase == "confirm":
+        render_confirm_phase(dispatch_at, use_onemap, beam_width, time_limit)
+    elif phase == "board":
+        render_board_phase(dispatch_at, use_onemap, beam_width, time_limit)
+
+
+@st.dialog("Daily exports", width="large")
+def daily_exports_dialog() -> None:
+    st.caption(
+        "Each business day (11am to 11am) is exported here automatically once the next day "
+        "rolls over. Download and send to your manager."
+    )
+    exports = list_daily_exports()
+    if not exports:
+        st.caption("No daily exports yet.")
+        return
+    for path in exports:
+        columns = st.columns([3, 1])
+        columns[0].write(path.stem.replace("dispatch_", ""))
+        try:
+            data = path.read_bytes()
+        except Exception as exc:
+            columns[1].caption(f"Unavailable: {exc}")
+            continue
+        columns[1].download_button(
+            "Download",
+            data=data,
+            file_name=path.name,
+            key=f"daily_export_download_{path.name}",
+            width="stretch",
+        )
 
 
 @st.dialog("Standby coverage options", width="large")
@@ -443,6 +770,16 @@ st.session_state.setdefault("hourly_dispatch_result", None)
 st.session_state.setdefault("hourly_ledger_error", "")
 st.session_state.setdefault("hourly_ledger_resumed", False)
 st.session_state.setdefault("hourly_run_log", [])
+st.session_state.setdefault("hourly_business_day", None)
+st.session_state.setdefault("hourly_rollover_checked", False)
+st.session_state.setdefault("hourly_last_export_path", "")
+st.session_state.setdefault("hourly_popup_phase", None)
+st.session_state.setdefault("hourly_popup_session_id", 0)
+st.session_state.setdefault("hourly_popup_residual", None)
+st.session_state.setdefault("hourly_popup_open_jobs", None)
+st.session_state.setdefault("hourly_popup_solver_result", None)
+st.session_state.setdefault("hourly_popup_draft_assignment", None)
+st.session_state.setdefault("hourly_popup_error", "")
 
 if not st.session_state.hourly_ledger_resumed:
     st.session_state.hourly_ledger_resumed = True
@@ -461,13 +798,87 @@ if not st.session_state.hourly_ledger_resumed:
         st.session_state.hourly_archived_routes = saved_ledger.archived_routes
         if saved_ledger.dispatch_at is not None:
             st.session_state.hourly_dispatch_at = saved_ledger.dispatch_at
+        if saved_ledger.business_day is not None:
+            st.session_state.hourly_business_day = saved_ledger.business_day
         st.session_state.hourly_notice = "Resumed today's saved dispatch state from the local ledger."
+
+# ---------------------------------------------------------------------------
+# 11am business-day rollover: once a new business day has started, export
+# whatever the ledger tracked as the previous business day's finished
+# dispatch and start today's list clean. Only fires once per browser
+# session (guarded by hourly_rollover_checked) and only when a previous
+# business day is actually known - a brand-new ledger has nothing to
+# roll over from yet.
+#
+# The same-day ledger resume above deliberately hides a ledger left over
+# from a previous *calendar* day (see `load_hourly_ledger`'s docstring) -
+# but a session spanning midnight without crossing the 11am business
+# boundary yet is exactly that: same business day, different calendar day.
+# If that resume was rejected, `hourly_business_day` is still unset here,
+# so a raw, staleness-ignoring read recovers the real previous-day data
+# before anything gets persisted - otherwise the very `persist_hourly_ledger`
+# call below would silently overwrite it with an empty day.
+# ---------------------------------------------------------------------------
+
+if not st.session_state.hourly_rollover_checked:
+    st.session_state.hourly_rollover_checked = True
+    current_business_day = business_day_for(now)
+    previous_business_day = st.session_state.hourly_business_day
+    fallback_ledger = None
+    if previous_business_day is None:
+        try:
+            fallback_ledger = load_hourly_ledger_ignoring_staleness()
+        except Exception:
+            fallback_ledger = None
+        if fallback_ledger is not None:
+            previous_business_day = fallback_ledger.business_day
+
+    if previous_business_day is not None and previous_business_day != current_business_day:
+        jobs_for_export = fallback_ledger.committed_jobs if fallback_ledger is not None else st.session_state.committed_jobs
+        open_for_export = fallback_ledger.open_routes if fallback_ledger is not None else st.session_state.hourly_open_routes
+        archived_for_export = (
+            fallback_ledger.archived_routes if fallback_ledger is not None else st.session_state.hourly_archived_routes
+        )
+        has_data = any(
+            isinstance(frame, pd.DataFrame) and not frame.empty
+            for frame in (jobs_for_export, open_for_export, archived_for_export)
+        )
+        export_path = None
+        export_error = None
+        if has_data:
+            combined_for_export = combine_dispatch_routes(archived_for_export, open_for_export)
+            try:
+                export_path = export_daily_dispatch_excel(
+                    combined_for_export,
+                    pd.DataFrame(),
+                    previous_business_day,
+                    jobs_df=jobs_for_export,
+                )
+            except Exception as exc:
+                export_error = str(exc)
+        reset_hourly_jobs()
+        st.session_state.hourly_dispatch_at = default_dispatch
+        if export_error:
+            st.session_state.hourly_ledger_error = (
+                f"Could not export {previous_business_day.isoformat()}'s dispatch: {export_error}"
+            )
+        elif export_path is not None:
+            st.session_state.hourly_last_export_path = str(export_path)
+            st.session_state.hourly_notice = (
+                f"New day started ({current_business_day.isoformat()}). "
+                f"{previous_business_day.isoformat()}'s dispatch was exported to {export_path.name}."
+            )
+        else:
+            st.session_state.hourly_notice = f"New day started ({current_business_day.isoformat()})."
+        log_line(f"Business-day rollover: {previous_business_day} -> {current_business_day}.")
+    st.session_state.hourly_business_day = current_business_day
+    persist_hourly_ledger()
 
 # ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
 
-header_columns = st.columns([4.4, 1, 1, 1.2], vertical_alignment="center")
+header_columns = st.columns([3.6, 1, 1, 1.2, 1.3], vertical_alignment="center")
 header_columns[0].title("Hourly Route Optimiser")
 if header_columns[1].button("Today's riders", icon=":material/menu:", width="stretch"):
     configure_hourly_riders_dialog()
@@ -475,6 +886,8 @@ if header_columns[2].button("OneMap key", icon=":material/key:", width="stretch"
     configure_onemap_token_dialog()
 if header_columns[3].button("Gemini key", icon=":material/smart_toy:", width="stretch"):
     configure_gemini_key_dialog()
+if header_columns[4].button("Daily exports", icon=":material/folder_zip:", width="stretch"):
+    daily_exports_dialog()
 
 roster = normalise_riders(st.session_state.committed_riders)
 full_day_count = int(roster["Active"].fillna(True).astype(bool).sum())
@@ -484,6 +897,9 @@ st.caption(f"{full_day_count} full day driver(s) · {pool_count} ad hoc pool dri
 for message_key in ("hourly_notice", "hourly_gemini_key_message", "bluesg_onemap_token_message"):
     if st.session_state.get(message_key):
         st.success(st.session_state.pop(message_key))
+if st.session_state.get("hourly_run_toast"):
+    toast_message, toast_icon = st.session_state.pop("hourly_run_toast")
+    st.toast(toast_message, icon=toast_icon)
 if st.session_state.hourly_ledger_error:
     st.warning(st.session_state.hourly_ledger_error)
 
@@ -507,11 +923,18 @@ st.session_state.hourly_dispatch_at = dispatch_at
 # ---------------------------------------------------------------------------
 
 open_jobs_now = open_jobs_for_dispatch(st.session_state.committed_jobs, st.session_state.hourly_archived_routes)
-action_columns = st.columns([1, 1, 1.4])
+action_columns = st.columns([1, 1, 0.8, 1])
 if action_columns[0].button("Upload", icon=":material/upload_file:", width="stretch"):
     upload_jobs_dialog()
 
 with action_columns[2]:
+    with st.popover("Reset", icon=":material/restart_alt:", width="stretch"):
+        st.caption("Clears today's jobs, routes, and the local ledger for a clean test run. Riders stay as configured.")
+        if st.button("Yes, reset jobs", type="primary", key="hourly_reset_confirm", width="stretch"):
+            reset_hourly_jobs()
+            st.rerun()
+
+with action_columns[3]:
     with st.popover("Settings", icon=":material/tune:", width="stretch"):
         use_onemap = st.checkbox("Use OneMap routing", value=True, key="hourly_use_onemap")
         beam_width = st.number_input(
@@ -531,34 +954,28 @@ optimise_clicked = action_columns[1].button(
 st.caption(f"{len(open_jobs_now)} job(s) waiting to be planned this hour.")
 
 if optimise_clicked:
-    try:
-        log_line(f"Solving {len(open_jobs_now)} open job(s)...")
-        result = run_hourly_dispatch(
-            committed_jobs=st.session_state.committed_jobs,
-            roster_df=st.session_state.committed_riders,
-            dispatch_at=dispatch_at,
-            archived_routes=st.session_state.hourly_archived_routes,
-            confirmed_open_routes=st.session_state.hourly_open_routes,
-            use_onemap=use_onemap,
-            beam_width=int(beam_width),
-            time_limit_seconds=float(time_limit),
-        )
-    except Exception as exc:
-        st.error(f"Hourly dispatch failed: {exc}")
-        log_line(f"Dispatch failed: {exc}")
-    else:
-        st.session_state.hourly_dispatch_result = result
-        if result.solver_result.status == "INFEASIBLE":
-            log_line("Result: INFEASIBLE - no hard-feasible plan found.")
-        else:
-            st.session_state.hourly_open_routes = result.open_route_df
-            log_line(
-                f"Result: {result.solver_result.status} - "
-                f"{len(result.active_rider_names)} active rider(s), "
-                f"{len(result.recalculation.affected_riders)} route(s) recalculated."
-            )
-        persist_hourly_ledger()
-        st.rerun()
+    open_review_popup()
+
+if st.session_state.hourly_popup_phase is not None:
+    review_and_dispatch_dialog(dispatch_at, use_onemap, beam_width, time_limit)
+
+# ---------------------------------------------------------------------------
+# The currently accepted plan (set once the review popup's board is Saved)
+# ---------------------------------------------------------------------------
+
+latest = st.session_state.hourly_dispatch_result
+
+if latest is None:
+    st.caption("No solve run yet this session. Click Optimise to plan this hour's routes.")
+elif latest.solver_result.status == "INFEASIBLE":
+    st.error("⚠️ No hard-feasible plan was found for this hour.")
+    st.caption("Check Standby options in the Backup pool panel on the right to see what's coverable now.")
+else:
+    result_columns = st.columns(3)
+    result_columns[0].metric("Status", latest.solver_result.status.replace("_", " ").title())
+    result_columns[1].metric("Riders routed", len(latest.active_rider_names))
+    result_columns[2].metric("Stops planned", len(latest.route_df))
+    render_solver_callouts(latest.solver_result)
 
 # ---------------------------------------------------------------------------
 # Two-column body: terminal/output on the left, driver overview on the right
@@ -571,19 +988,12 @@ with left_col:
     log_text = "\n".join(st.session_state.hourly_run_log) or "No activity yet this session."
     st.code(log_text, language="text")
 
-    latest = st.session_state.hourly_dispatch_result
     if latest is not None:
         st.subheader("Dispatch output")
         if latest.solver_result.status == "INFEASIBLE":
-            st.error("No hard-feasible plan was found.")
             for reason in latest.solver_result.infeasible_reasons:
                 st.warning(reason)
-            st.caption("Check standby options in the Backup pool panel on the right to see what's coverable now.")
         else:
-            st.success(
-                f"{latest.solver_result.status.replace('_', ' ').title()} · "
-                f"{len(latest.active_rider_names)} active rider(s)"
-            )
             st.dataframe(latest.route_df, hide_index=True, height=360)
             show_route_map(latest.route_df)
 

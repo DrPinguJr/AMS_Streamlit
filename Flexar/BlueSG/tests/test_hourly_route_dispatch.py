@@ -12,11 +12,15 @@ from Flexar.BlueSG.build_optimised_vehicle_routes import (
     stable_job_id_from_route_row,
 )
 from Flexar.BlueSG.hourly_route_dispatch import (
+    active_riders_for_dispatch,
     append_hourly_jobs,
+    apply_manual_dispatch_edits,
     archive_completed_prefix,
+    business_day_for,
     live_shift_timeline,
     open_jobs_for_dispatch,
     operation_context_for_riders,
+    residual_riders,
     run_hourly_dispatch,
     solve_with_standby_options,
     standby_riders_for_dispatch,
@@ -223,6 +227,89 @@ def test_hourly_run_uses_incremental_recalculation_for_open_routes() -> None:
     ]
 
 
+def test_residual_riders_handles_no_shift_window_and_no_history() -> None:
+    # Regression: a full-day rider with blank Shift Start/End and no archived
+    # completions yet (the first solve of the day) used to crash inside
+    # `max(dispatch_at, *[], *[])`, which degenerates to `max(dispatch_at)` -
+    # a single non-iterable positional argument.
+    rider = Rider("Rider A", "Tampines", "East", 1, 2, WorkStyle.FLEXIBLE)
+    dispatch_at = datetime(2026, 8, 5, 14, tzinfo=ZONE)
+
+    residual = residual_riders([rider], pd.DataFrame(), dispatch_at)
+
+    assert len(residual) == 1
+    assert residual[0].available_from == dispatch_at
+
+
+def test_hourly_dispatch_succeeds_for_a_rider_with_no_shift_window() -> None:
+    jobs = pd.DataFrame([_job()])
+    roster = _roster(**{"Shift Start": "", "Shift End": ""})
+
+    result = run_hourly_dispatch(
+        committed_jobs=jobs,
+        roster_df=roster,
+        dispatch_at=datetime(2026, 8, 5, 14, tzinfo=ZONE),
+        use_onemap=False,
+        beam_width=10,
+        time_limit_seconds=5,
+    )
+
+    assert result.solver_result.status == "COMPLETE"
+
+
+def test_hourly_dispatch_accepts_the_raw_session_state_default_frames() -> None:
+    # Regression: `st.session_state.setdefault("hourly_open_routes", pd.DataFrame())`
+    # is a bare, columnless DataFrame - still `isinstance(..., pd.DataFrame)`,
+    # so it used to be trusted as-is instead of falling back to the
+    # ROUTE_COLUMNS-shaped empty frame, crashing inside
+    # `incremental_recalculate` on `confirmed_routes["Rider"]` the first time
+    # anyone clicked Optimise in a fresh session.
+    jobs = pd.DataFrame([_job()])
+
+    result = run_hourly_dispatch(
+        committed_jobs=jobs,
+        roster_df=_roster(**{"Shift End": "6:00 PM"}),
+        dispatch_at=datetime(2026, 8, 5, 14, tzinfo=ZONE),
+        confirmed_open_routes=pd.DataFrame(),
+        archived_routes=pd.DataFrame(),
+        use_onemap=False,
+        beam_width=10,
+        time_limit_seconds=5,
+    )
+
+    assert result.solver_result.status == "COMPLETE"
+
+
+def test_guarantee_minimum_coverage_spreads_jobs_when_capacity_is_short() -> None:
+    # Regression: the mandatory hourly solve's guarantee_minimum_coverage
+    # default used to still hit the pre-search capacity gate (which only
+    # checked allow_partial_assignment) and abort with INFEASIBLE the moment
+    # jobs outnumbered total rider capacity - exactly the "6 drivers, 7
+    # jobs" case this feature exists for. Every rider should get one job and
+    # the surplus job should come back unassigned, not an outright failure.
+    jobs = pd.DataFrame([_job(f"J{i + 1}", i) for i in range(7)])
+    roster = pd.concat(
+        [_roster(**{"Rider Name": f"Rider {i}", "Preferred": 1, "Maximum": 1}) for i in range(6)],
+        ignore_index=True,
+    )
+
+    result = run_hourly_dispatch(
+        committed_jobs=jobs,
+        roster_df=roster,
+        dispatch_at=datetime(2026, 8, 5, 14, tzinfo=ZONE),
+        confirmed_open_routes=pd.DataFrame(),
+        archived_routes=pd.DataFrame(),
+        use_onemap=False,
+        beam_width=20,
+        time_limit_seconds=10,
+    )
+
+    assert result.solver_result.status == "PARTIAL"
+    assert result.route_df["Rider"].nunique() == 6
+    assert len(result.route_df) == 6
+    assert len(result.solver_result.unassigned_jobs) == 1
+
+
 def test_standby_riders_excludes_active_and_requires_a_shift_window() -> None:
     roster = pd.concat(
         [
@@ -304,3 +391,83 @@ def test_solve_with_standby_options_asks_the_advisor_when_leftovers_exist() -> N
     assert options.standby_recommendation is not None
     assert options.standby_recommendation.activate_driver is False
     assert "not configured" in options.standby_recommendation.business_reasoning
+
+
+def test_business_day_for_rolls_over_at_eleven_am() -> None:
+    assert business_day_for(datetime(2026, 8, 19, 10, 59)) == date(2026, 8, 18)
+    assert business_day_for(datetime(2026, 8, 19, 11, 0)) == date(2026, 8, 19)
+    assert business_day_for(datetime(2026, 8, 19, 23, 59)) == date(2026, 8, 19)
+    assert business_day_for(datetime(2026, 8, 19, 0, 0)) == date(2026, 8, 18)
+
+
+def test_apply_manual_dispatch_edits_moves_a_job_to_a_different_rider() -> None:
+    jobs = pd.DataFrame([_job()])
+    dispatch_at = datetime(2026, 8, 5, 14, tzinfo=ZONE)
+    roster = pd.concat(
+        [
+            _roster(**{"Rider Name": "Rider A", "Shift End": "6:00 PM"}),
+            _roster(**{"Rider Name": "Rider B", "Shift End": "6:00 PM"}),
+        ],
+        ignore_index=True,
+    )
+
+    solved = run_hourly_dispatch(
+        committed_jobs=jobs,
+        roster_df=roster,
+        dispatch_at=dispatch_at,
+        use_onemap=False,
+        beam_width=10,
+        time_limit_seconds=5,
+    )
+    job_id = stable_job_id_from_route_row(solved.route_df.iloc[0])
+    residual = residual_riders(
+        active_riders_for_dispatch(roster, dispatch_at), pd.DataFrame(), dispatch_at
+    )
+    open_jobs = open_jobs_for_dispatch(jobs, pd.DataFrame())
+
+    # Whichever rider the solver picked, the operator drags the job onto
+    # Rider B in the review popup before saving.
+    edited = apply_manual_dispatch_edits(
+        draft_assignment={"Rider A": [], "Rider B": [job_id]},
+        residual=residual,
+        open_jobs=open_jobs,
+        archived_routes=pd.DataFrame(),
+        operation_context=CONTEXT,
+        solver_result=solved.solver_result,
+        use_onemap=False,
+        matching_preview_routes=solved.route_df,
+    )
+
+    assert edited.route_df["Rider"].tolist() == ["Rider B"]
+    assert edited.solver_result is solved.solver_result
+
+
+def test_apply_manual_dispatch_edits_rejects_a_duplicated_job_on_the_board() -> None:
+    jobs = pd.DataFrame([_job()])
+    dispatch_at = datetime(2026, 8, 5, 14, tzinfo=ZONE)
+    roster = _roster(**{"Shift End": "6:00 PM"})
+
+    solved = run_hourly_dispatch(
+        committed_jobs=jobs,
+        roster_df=roster,
+        dispatch_at=dispatch_at,
+        use_onemap=False,
+        beam_width=10,
+        time_limit_seconds=5,
+    )
+    job_id = stable_job_id_from_route_row(solved.route_df.iloc[0])
+    residual = residual_riders(
+        active_riders_for_dispatch(roster, dispatch_at), pd.DataFrame(), dispatch_at
+    )
+    open_jobs = open_jobs_for_dispatch(jobs, pd.DataFrame())
+
+    with pytest.raises(ValueError):
+        apply_manual_dispatch_edits(
+            draft_assignment={"Rider A": [job_id, job_id]},
+            residual=residual,
+            open_jobs=open_jobs,
+            archived_routes=pd.DataFrame(),
+            operation_context=CONTEXT,
+            solver_result=solved.solver_result,
+            use_onemap=False,
+        )

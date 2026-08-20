@@ -9,7 +9,13 @@ Gateway from [[94 Hourly Rolling Dispatch]]. Owns `hourly_dispatch_ledger.py` (n
 
 ## What it does
 
-A local Excel workbook (`Flexar/BlueSG/data/hourly_dispatch_ledger.xlsx`, git-ignored) with sheets `Committed_Jobs`, `Committed_Riders`, `Open_Routes`, `Archived_Routes`, `Meta`. On page load the hourly page calls `load_hourly_ledger(today)`; if the ledger's `Meta.Last_Accessed_Date` matches today it resumes session state from the saved sheets, otherwise it starts with an empty canvas. Every state-changing action on the page (append jobs, save roster, archive completions, run dispatch) calls `save_hourly_ledger` afterward, overwriting the previous snapshot.
+A local Excel workbook (`Flexar/BlueSG/data/hourly_dispatch_ledger.xlsx`, git-ignored) with sheets `Committed_Jobs`, `Committed_Riders`, `Open_Routes`, `Archived_Routes`, `Meta`. On page load the hourly page calls `load_hourly_ledger(today)`; if the ledger's `Meta.Last_Accessed_Date` matches today it resumes session state from the saved sheets, otherwise it starts with an empty canvas. Every state-changing action on the page (append jobs, save roster, archive completions, run dispatch, save the popup board) calls `save_hourly_ledger` afterward, overwriting the previous snapshot.
+
+## Business-day tracking
+
+`Meta` also carries a `Business_Day` field (`HourlyLedgerState.business_day`), independent of `Last_Accessed_Date` - it's the 11am-boundary day from `business_day_for` in `hourly_route_dispatch.py`, not the raw calendar date. [[94 Hourly Rolling Dispatch]]'s rollover check compares this against the current business day to decide whether to export and reset.
+
+`load_hourly_ledger`'s same-calendar-day gate is deliberately left unchanged for the normal resume path, but that creates a gap for the rollover check specifically: a session spanning past midnight without yet crossing 11am is still the same *business* day even though the calendar date rolled over, so the gate rejects the file, session state resets to empty defaults, and the very next `persist_hourly_ledger` call would silently overwrite the real previous-day data with that empty state - before the rollover ever got a chance to export it. `load_hourly_ledger_ignoring_staleness` exists solely to close that gap: it parses the same workbook through the same `_state_from_sheets` logic but skips the date gate entirely, so the rollover check can recover the real previous business day's data (and its `Business_Day` tag) even when the normal resume rejected it. It is not used anywhere else - reaching for it outside the rollover path would defeat the point of the same-day gate.
 
 ## Why "same-day, best-effort" and not durable storage
 

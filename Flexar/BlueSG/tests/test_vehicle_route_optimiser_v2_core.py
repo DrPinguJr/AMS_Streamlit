@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date, time
+from datetime import date, time, timedelta
 
 import pandas as pd
 
@@ -273,6 +273,132 @@ def test_allow_partial_assignment_still_completes_when_everything_fits() -> None
     assert result.status == "COMPLETE"
     assert not result.unassigned_jobs
     assert len(result.route_df) == 1
+
+
+def test_guarantee_minimum_coverage_defaults_to_off() -> None:
+    jobs = _jobs(2)
+    riders = [
+        Rider("Rider A", "East pickup 1", "East", 2, 2, WorkStyle.FLEXIBLE),
+        Rider(
+            "Rider B",
+            "East pickup 2",
+            "East",
+            1,
+            1,
+            WorkStyle.FLEXIBLE,
+            available_until=CONTEXT.operation_start + timedelta(minutes=10),
+        ),
+    ]
+    matrix = _matrix(jobs, riders, default_empty=1, loaded=1)
+
+    result = run_optimiser_v2(jobs, riders, operation_context=CONTEXT, travel_matrix=matrix, beam_width=20)
+
+    assert result.status == "COMPLETE"
+    assert result.forced_assignments == []
+    assert result.route_df.groupby("Rider").size().to_dict() == {"Rider A": 2}
+
+
+def test_guarantee_minimum_coverage_forces_a_job_onto_an_idle_rider() -> None:
+    # Rider B's 10-minute shift-remaining window can never fit any job's
+    # handling + travel time, so the normal search always routes both jobs
+    # to Rider A and leaves Rider B at zero. With the override on, Rider B
+    # must get one anyway.
+    jobs = _jobs(2)
+    riders = [
+        Rider("Rider A", "East pickup 1", "East", 2, 2, WorkStyle.FLEXIBLE),
+        Rider(
+            "Rider B",
+            "East pickup 2",
+            "East",
+            1,
+            1,
+            WorkStyle.FLEXIBLE,
+            available_until=CONTEXT.operation_start + timedelta(minutes=10),
+        ),
+    ]
+    matrix = _matrix(jobs, riders, default_empty=1, loaded=1)
+
+    result = run_optimiser_v2(
+        jobs,
+        riders,
+        operation_context=CONTEXT,
+        travel_matrix=matrix,
+        beam_width=20,
+        guarantee_minimum_coverage=True,
+    )
+
+    assert result.status == "COMPLETE_WITH_FORCED_COVERAGE"
+    assert len(result.forced_assignments) == 1
+    forced = result.forced_assignments[0]
+    assert forced["rider"] == "Rider B"
+    assert forced["donor"] == "Rider A"
+    assert forced["feasible"] is False
+    assert forced["reasons"]
+    assert result.route_df.groupby("Rider").size().to_dict() == {"Rider A": 1, "Rider B": 1}
+    assert result.route_df.attrs["hard_constraint_validation"]["is_valid"] is False
+    assert result.route_df.attrs["hard_constraint_validation"]["hard_violation_count"] == 1
+
+
+def test_guarantee_minimum_coverage_leaves_extra_riders_idle_on_job_shortage() -> None:
+    # Only one job for two riders - forcing has nothing to redistribute
+    # (no rider ever holds more than one job), so this must not invent work.
+    jobs = _jobs(1)
+    riders = [
+        Rider("Rider A", "East pickup 1", "East", 1, 1, WorkStyle.FLEXIBLE),
+        Rider("Rider B", "East start B", "East", 1, 1, WorkStyle.FLEXIBLE),
+    ]
+    matrix = _matrix(jobs, riders, default_empty=1, loaded=1)
+
+    result = run_optimiser_v2(
+        jobs,
+        riders,
+        operation_context=CONTEXT,
+        travel_matrix=matrix,
+        beam_width=20,
+        guarantee_minimum_coverage=True,
+    )
+
+    assert result.status == "COMPLETE"
+    assert result.forced_assignments == []
+    assert len(result.route_df) == 1
+
+
+def test_true_capacity_shortfall_is_still_infeasible_by_default() -> None:
+    # Regression guard: guarantee_minimum_coverage/allow_partial_assignment
+    # both being off must keep the original all-or-nothing behaviour when
+    # total jobs exceed every rider's combined Max Jobs.
+    jobs = _jobs(7)
+    riders = [Rider(f"R{i}", f"East pickup {i + 1}", "East", 1, 1, WorkStyle.FLEXIBLE) for i in range(6)]
+    matrix = _matrix(jobs, riders, default_empty=1, loaded=1)
+
+    result = run_optimiser_v2(jobs, riders, operation_context=CONTEXT, travel_matrix=matrix, beam_width=20)
+
+    assert result.status == "INFEASIBLE"
+    assert result.route_df.empty
+
+
+def test_guarantee_minimum_coverage_tolerates_a_true_capacity_shortfall() -> None:
+    # 7 jobs, 6 riders capped at 1 each: one job genuinely cannot fit
+    # anywhere. Every rider should still get exactly one job instead of the
+    # whole run reporting INFEASIBLE, and the leftover job comes back as an
+    # explicit unassigned entry rather than being silently dropped.
+    jobs = _jobs(7)
+    riders = [Rider(f"R{i}", f"East pickup {i + 1}", "East", 1, 1, WorkStyle.FLEXIBLE) for i in range(6)]
+    matrix = _matrix(jobs, riders, default_empty=1, loaded=1)
+
+    result = run_optimiser_v2(
+        jobs,
+        riders,
+        operation_context=CONTEXT,
+        travel_matrix=matrix,
+        beam_width=20,
+        guarantee_minimum_coverage=True,
+    )
+
+    assert result.status == "PARTIAL"
+    assert len(result.route_df) == 6
+    assert result.route_df["Rider"].nunique() == 6
+    assert len(result.unassigned_jobs) == 1
 
 
 def test_zero_minute_empty_route_is_valid() -> None:
