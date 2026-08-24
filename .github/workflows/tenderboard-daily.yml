@@ -1,0 +1,61 @@
+name: TenderFlow Daily Scraper
+
+on:
+  schedule:
+    # 08:00 UTC daily = 16:00 Singapore time (UTC+8). Adjust if you want a
+    # different local send time.
+    - cron: "0 8 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  scrape-and-email:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The scraper de-dupes new tenders against Lance/Tender/Excel
+      # Sheets/Database.xlsx (gitignored, so it is not committed). Caching
+      # it between runs is what makes "new since last run" mean anything
+      # across days instead of re-reporting everything every run.
+      - name: Restore tender database cache
+        uses: actions/cache/restore@v4
+        with:
+          path: "Lance/Tender/Excel Sheets"
+          key: tenderboard-database-${{ github.run_id }}
+          restore-keys: |
+            tenderboard-database-
+
+      - name: Set up Chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run daily tender scrape and email digest
+        env:
+          TENDERBOARD_USERNAME: ${{ secrets.TENDERBOARD_USERNAME }}
+          TENDERBOARD_PASSWORD: ${{ secrets.TENDERBOARD_PASSWORD }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GMAIL_EMAIL: ${{ secrets.GMAIL_EMAIL }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+        run: python "Lance/Tender/daily_report.py"
+
+      - name: Save tender database cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: "Lance/Tender/Excel Sheets"
+          key: tenderboard-database-${{ github.run_id }}
