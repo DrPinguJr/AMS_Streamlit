@@ -1,38 +1,40 @@
-"""Daily TenderBoard scrape -> Gemini relevance filter -> email digest.
+"""Daily TenderBoard scrape -> Gemini relevance filter -> Slack digest.
 
 Runs the existing TenderBoard scraper (`TenderScrape.scrape_tenderboard`),
 keeps only the tenders that are new since the last run, asks Gemini to
-shortlist the ones relevant to a manpower/staffing agency, and emails the
-shortlist. Designed to be triggered daily by
-`.github/workflows/tenderboard-daily.yml`, but `main()` also runs fine
-locally (reads a local `.env`, same as the Streamlit page).
+shortlist the ones relevant to a manpower/staffing agency, and posts the
+shortlist to a Slack Workflow Builder webhook. Designed to be triggered
+daily by `.github/workflows/tenderboard-daily.yml`, but `main()` also runs
+fine locally (reads a local `.env`, same as the Streamlit page).
 
 Every step degrades gracefully rather than raising past the top: a Gemini
-failure keeps everyone (fail open, not silent), a missing email credential
-just gets logged. A flaky dependency should never crash the whole run
-before we know whether anything was found. Note: `send_email` still raises
-on failure, so a broken mail credential surfaces as a failed run (which
-is the point of the daily job).
+failure keeps everyone (fail open, not silent), a missing Gemini key just
+gets logged. A flaky dependency should never crash the whole run before we
+know whether anything was found. Note: `send_slack_digest` still raises on
+failure, so a broken webhook surfaces as a failed run (which is the point
+of the daily job).
 
 Required environment variables (set as GitHub Actions secrets, never
 committed - see the workflow file for the exact secret names):
     TENDERBOARD_USERNAME   - TenderBoard login used by the scraper
     TENDERBOARD_PASSWORD   - TenderBoard login used by the scraper
     GEMINI_API_KEY          - Google GenAI API key
-    GMAIL_EMAIL             - Sender Gmail address
-    GMAIL_APP_PASSWORD      - Gmail App Password (NOT the account password)
-    RECEIVER_EMAIL          - Recipient address for the daily digest
+    SLACK_WEBHOOK_URL       - Slack Workflow Builder webhook trigger URL
+
+The Slack webhook is a Workflow Builder trigger (hooks.slack.com/triggers/...),
+not a classic Incoming Webhook, so the POST body must match the workflow's
+own input variable name rather than the classic `{"text": ...}` shape. This
+workflow's trigger expects a single variable called `message`.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import smtplib
 from dataclasses import dataclass
-from email.message import EmailMessage
 
 import pandas as pd
+import requests
 
 try:
     from TenderScrape import load_local_env, log, scrape_tenderboard
@@ -129,13 +131,13 @@ def analyze_tenders(tenders: list[DigestTender]) -> list[DigestTender]:
     return [tender for tender in tenders if tender.title in relevant_titles]
 
 
-def format_email_body(tenders: list[DigestTender]) -> str:
+def format_digest_body(tenders: list[DigestTender]) -> str:
     if not tenders:
         return "No new manpower/staffing-relevant tenders were found today."
 
-    lines = [f"{len(tenders)} new tender(s) relevant to manpower/staffing:", ""]
+    lines = [f"*{len(tenders)} new tender(s) relevant to manpower/staffing:*", ""]
     for tender in tenders:
-        lines.append(f"- {tender.title}")
+        lines.append(f"• *{tender.title}*")
         if tender.company:
             lines.append(f"  Organisation: {tender.company}")
         if tender.closing_date:
@@ -146,30 +148,23 @@ def format_email_body(tenders: list[DigestTender]) -> str:
     return "\n".join(lines)
 
 
-def send_email(subject: str, body: str) -> None:
-    """Send `body` from GMAIL_EMAIL to RECEIVER_EMAIL via Gmail SMTP.
+def send_slack_digest(subject: str, body: str) -> None:
+    """Post the digest to the Slack Workflow Builder webhook trigger.
 
-    Uses an App Password (not the Gmail account password) over STARTTLS, per
-    Google's recommendation for SMTP from scripts/CI:
-    https://support.google.com/accounts/answer/185833
+    Unlike a classic Slack Incoming Webhook (which accepts a free-form
+    `{"text": ...}` payload), a Workflow Builder trigger only accepts the
+    exact input variable(s) defined on that trigger - here, a single
+    `message` variable. Raises on a non-2xx response so a broken webhook
+    fails the run instead of silently dropping the digest.
     """
 
-    sender = os.environ["GMAIL_EMAIL"]
-    app_password = os.environ["GMAIL_APP_PASSWORD"]
-    receiver = os.environ["RECEIVER_EMAIL"]
+    webhook_url = os.environ["SLACK_WEBHOOK_URL"]
+    message = f"{subject}\n\n{body}"
 
-    message = EmailMessage()
-    message["Subject"] = subject
-    message["From"] = sender
-    message["To"] = receiver
-    message.set_content(body)
+    response = requests.post(webhook_url, json={"message": message}, timeout=30)
+    response.raise_for_status()
 
-    with smtplib.SMTP("smtp.gmail.com", 587) as smtp:
-        smtp.starttls()
-        smtp.login(sender, app_password)
-        smtp.send_message(message)
-
-    log(f"Email sent to {receiver}.")
+    log("Digest posted to Slack.")
 
 
 def main() -> None:
@@ -183,8 +178,8 @@ def main() -> None:
     log(f"{len(relevant)} tender(s) kept as relevant after Gemini filtering.")
 
     subject = f"TenderFlow Daily Digest - {len(relevant)} relevant tender(s)"
-    body = format_email_body(relevant)
-    send_email(subject, body)
+    body = format_digest_body(relevant)
+    send_slack_digest(subject, body)
 
 
 if __name__ == "__main__":
