@@ -174,17 +174,33 @@ def classify_tenders(tenders: list[DigestTender]) -> dict[str, list[DigestTender
     return result
 
 
-def _format_tender_lines(tenders: list[DigestTender]) -> list[str]:
+# Slack Workflow Builder's "Send a message to a channel" step has a hard
+# size limit on its message variable (~3000 chars) - blow past it and the
+# whole send fails inside Slack with an "INPUT VALIDATION ERROR", *after*
+# the webhook has already returned 200 to us, so the Python script and the
+# GitHub Actions run both report success while nothing actually lands in
+# Slack. Keep every digest well under that limit.
+_MAX_LISTED_PER_CATEGORY = 12
+_MAX_MESSAGE_CHARS = 2800
+
+
+def _format_tender_lines(tenders: list[DigestTender], *, limit: int) -> list[str]:
+    """One compact line per tender - title as a Slack hyperlink, nothing else.
+
+    Company/closing date are dropped and the list is capped at `limit`
+    entries; a full multi-line block per tender (the old format) is what
+    blew past Slack's message size limit once there were more than a
+    couple dozen tenders.
+    """
+
+    shown = tenders[:limit]
     lines: list[str] = []
-    for tender in tenders:
-        lines.append(f"• *{tender.title}*")
-        if tender.company:
-            lines.append(f"  Organisation: {tender.company}")
-        if tender.closing_date:
-            lines.append(f"  Closing: {tender.closing_date}")
-        if tender.link:
-            lines.append(f"  Link: {tender.link}")
-        lines.append("")
+    for tender in shown:
+        text = tender.title.replace("|", "-") or "(untitled)"
+        lines.append(f"• <{tender.link}|{text}>" if tender.link else f"• {text}")
+    remaining = len(tenders) - len(shown)
+    if remaining > 0:
+        lines.append(f"…and {remaining} more not shown.")
     return lines
 
 
@@ -211,17 +227,20 @@ def format_digest_body(
     lines = [headline, ""]
 
     if confirmed:
-        lines.append(f"✅ *Confirmed manpower/staffing match ({len(confirmed)})*")
-        lines.extend(_format_tender_lines(confirmed))
+        lines.append(f"✅ *Confirmed ({len(confirmed)})*")
+        lines.extend(_format_tender_lines(confirmed, limit=_MAX_LISTED_PER_CATEGORY))
+        lines.append("")
 
     if likely:
-        lines.append(f"🟡 *Possibly relevant - worth a look ({len(likely)})*")
-        lines.extend(_format_tender_lines(likely))
+        lines.append(f"🟡 *Possibly relevant ({len(likely)})*")
+        lines.extend(_format_tender_lines(likely, limit=_MAX_LISTED_PER_CATEGORY))
+        lines.append("")
 
     if rejected:
-        lines.append(f"⚪ *Screened out as not relevant ({len(rejected)})*")
-        lines.extend(f"• {tender.title}" for tender in rejected)
-        lines.append("")
+        # Rejected tenders are screened out by definition - a count is
+        # enough, and skipping the list saves a lot of space on a
+        # full-snapshot run where this bucket can be hundreds long.
+        lines.append(f"⚪ *Screened out as not relevant: {len(rejected)}*")
 
     return "\n".join(lines).rstrip()
 
@@ -234,10 +253,19 @@ def send_slack_digest(subject: str, body: str) -> None:
     exact input variable(s) defined on that trigger - here, a single
     `message` variable. Raises on a non-2xx response so a broken webhook
     fails the run instead of silently dropping the digest.
+
+    Belt-and-suspenders length cap: `format_digest_body` already keeps
+    digests compact, but this truncates the final payload too, so a huge
+    message can never again pass Slack's webhook (200 OK) only to fail
+    silently inside the Workflow Builder step with an "INPUT VALIDATION
+    ERROR" that this script never sees.
     """
 
     webhook_url = os.environ["SLACK_WEBHOOK_URL"]
     message = f"{subject}\n\n{body}"
+    if len(message) > _MAX_MESSAGE_CHARS:
+        note = "\n\n…(truncated - see the GitHub Actions run log for the full list)"
+        message = message[: _MAX_MESSAGE_CHARS - len(note)].rstrip() + note
 
     response = requests.post(webhook_url, json={"message": message}, timeout=30)
     response.raise_for_status()
