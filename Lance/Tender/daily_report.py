@@ -1,18 +1,19 @@
-"""Daily TenderBoard scrape -> Gemini relevance filter -> Slack digest.
+"""Daily TenderBoard scrape -> Gemini relevance classifier -> Slack digest.
 
 Runs the existing TenderBoard scraper (`TenderScrape.scrape_tenderboard`),
-keeps only the tenders that are new since the last run, asks Gemini to
-shortlist the ones relevant to a manpower/staffing agency, and posts the
-shortlist to a Slack Workflow Builder webhook. Designed to be triggered
-daily by `.github/workflows/tenderboard-daily.yml`, but `main()` also runs
-fine locally (reads a local `.env`, same as the Streamlit page).
+keeps only the tenders that are new since the last run, asks Gemini to sort
+them into confirmed / likely / rejected manpower-staffing relevance, and
+posts the full breakdown (all three buckets, nothing dropped) to a Slack
+Workflow Builder webhook. Designed to be triggered daily by
+`.github/workflows/tenderboard-daily.yml`, but `main()` also runs fine
+locally (reads a local `.env`, same as the Streamlit page).
 
 Every step degrades gracefully rather than raising past the top: a Gemini
-failure keeps everyone (fail open, not silent), a missing Gemini key just
-gets logged. A flaky dependency should never crash the whole run before we
-know whether anything was found. Note: `send_slack_digest` still raises on
-failure, so a broken webhook surfaces as a failed run (which is the point
-of the daily job).
+failure buckets everything as "likely" (fail open, not silent), a missing
+Gemini key does the same. A flaky dependency should never crash the whole
+run before we know whether anything was found. Note: `send_slack_digest`
+still raises on failure, so a broken webhook surfaces as a failed run
+(which is the point of the daily job).
 
 Required environment variables (set as GitHub Actions secrets, never
 committed - see the workflow file for the exact secret names):
@@ -45,14 +46,24 @@ except ModuleNotFoundError:
 GEMINI_MODEL_NAME = "gemini-2.5-flash"
 
 _SYSTEM_INSTRUCTION = (
-    "You are screening tender titles for a manpower/staffing agency (temp "
-    "staffing, recruitment, outsourced labour, and facilities/security/"
-    "cleaning/healthcare manpower and HR services contracts). Given a JSON "
-    "array of tender titles, return ONLY a JSON array containing the exact "
-    "titles (unchanged) that are relevant to that business. Drop anything "
-    "unrelated (e.g. construction works, IT hardware, pure goods supply). "
-    "If none are relevant, return an empty array."
+    "You are screening daily tender titles for a manpower/staffing agency "
+    "(temp staffing, recruitment, outsourced labour, and facilities/security/"
+    "cleaning/healthcare manpower and HR services contracts). Classify EVERY "
+    "title in the input into exactly one category:\n"
+    '  "confirmed" - clearly a manpower/staffing/recruitment/outsourced-labour '
+    "contract, or facilities/security/cleaning/healthcare manpower and HR "
+    "services.\n"
+    '  "likely" - plausibly involves a manpower/staffing component but the '
+    "title is ambiguous or mixes in other scope (e.g. a facilities-management "
+    "contract that may include manpower).\n"
+    '  "rejected" - clearly unrelated (e.g. construction works, IT hardware, '
+    "pure goods supply).\n"
+    "Return ONLY a JSON array of objects, one per input title, each with the "
+    'exact keys "title" (unchanged from the input) and "category" (one of '
+    '"confirmed", "likely", "rejected"). Include every input title exactly once.'
 )
+
+_CATEGORIES = ("confirmed", "likely", "rejected")
 
 
 @dataclass(frozen=True)
@@ -89,29 +100,35 @@ def scrape_tenders(headless: bool = True) -> list[DigestTender]:
     return tenders
 
 
-def analyze_tenders(tenders: list[DigestTender]) -> list[DigestTender]:
-    """Ask Gemini which of `tenders` are relevant to a manpower/staffing agency.
+def classify_tenders(tenders: list[DigestTender]) -> dict[str, list[DigestTender]]:
+    """Ask Gemini to sort `tenders` into confirmed / likely / rejected buckets.
 
-    Any failure (missing key, missing dependency, malformed response,
-    network error) falls back to keeping every tender rather than dropping
-    the run silently - a noisier email beats a lost tender.
+    Unlike a simple keep/drop filter, every tender is kept somewhere - the
+    digest reports the full picture (strong matches, borderline ones worth a
+    human glance, and what got screened out) rather than silently dropping
+    anything. Any failure (missing key, missing dependency, malformed
+    response, network error, a title Gemini's response omits) falls back to
+    bucketing the affected tenders as "likely" rather than losing or
+    wrongly rejecting them - a noisier digest beats a lost tender.
     """
 
+    empty: dict[str, list[DigestTender]] = {category: [] for category in _CATEGORIES}
     if not tenders:
-        return []
+        return empty
 
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        log("GEMINI_API_KEY is not set; skipping relevance filtering.")
-        return tenders
+        log("GEMINI_API_KEY is not set; skipping relevance classification.")
+        return {**empty, "likely": list(tenders)}
 
     try:
         from google import genai
         from google.genai import types
     except ImportError:
-        log("google-genai is not installed; skipping relevance filtering.")
-        return tenders
+        log("google-genai is not installed; skipping relevance classification.")
+        return {**empty, "likely": list(tenders)}
 
+    by_title = {tender.title: tender for tender in tenders}
     titles = [tender.title for tender in tenders]
     try:
         client = genai.Client(api_key=api_key)
@@ -123,19 +140,33 @@ def analyze_tenders(tenders: list[DigestTender]) -> list[DigestTender]:
                 response_mime_type="application/json",
             ),
         )
-        relevant_titles = {str(title).strip() for title in json.loads(response.text)}
+        classifications = json.loads(response.text)
     except Exception as exc:  # noqa: BLE001 - any provider/network failure degrades gracefully
-        log(f"Gemini relevance filtering failed ({exc}); keeping all tenders.")
-        return tenders
+        log(f"Gemini relevance classification failed ({exc}); keeping all tenders as likely.")
+        return {**empty, "likely": list(tenders)}
 
-    return [tender for tender in tenders if tender.title in relevant_titles]
+    result: dict[str, list[DigestTender]] = {category: [] for category in _CATEGORIES}
+    classified_titles: set[str] = set()
+    for item in classifications:
+        title = str(item.get("title", "")).strip()
+        category = str(item.get("category", "")).strip().lower()
+        tender = by_title.get(title)
+        if tender is None or category not in result or title in classified_titles:
+            continue
+        result[category].append(tender)
+        classified_titles.add(title)
+
+    # A malformed or partial Gemini response shouldn't lose tenders - anything
+    # it didn't classify still needs a human to see it.
+    for tender in tenders:
+        if tender.title not in classified_titles:
+            result["likely"].append(tender)
+
+    return result
 
 
-def format_digest_body(tenders: list[DigestTender]) -> str:
-    if not tenders:
-        return "No new manpower/staffing-relevant tenders were found today."
-
-    lines = [f"*{len(tenders)} new tender(s) relevant to manpower/staffing:*", ""]
+def _format_tender_lines(tenders: list[DigestTender]) -> list[str]:
+    lines: list[str] = []
     for tender in tenders:
         lines.append(f"• *{tender.title}*")
         if tender.company:
@@ -145,7 +176,34 @@ def format_digest_body(tenders: list[DigestTender]) -> str:
         if tender.link:
             lines.append(f"  Link: {tender.link}")
         lines.append("")
-    return "\n".join(lines)
+    return lines
+
+
+def format_digest_body(categorized: dict[str, list[DigestTender]]) -> str:
+    confirmed = categorized.get("confirmed", [])
+    likely = categorized.get("likely", [])
+    rejected = categorized.get("rejected", [])
+    total = len(confirmed) + len(likely) + len(rejected)
+
+    if total == 0:
+        return "No new tenders were found today."
+
+    lines = [f"*{total} new tender(s) found today.*", ""]
+
+    if confirmed:
+        lines.append(f"✅ *Confirmed manpower/staffing match ({len(confirmed)})*")
+        lines.extend(_format_tender_lines(confirmed))
+
+    if likely:
+        lines.append(f"🟡 *Possibly relevant - worth a look ({len(likely)})*")
+        lines.extend(_format_tender_lines(likely))
+
+    if rejected:
+        lines.append(f"⚪ *Screened out as not relevant ({len(rejected)})*")
+        lines.extend(f"• {tender.title}" for tender in rejected)
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
 
 
 def send_slack_digest(subject: str, body: str) -> None:
@@ -174,11 +232,15 @@ def main() -> None:
     tenders = scrape_tenders(headless=headless)
     log(f"Scraper found {len(tenders)} new tender(s) since the last run.")
 
-    relevant = analyze_tenders(tenders)
-    log(f"{len(relevant)} tender(s) kept as relevant after Gemini filtering.")
+    categorized = classify_tenders(tenders)
+    log(
+        f"{len(categorized['confirmed'])} confirmed, {len(categorized['likely'])} likely, "
+        f"{len(categorized['rejected'])} rejected after Gemini classification."
+    )
 
-    subject = f"TenderFlow Daily Digest - {len(relevant)} relevant tender(s)"
-    body = format_digest_body(relevant)
+    total = sum(len(bucket) for bucket in categorized.values())
+    subject = f"TenderFlow Daily Digest - {total} new tender(s)"
+    body = format_digest_body(categorized)
     send_slack_digest(subject, body)
 
 
