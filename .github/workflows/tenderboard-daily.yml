@@ -5,7 +5,15 @@ on:
     # 08:00 UTC daily = 16:00 Singapore time (UTC+8). Adjust if you want a
     # different local send time.
     - cron: "0 8 * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      force_full_report:
+        description: >-
+          Report every tender currently on the board (not just ones new
+          since the last run). Does not affect the dedupe database used by
+          the daily schedule - use this to preview/verify the digest.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -49,6 +57,7 @@ jobs:
           TENDERBOARD_PASSWORD: ${{ secrets.TENDERBOARD_PASSWORD }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          FORCE_FULL_REPORT: ${{ inputs.force_full_report }}
         run: python "Lance/Tender/daily_report.py"
 
       - name: Save tender database cache

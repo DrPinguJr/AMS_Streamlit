@@ -74,19 +74,25 @@ class DigestTender:
     company: str
 
 
-def scrape_tenders(headless: bool = True) -> list[DigestTender]:
-    """Run the TenderBoard scraper and return only tenders new since the last run.
+def scrape_tenders(headless: bool = True, force_full: bool = False) -> list[DigestTender]:
+    """Run the TenderBoard scraper and return the tenders to report.
 
-    Reuses `scrape_tenderboard`'s own dedupe against the saved database, so
-    on a normal day (nothing new) this returns an empty list rather than
-    re-reporting everything already seen.
+    By default, reuses `scrape_tenderboard`'s own dedupe against the saved
+    database, so on a normal day (nothing new) this returns an empty list
+    rather than re-reporting everything already seen. When `force_full` is
+    set, the scrape still runs and still updates the dedupe database as
+    normal (so the daily schedule's "new since last run" behaviour is
+    unaffected), but this returns every tender currently on the board
+    instead of just the ones new since the last run - useful for previewing
+    or verifying the digest on demand.
     """
 
     _, save_summary = scrape_tenderboard(headless=headless, log_fn=log)
-    if save_summary.new_output_path is None:
+    source_path = save_summary.database_path if force_full else save_summary.new_output_path
+    if source_path is None or not source_path.exists():
         return []
 
-    dataframe = pd.read_excel(save_summary.new_output_path)
+    dataframe = pd.read_excel(source_path)
     tenders: list[DigestTender] = []
     for row in dataframe.to_dict("records"):
         tenders.append(
@@ -179,16 +185,27 @@ def _format_tender_lines(tenders: list[DigestTender]) -> list[str]:
     return lines
 
 
-def format_digest_body(categorized: dict[str, list[DigestTender]]) -> str:
+def format_digest_body(
+    categorized: dict[str, list[DigestTender]], *, full_snapshot: bool = False
+) -> str:
     confirmed = categorized.get("confirmed", [])
     likely = categorized.get("likely", [])
     rejected = categorized.get("rejected", [])
     total = len(confirmed) + len(likely) + len(rejected)
 
     if total == 0:
-        return "No new tenders were found today."
+        return (
+            "No tenders are currently on the board."
+            if full_snapshot
+            else "No new tenders were found today."
+        )
 
-    lines = [f"*{total} new tender(s) found today.*", ""]
+    headline = (
+        f"*{total} tender(s) currently on the board.*"
+        if full_snapshot
+        else f"*{total} new tender(s) found today.*"
+    )
+    lines = [headline, ""]
 
     if confirmed:
         lines.append(f"✅ *Confirmed manpower/staffing match ({len(confirmed)})*")
@@ -229,8 +246,12 @@ def main() -> None:
     load_local_env()
 
     headless = os.getenv("TENDERBOARD_HEADLESS", "1") != "0"
-    tenders = scrape_tenders(headless=headless)
-    log(f"Scraper found {len(tenders)} new tender(s) since the last run.")
+    force_full = os.getenv("FORCE_FULL_REPORT", "0").strip().lower() in ("1", "true")
+    tenders = scrape_tenders(headless=headless, force_full=force_full)
+    if force_full:
+        log(f"Scraper found {len(tenders)} tender(s) currently on the board (full snapshot).")
+    else:
+        log(f"Scraper found {len(tenders)} new tender(s) since the last run.")
 
     categorized = classify_tenders(tenders)
     log(
@@ -239,8 +260,10 @@ def main() -> None:
     )
 
     total = sum(len(bucket) for bucket in categorized.values())
-    subject = f"TenderFlow Daily Digest - {total} new tender(s)"
-    body = format_digest_body(categorized)
+    label = "tender(s) on the board" if force_full else "new tender(s)"
+    subject_prefix = "TenderFlow Full Snapshot" if force_full else "TenderFlow Daily Digest"
+    subject = f"{subject_prefix} - {total} {label}"
+    body = format_digest_body(categorized, full_snapshot=force_full)
     send_slack_digest(subject, body)
 
 
