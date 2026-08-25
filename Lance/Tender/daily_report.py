@@ -43,7 +43,10 @@ except ModuleNotFoundError:
     from Lance.Tender.TenderScrape import load_local_env, log, scrape_tenderboard
 
 # Update this if the pinned google-genai release retires the model.
-GEMINI_MODEL_NAME = "gemini-2.5-flash"
+# gemini-2.5-flash was retired for new users (404 from the API pointing at
+# gemini-3.6-flash) - every run since then silently fell back to bucketing
+# every tender as "likely" instead of actually classifying them.
+GEMINI_MODEL_NAME = "gemini-3.6-flash"
 
 _SYSTEM_INSTRUCTION = (
     "You are screening daily tender titles for a manpower/staffing agency "
