@@ -60,6 +60,18 @@ jobs:
           FORCE_FULL_REPORT: ${{ inputs.force_full_report }}
         run: python "Lance/Tender/daily_report.py"
 
+      # The cache below keeps the scraper's dedupe state between runs, but
+      # caches cannot be downloaded from a workflow run. Publish the dated
+      # Excel reports separately so they appear in the run's Artifacts list.
+      - name: Upload tender Excel reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tenderflow-report-${{ github.run_number }}
+          path: "Lance/Tender/Excel Sheets/*_TenderBoard.xlsx"
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Save tender database cache
         if: always()
         uses: actions/cache/save@v4
