@@ -8,6 +8,16 @@ SMTP. Designed to be triggered daily by
 `.github/workflows/tenderboard-daily.yml`, but `main()` also runs fine
 locally (reads a local `.env`, same as the Streamlit page).
 
+GitHub's `schedule` trigger is not guaranteed to fire on time - it has been
+observed firing hours late on this repo. To compensate, the workflow ticks
+every 10 minutes across a 2-hour window instead of once at the target time,
+and `main()` self-guards with a same-day marker file (see
+`_already_sent_today`/`_mark_sent_today` below) so only the first tick that
+successfully sends actually does anything; every later tick that day is a
+fast no-op. `force_full_report` runs bypass the marker entirely (both
+checking and writing it) since those are on-demand previews, not the one
+daily send.
+
 Every step degrades gracefully rather than raising past the top: a Gemini
 failure buckets everything as "likely" (fail open, not silent), a missing
 Gemini key does the same. A flaky dependency should never crash the whole
@@ -32,14 +42,27 @@ import json
 import os
 import smtplib
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 
 import pandas as pd
 
 try:
+    from TenderProcess import DATABASE_PATH
     from TenderScrape import load_local_env, log, scrape_tenderboard
 except ModuleNotFoundError:
+    from Lance.Tender.TenderProcess import DATABASE_PATH
     from Lance.Tender.TenderScrape import load_local_env, log, scrape_tenderboard
+
+# Singapore has no DST, so a fixed UTC+8 offset is all "today" needs - no
+# dependency on the runner having full tzdata installed.
+_SGT = timezone(timedelta(hours=8))
+
+# Lives next to Database.xlsx, so it rides along with the same GitHub Actions
+# cache (see the workflow's cache/restore and cache/save steps) without any
+# extra setup. Holds nothing but an ISO date - the last day the daily digest
+# was actually sent.
+_SENT_MARKER_PATH = DATABASE_PATH.parent / ".last_sent_date"
 
 # Update this if the pinned google-genai release retires the model.
 # gemini-2.5-flash was retired for new users (404 from the API pointing at
@@ -72,6 +95,7 @@ _CATEGORIES = ("confirmed", "likely", "rejected")
 class DigestTender:
     title: str
     link: str
+    published_date: str
     closing_date: str
     company: str
 
@@ -101,6 +125,7 @@ def scrape_tenders(headless: bool = True, force_full: bool = False) -> list[Dige
             DigestTender(
                 title=str(row.get("tender_title", "") or "").strip(),
                 link=str(row.get("tender_link", "") or "").strip(),
+                published_date=str(row.get("published_date", "") or "").strip(),
                 closing_date=str(row.get("closing_date", "") or "").strip(),
                 company=str(row.get("company_organisation_name", "") or "").strip(),
             )
@@ -173,19 +198,31 @@ def classify_tenders(tenders: list[DigestTender]) -> dict[str, list[DigestTender
     return result
 
 
-def _format_tender_block(tenders: list[DigestTender]) -> list[str]:
-    """One multi-line block per tender: title, organisation, closing date, link.
+def _format_tender_block(
+    tenders: list[DigestTender], *, include_organisation: bool = True
+) -> list[str]:
+    """One multi-line block per tender: title, [organisation,] published/closing dates, link.
 
     Unlike the old Slack-oriented formatting, email has no practical message
     size limit, so every tender in the bucket is listed in full rather than
     capped at a handful of entries.
+
+    `published_date` is TenderBoard's own posting date for the listing (day/
+    month/year, as scraped) - TenderBoard doesn't expose a time of day, so
+    there's no posting time to show, only the date.
+
+    `include_organisation` is off for the screened-out bucket, which can run
+    much longer than confirmed/likely - title, dates and link are enough to
+    catch a false positive without stretching every entry an extra line.
     """
 
     lines: list[str] = []
     for tender in tenders:
         lines.append(f"- {tender.title or '(untitled)'}")
-        if tender.company:
+        if include_organisation and tender.company:
             lines.append(f"  Organisation: {tender.company}")
+        if tender.published_date:
+            lines.append(f"  Published: {tender.published_date}")
         if tender.closing_date:
             lines.append(f"  Closing: {tender.closing_date}")
         if tender.link:
@@ -227,11 +264,14 @@ def format_digest_body(
         lines.extend(_format_tender_block(likely))
 
     if rejected:
-        # Rejected tenders are screened out by definition - a count is
-        # enough, and skipping the list keeps the useful buckets from being
-        # buried, especially on a full-snapshot run where this bucket can be
-        # hundreds long.
-        lines.append(f"Screened out as not relevant: {len(rejected)}")
+        # Listed in full (not just a count) so a false positive - a good
+        # tender Gemini wrongly screened out - is still catchable on a
+        # glance, instead of being silently lost. Unlike the old Slack
+        # digest, email has no practical size limit, and this bucket sits
+        # last so the buckets worth acting on first aren't buried under it.
+        lines.append(f"SCREENED OUT AS NOT RELEVANT ({len(rejected)})")
+        lines.append("-" * 40)
+        lines.extend(_format_tender_block(rejected, include_organisation=False))
 
     return "\n".join(lines).rstrip()
 
@@ -273,11 +313,36 @@ def send_email(subject: str, body: str) -> None:
     log(f"Email sent to {', '.join(recipients)}.")
 
 
+def _today_sgt() -> str:
+    return datetime.now(_SGT).date().isoformat()
+
+
+def _already_sent_today() -> bool:
+    """True if `_mark_sent_today` already ran today (SGT), per the marker file."""
+
+    if not _SENT_MARKER_PATH.exists():
+        return False
+    return _SENT_MARKER_PATH.read_text(encoding="utf-8").strip() == _today_sgt()
+
+
+def _mark_sent_today() -> None:
+    _SENT_MARKER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _SENT_MARKER_PATH.write_text(_today_sgt(), encoding="utf-8")
+
+
 def main() -> None:
     load_local_env()
 
     headless = os.getenv("TENDERBOARD_HEADLESS", "1") != "0"
     force_full = os.getenv("FORCE_FULL_REPORT", "0").strip().lower() in ("1", "true")
+
+    # Only the real daily send is guarded - force_full previews are on-demand
+    # and should never be silently skipped just because today's digest
+    # already went out.
+    if not force_full and _already_sent_today():
+        log(f"Daily digest already sent today ({_today_sgt()} SGT); skipping this tick.")
+        return
+
     tenders = scrape_tenders(headless=headless, force_full=force_full)
     if force_full:
         log(f"Scraper found {len(tenders)} tender(s) currently on the board (full snapshot).")
@@ -296,6 +361,8 @@ def main() -> None:
     subject = f"{subject_prefix} - {total} {label}"
     body = format_digest_body(categorized, full_snapshot=force_full)
     send_email(subject, body)
+    if not force_full:
+        _mark_sent_today()
 
 
 if __name__ == "__main__":

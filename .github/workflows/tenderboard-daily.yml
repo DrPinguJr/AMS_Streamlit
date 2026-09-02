@@ -2,21 +2,34 @@ name: TenderFlow Daily Scraper
 
 on:
   schedule:
-    # 08:00 UTC daily = 16:00 Singapore time (UTC+8). Adjust if you want a
-    # different local send time.
-    - cron: "0 8 * * *"
+    # GitHub's `schedule` trigger is not guaranteed to fire on time - on
+    # this repo it has been observed firing anywhere from ~1 to ~12 hours
+    # late. So instead of one "0 8 * * *" tick, this fires every 10 minutes
+    # across 08:00-09:50 UTC (16:00-17:50 Singapore time) - whichever tick
+    # actually gets through first does the real work; daily_report.py's
+    # same-day marker file makes every later tick that day a fast no-op
+    # (see _already_sent_today/_mark_sent_today).
+    - cron: "*/10 8-9 * * *"
   workflow_dispatch:
     inputs:
       force_full_report:
         description: >-
           Report every tender currently on the board (not just ones new
-          since the last run). Does not affect the dedupe database used by
-          the daily schedule - use this to preview/verify the digest.
+          since the last run). Does not affect the dedupe database or the
+          daily send-marker used by the schedule - use this to
+          preview/verify the digest.
         type: boolean
         default: false
 
 permissions:
   contents: read
+
+# Ticks are 10 minutes apart but a run can take longer than that (scrape +
+# classify + email). Serialize them so two ticks never scrape/send
+# concurrently and race on the same-day marker file.
+concurrency:
+  group: tenderboard-daily
+  cancel-in-progress: false
 
 jobs:
   scrape-and-email:
