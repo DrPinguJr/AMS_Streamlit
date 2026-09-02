@@ -19,7 +19,7 @@ permissions:
   contents: read
 
 jobs:
-  scrape-and-notify:
+  scrape-and-email:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -51,12 +51,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run daily tender scrape and Slack digest
+      - name: Run daily tender scrape and email digest
         env:
           TENDERBOARD_USERNAME: ${{ secrets.TENDERBOARD_USERNAME }}
           TENDERBOARD_PASSWORD: ${{ secrets.TENDERBOARD_PASSWORD }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_PASS: ${{ secrets.GMAIL_PASS }}
+          RECIPIENT_EMAILS_TEST: ${{ secrets.RECIPIENT_EMAILS_TEST }}
           FORCE_FULL_REPORT: ${{ inputs.force_full_report }}
         run: python "Lance/Tender/daily_report.py"
 

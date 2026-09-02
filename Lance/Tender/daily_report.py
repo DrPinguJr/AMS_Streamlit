@@ -1,18 +1,18 @@
-"""Daily TenderBoard scrape -> Gemini relevance classifier -> Slack digest.
+"""Daily TenderBoard scrape -> Gemini relevance classifier -> email digest.
 
 Runs the existing TenderBoard scraper (`TenderScrape.scrape_tenderboard`),
 keeps only the tenders that are new since the last run, asks Gemini to sort
 them into confirmed / likely / rejected manpower-staffing relevance, and
-posts the full breakdown (all three buckets, nothing dropped) to a Slack
-Workflow Builder webhook. Designed to be triggered daily by
+emails the full breakdown (all three buckets, nothing dropped) via Gmail
+SMTP. Designed to be triggered daily by
 `.github/workflows/tenderboard-daily.yml`, but `main()` also runs fine
 locally (reads a local `.env`, same as the Streamlit page).
 
 Every step degrades gracefully rather than raising past the top: a Gemini
 failure buckets everything as "likely" (fail open, not silent), a missing
 Gemini key does the same. A flaky dependency should never crash the whole
-run before we know whether anything was found. Note: `send_slack_digest`
-still raises on failure, so a broken webhook surfaces as a failed run
+run before we know whether anything was found. Note: `send_email` still
+raises on failure, so a bad credential or address surfaces as a failed run
 (which is the point of the daily job).
 
 Required environment variables (set as GitHub Actions secrets, never
@@ -20,22 +20,21 @@ committed - see the workflow file for the exact secret names):
     TENDERBOARD_USERNAME   - TenderBoard login used by the scraper
     TENDERBOARD_PASSWORD   - TenderBoard login used by the scraper
     GEMINI_API_KEY          - Google GenAI API key
-    SLACK_WEBHOOK_URL       - Slack Workflow Builder webhook trigger URL
-
-The Slack webhook is a Workflow Builder trigger (hooks.slack.com/triggers/...),
-not a classic Incoming Webhook, so the POST body must match the workflow's
-own input variable name rather than the classic `{"text": ...}` shape. This
-workflow's trigger expects a single variable called `message`.
+    GMAIL_USER              - Sender Gmail address
+    GMAIL_PASS              - Gmail App Password (NOT the account password -
+                               see https://support.google.com/accounts/answer/185833)
+    RECIPIENT_EMAILS_TEST   - Comma-separated recipient address(es)
 """
 
 from __future__ import annotations
 
 import json
 import os
+import smtplib
 from dataclasses import dataclass
+from email.message import EmailMessage
 
 import pandas as pd
-import requests
 
 try:
     from TenderScrape import load_local_env, log, scrape_tenderboard
@@ -174,33 +173,24 @@ def classify_tenders(tenders: list[DigestTender]) -> dict[str, list[DigestTender
     return result
 
 
-# Slack Workflow Builder's "Send a message to a channel" step has a hard
-# size limit on its message variable (~3000 chars) - blow past it and the
-# whole send fails inside Slack with an "INPUT VALIDATION ERROR", *after*
-# the webhook has already returned 200 to us, so the Python script and the
-# GitHub Actions run both report success while nothing actually lands in
-# Slack. Keep every digest well under that limit.
-_MAX_LISTED_PER_CATEGORY = 12
-_MAX_MESSAGE_CHARS = 2800
+def _format_tender_block(tenders: list[DigestTender]) -> list[str]:
+    """One multi-line block per tender: title, organisation, closing date, link.
 
-
-def _format_tender_lines(tenders: list[DigestTender], *, limit: int) -> list[str]:
-    """One compact line per tender - title as a Slack hyperlink, nothing else.
-
-    Company/closing date are dropped and the list is capped at `limit`
-    entries; a full multi-line block per tender (the old format) is what
-    blew past Slack's message size limit once there were more than a
-    couple dozen tenders.
+    Unlike the old Slack-oriented formatting, email has no practical message
+    size limit, so every tender in the bucket is listed in full rather than
+    capped at a handful of entries.
     """
 
-    shown = tenders[:limit]
     lines: list[str] = []
-    for tender in shown:
-        text = tender.title.replace("|", "-") or "(untitled)"
-        lines.append(f"• <{tender.link}|{text}>" if tender.link else f"• {text}")
-    remaining = len(tenders) - len(shown)
-    if remaining > 0:
-        lines.append(f"…and {remaining} more not shown.")
+    for tender in tenders:
+        lines.append(f"- {tender.title or '(untitled)'}")
+        if tender.company:
+            lines.append(f"  Organisation: {tender.company}")
+        if tender.closing_date:
+            lines.append(f"  Closing: {tender.closing_date}")
+        if tender.link:
+            lines.append(f"  Link: {tender.link}")
+        lines.append("")
     return lines
 
 
@@ -220,57 +210,67 @@ def format_digest_body(
         )
 
     headline = (
-        f"*{total} tender(s) currently on the board.*"
+        f"{total} tender(s) currently on the board."
         if full_snapshot
-        else f"*{total} new tender(s) found today.*"
+        else f"{total} new tender(s) found today."
     )
     lines = [headline, ""]
 
     if confirmed:
-        lines.append(f"✅ *Confirmed ({len(confirmed)})*")
-        lines.extend(_format_tender_lines(confirmed, limit=_MAX_LISTED_PER_CATEGORY))
-        lines.append("")
+        lines.append(f"CONFIRMED ({len(confirmed)})")
+        lines.append("-" * 40)
+        lines.extend(_format_tender_block(confirmed))
 
     if likely:
-        lines.append(f"🟡 *Possibly relevant ({len(likely)})*")
-        lines.extend(_format_tender_lines(likely, limit=_MAX_LISTED_PER_CATEGORY))
-        lines.append("")
+        lines.append(f"POSSIBLY RELEVANT ({len(likely)})")
+        lines.append("-" * 40)
+        lines.extend(_format_tender_block(likely))
 
     if rejected:
         # Rejected tenders are screened out by definition - a count is
-        # enough, and skipping the list saves a lot of space on a
-        # full-snapshot run where this bucket can be hundreds long.
-        lines.append(f"⚪ *Screened out as not relevant: {len(rejected)}*")
+        # enough, and skipping the list keeps the useful buckets from being
+        # buried, especially on a full-snapshot run where this bucket can be
+        # hundreds long.
+        lines.append(f"Screened out as not relevant: {len(rejected)}")
 
     return "\n".join(lines).rstrip()
 
 
-def send_slack_digest(subject: str, body: str) -> None:
-    """Post the digest to the Slack Workflow Builder webhook trigger.
+def send_email(subject: str, body: str) -> None:
+    """Send `body` from GMAIL_USER to every address in RECIPIENT_EMAILS_TEST.
 
-    Unlike a classic Slack Incoming Webhook (which accepts a free-form
-    `{"text": ...}` payload), a Workflow Builder trigger only accepts the
-    exact input variable(s) defined on that trigger - here, a single
-    `message` variable. Raises on a non-2xx response so a broken webhook
-    fails the run instead of silently dropping the digest.
+    Uses an App Password (not the Gmail account password) over STARTTLS, per
+    Google's recommendation for SMTP from scripts/CI:
+    https://support.google.com/accounts/answer/185833
 
-    Belt-and-suspenders length cap: `format_digest_body` already keeps
-    digests compact, but this truncates the final payload too, so a huge
-    message can never again pass Slack's webhook (200 OK) only to fail
-    silently inside the Workflow Builder step with an "INPUT VALIDATION
-    ERROR" that this script never sees.
+    RECIPIENT_EMAILS_TEST is a comma-separated list so the digest can go to
+    more than one address; raises on a bad/empty list or a failed send so a
+    misconfigured credential surfaces as a failed run rather than a silently
+    dropped digest.
     """
 
-    webhook_url = os.environ["SLACK_WEBHOOK_URL"]
-    message = f"{subject}\n\n{body}"
-    if len(message) > _MAX_MESSAGE_CHARS:
-        note = "\n\n…(truncated - see the GitHub Actions run log for the full list)"
-        message = message[: _MAX_MESSAGE_CHARS - len(note)].rstrip() + note
+    sender = os.environ["GMAIL_USER"]
+    app_password = os.environ["GMAIL_PASS"]
+    recipients = [
+        address.strip()
+        for address in os.environ["RECIPIENT_EMAILS_TEST"].split(",")
+        if address.strip()
+    ]
+    if not recipients:
+        raise ValueError("RECIPIENT_EMAILS_TEST is set but contains no valid email address(es).")
 
-    response = requests.post(webhook_url, json={"message": message}, timeout=30)
-    response.raise_for_status()
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = sender
+    message["To"] = ", ".join(recipients)
+    message.set_content(body)
 
-    log("Digest posted to Slack.")
+    with smtplib.SMTP("smtp.gmail.com", 587) as smtp:
+        smtp.starttls()
+        smtp.login(sender, app_password)
+        smtp.send_message(message)
+
+    log(f"Email sent to {', '.join(recipients)}.")
 
 
 def main() -> None:
@@ -295,7 +295,7 @@ def main() -> None:
     subject_prefix = "TenderFlow Full Snapshot" if force_full else "TenderFlow Daily Digest"
     subject = f"{subject_prefix} - {total} {label}"
     body = format_digest_body(categorized, full_snapshot=force_full)
-    send_slack_digest(subject, body)
+    send_email(subject, body)
 
 
 if __name__ == "__main__":
