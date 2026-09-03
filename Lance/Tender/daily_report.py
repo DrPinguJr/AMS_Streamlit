@@ -384,7 +384,7 @@ def main() -> None:
 
     total = sum(len(bucket) for bucket in categorized.values())
     label = "tender(s) on the board" if force_full else "new tender(s)"
-    subject_prefix = "TenderFlow Full Snapshot" if force_full else "TenderFlow Daily Digest"
+    subject_prefix = "TenderFlow Full Snapshot" if force_full else "TenderFlow Daily Digest (Tenderboard)"
     subject = f"{subject_prefix} - {total} {label}"
     body = format_digest_body(categorized, full_snapshot=force_full)
     send_email(subject, body)
