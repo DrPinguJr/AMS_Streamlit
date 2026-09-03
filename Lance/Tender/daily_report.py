@@ -41,6 +41,7 @@ from __future__ import annotations
 import json
 import os
 import smtplib
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -69,6 +70,13 @@ _SENT_MARKER_PATH = DATABASE_PATH.parent / ".last_sent_date"
 # gemini-3.6-flash) - every run since then silently fell back to bucketing
 # every tender as "likely" instead of actually classifying them.
 GEMINI_MODEL_NAME = "gemini-3.6-flash"
+
+# Gemini intermittently returns a transient 503 ("high demand... try again
+# later") - confirmed by re-running the exact same request a few seconds
+# apart and getting a mix of success and 503. A handful of short retries is
+# usually enough to ride that out.
+_GEMINI_MAX_ATTEMPTS = 3
+_GEMINI_RETRY_DELAY_SECONDS = 15
 
 _SYSTEM_INSTRUCTION = (
     "You are screening daily tender titles for a manpower/staffing agency "
@@ -163,19 +171,38 @@ def classify_tenders(tenders: list[DigestTender]) -> dict[str, list[DigestTender
 
     by_title = {tender.title: tender for tender in tenders}
     titles = [tender.title for tender in tenders]
-    try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=GEMINI_MODEL_NAME,
-            contents=f"Tender titles: {json.dumps(titles)}",
-            config=types.GenerateContentConfig(
-                system_instruction=_SYSTEM_INSTRUCTION,
-                response_mime_type="application/json",
-            ),
+    client = genai.Client(api_key=api_key)
+
+    # Gemini returns a transient 503 ("high demand... try again later") often
+    # enough that hitting it once used to blank out the whole day's
+    # classification - the marker file (see _mark_sent_today) means there is
+    # only one real attempt per day now, so a short retry here is what
+    # actually stands between a blip and a fully unfiltered digest.
+    classifications = None
+    last_exc: Exception | None = None
+    for attempt in range(1, _GEMINI_MAX_ATTEMPTS + 1):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL_NAME,
+                contents=f"Tender titles: {json.dumps(titles)}",
+                config=types.GenerateContentConfig(
+                    system_instruction=_SYSTEM_INSTRUCTION,
+                    response_mime_type="application/json",
+                ),
+            )
+            classifications = json.loads(response.text)
+            break
+        except Exception as exc:  # noqa: BLE001 - any provider/network failure degrades gracefully
+            last_exc = exc
+            log(f"Gemini relevance classification attempt {attempt} failed ({exc}).")
+            if attempt < _GEMINI_MAX_ATTEMPTS:
+                time.sleep(_GEMINI_RETRY_DELAY_SECONDS)
+
+    if classifications is None:
+        log(
+            f"Gemini relevance classification failed after {_GEMINI_MAX_ATTEMPTS} attempts "
+            f"({last_exc}); keeping all tenders as likely."
         )
-        classifications = json.loads(response.text)
-    except Exception as exc:  # noqa: BLE001 - any provider/network failure degrades gracefully
-        log(f"Gemini relevance classification failed ({exc}); keeping all tenders as likely.")
         return {**empty, "likely": list(tenders)}
 
     result: dict[str, list[DigestTender]] = {category: [] for category in _CATEGORIES}
