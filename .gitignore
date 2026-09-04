@@ -9,6 +9,9 @@
 **/__pycache__/
 *.py[cod]
 
+# macOS Finder metadata.
+.DS_Store
+
 tenderboard_results.csv
 Lance/Tender/Excel Sheets/*.csv
 Lance/Tender/Excel Sheets/*.xlsx
