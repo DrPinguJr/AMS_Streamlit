@@ -1,10 +1,13 @@
 """Daily TenderBoard scrape -> Gemini relevance classifier -> email digest.
 
 Runs the existing TenderBoard scraper (`TenderScrape.scrape_tenderboard`),
-keeps only the tenders that are new since the last run, asks Gemini to sort
-them into confirmed / likely / rejected manpower-staffing relevance, and
-emails the full breakdown (all three buckets, nothing dropped) via Gmail
-SMTP. Designed to be triggered daily by
+keeps only the tenders that are new since the last run, drops any MOE
+(Ministry of Education) tenders outright (AMS doesn't pursue those, so
+they're ignored before Gemini ever sees them), asks Gemini to sort the rest
+into confirmed / likely / rejected manpower-staffing relevance (with a
+short reason why AMS is a good fit on each confirmed/likely tender), and
+emails the full breakdown (all three buckets, nothing else dropped) via
+Gmail SMTP. Designed to be triggered daily by
 `.github/workflows/tenderboard-daily.yml`, but `main()` also runs fine
 locally (reads a local `.env`, same as the Streamlit page).
 
@@ -40,9 +43,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import smtplib
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 
@@ -79,10 +83,10 @@ _GEMINI_MAX_ATTEMPTS = 3
 _GEMINI_RETRY_DELAY_SECONDS = 15
 
 _SYSTEM_INSTRUCTION = (
-    "You are screening daily tender titles for a manpower/staffing agency "
-    "(temp staffing, recruitment, outsourced labour, and facilities/security/"
-    "cleaning/healthcare manpower and HR services contracts). Classify EVERY "
-    "title in the input into exactly one category:\n"
+    "You are screening daily tender titles for AMS, a manpower/staffing "
+    "agency (temp staffing, recruitment, outsourced labour, and facilities/"
+    "security/cleaning/healthcare manpower and HR services contracts). "
+    "Classify EVERY title in the input into exactly one category:\n"
     '  "confirmed" - clearly a manpower/staffing/recruitment/outsourced-labour '
     "contract, or facilities/security/cleaning/healthcare manpower and HR "
     "services.\n"
@@ -91,12 +95,22 @@ _SYSTEM_INSTRUCTION = (
     "contract that may include manpower).\n"
     '  "rejected" - clearly unrelated (e.g. construction works, IT hardware, '
     "pure goods supply).\n"
+    'For every "confirmed" or "likely" title, also give a "reason": one short '
+    "sentence on why AMS is a good fit for it. Use \"\" for \"reason\" on "
+    '"rejected" titles.\n'
     "Return ONLY a JSON array of objects, one per input title, each with the "
-    'exact keys "title" (unchanged from the input) and "category" (one of '
-    '"confirmed", "likely", "rejected"). Include every input title exactly once.'
+    'exact keys "title" (unchanged from the input), "category" (one of '
+    '"confirmed", "likely", "rejected"), and "reason" (as above). Include '
+    "every input title exactly once."
 )
 
 _CATEGORIES = ("confirmed", "likely", "rejected")
+
+# Word-boundary match so this only fires on an actual "MOE" token (e.g. the
+# Ministry of Education, or a listing that names it as a standalone word)
+# and not on unrelated words that merely contain the letters, like
+# "homeowner" or "moellendorf".
+_MOE_PATTERN = re.compile(r"\bmoe\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -106,6 +120,7 @@ class DigestTender:
     published_date: str
     closing_date: str
     company: str
+    reason: str = ""
 
 
 def scrape_tenders(headless: bool = True, force_full: bool = False) -> list[DigestTender]:
@@ -141,19 +156,37 @@ def scrape_tenders(headless: bool = True, force_full: bool = False) -> list[Dige
     return tenders
 
 
+def _is_moe_tender(tender: DigestTender) -> bool:
+    """True if `tender` is a Ministry of Education (MOE) tender.
+
+    AMS doesn't pursue MOE contracts, so these are dropped before Gemini
+    ever sees them rather than run through relevance classification.
+    """
+
+    return bool(_MOE_PATTERN.search(tender.title) or _MOE_PATTERN.search(tender.company))
+
+
 def classify_tenders(tenders: list[DigestTender]) -> dict[str, list[DigestTender]]:
     """Ask Gemini to sort `tenders` into confirmed / likely / rejected buckets.
 
-    Unlike a simple keep/drop filter, every tender is kept somewhere - the
-    digest reports the full picture (strong matches, borderline ones worth a
-    human glance, and what got screened out) rather than silently dropping
-    anything. Any failure (missing key, missing dependency, malformed
-    response, network error, a title Gemini's response omits) falls back to
-    bucketing the affected tenders as "likely" rather than losing or
-    wrongly rejecting them - a noisier digest beats a lost tender.
+    MOE (Ministry of Education) tenders are filtered out first and ignored
+    outright - never sent to Gemini, never reported in any bucket. Of the
+    remaining tenders, every one is kept somewhere - the digest reports the
+    full picture (strong matches, borderline ones worth a human glance, and
+    what got screened out) rather than silently dropping anything. Any
+    failure (missing key, missing dependency, malformed response, network
+    error, a title Gemini's response omits) falls back to bucketing the
+    affected tenders as "likely" rather than losing or wrongly rejecting
+    them - a noisier digest beats a lost tender.
     """
 
     empty: dict[str, list[DigestTender]] = {category: [] for category in _CATEGORIES}
+
+    moe_count = sum(1 for tender in tenders if _is_moe_tender(tender))
+    if moe_count:
+        log(f"Ignoring {moe_count} MOE tender(s) before Gemini classification.")
+    tenders = [tender for tender in tenders if not _is_moe_tender(tender)]
+
     if not tenders:
         return empty
 
@@ -210,10 +243,11 @@ def classify_tenders(tenders: list[DigestTender]) -> dict[str, list[DigestTender
     for item in classifications:
         title = str(item.get("title", "")).strip()
         category = str(item.get("category", "")).strip().lower()
+        reason = str(item.get("reason", "")).strip()
         tender = by_title.get(title)
         if tender is None or category not in result or title in classified_titles:
             continue
-        result[category].append(tender)
+        result[category].append(replace(tender, reason=reason))
         classified_titles.add(title)
 
     # A malformed or partial Gemini response shouldn't lose tenders - anything
@@ -254,6 +288,8 @@ def _format_tender_block(
             lines.append(f"  Closing: {tender.closing_date}")
         if tender.link:
             lines.append(f"  Link: {tender.link}")
+        if tender.reason:
+            lines.append(f"  Why AMS is a good fit: {tender.reason}")
         lines.append("")
     return lines
 
