@@ -105,6 +105,19 @@ On Linux deployments such as Streamlit Community Cloud, it uses LibreOffice in
 headless mode. DOCX generation remains available even when no PDF converter is
 installed.
 
+**Temporary (2026-09-09):** `packages.txt` (and its `libreoffice` apt
+dependency) is removed because Streamlit Community Cloud's build image has a
+platform-wide apt failure — an expired `bullseye-security` Debian Release file
+breaks the apt step for every app with a `packages.txt`
+(https://discuss.streamlit.io/t/apt-get-fails-on-community-cloud-bullseye-security-release-file-expired-all-apps-with-packages-txt/122420).
+This drops PDF preview in the Contracts generator pages (DOCX generation still
+works) until Streamlit fixes the base image, at which point restore
+`packages.txt` with:
+
+```
+libreoffice
+```
+
 ## Useful Commands
 
 Run with hot reload:
