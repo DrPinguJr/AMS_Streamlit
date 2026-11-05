@@ -53,6 +53,12 @@ service_agreement_generator = st.Page(
     title="Service Agreement",
     icon=":material/contract:",
 )
+bulk_template_generator = st.Page(
+    "Contracts/pages/Bulk_Template_Generator.py",
+    title="Bulk Template Generator",
+    icon=":material/library_books:",
+    url_path="bulk-template-generator",
+)
 rdl_management_studio = st.Page(
     "HR/RDL/app.py",
     title="RDL Management Studio",
@@ -70,7 +76,7 @@ pg = st.navigation(
         "Home": [home],
         "Lance": [tender, sesami, recruitment, converter, whatsapp],
         "Flexar": [bluesg, bluesg_hourly, bluesg_map, whatsapp_request_processor],
-        "Contracts": [cfs_generator, loa_generator, service_agreement_generator],
+        "Contracts": [cfs_generator, loa_generator, service_agreement_generator, bulk_template_generator],
         "HR": [hriq_report_tool, rdl_management_studio],
     }
 )

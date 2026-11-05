@@ -265,12 +265,33 @@ are the concrete hard-coded points to target:
    current `PROJECT_ROOT`-relative hard-coded `Path` constants at the top of
    each generator file.
 
-## 10. Tests
+## 10. Bulk Template Generator (any template)
+
+[pages/Bulk_Template_Generator.py](pages/Bulk_Template_Generator.py) mass-generates PDFs from **any**
+`.docx` under `templates/` (or one uploaded for the session), with no per-template code.
+The three pages above are unchanged.
+
+- [shared/template_lint.py](shared/template_lint.py): `prepare_template()` scans every paragraph
+  (body, tables, text boxes, headers, footers, with split Word runs joined back together) and lists
+  issues: 🔴 broken braces / invalid names / unmatched braces, 🟡 the same field spelled
+  differently (merged), 🔵 renamed or left-unchanged tags. Spellings are merged with
+  `canonical_key()` (`{{4D Number}}` and `{4d Number}}` both become `f_4d_number`). A cleaned copy is
+  built in memory; the original file is never changed. Issues marked "Not an error" are kept
+  as written (valid names keep their own spelling; broken text is printed literally).
+- [generators/dynamic_generator.py](generators/dynamic_generator.py): field types are guessed from
+  names (`*_date`, `*_time`, `*_fee`/`amount`/`salary`, `nric`), with each field set to either one
+  value for the whole batch or one value per row. It renders with docxtpl, checks the output for
+  leftover brace text, and converts to PDF. Template-specific post-processing is registered in
+  `POST_PROCESSORS` (CFS pagination is reused here).
+- To add a new template permanently, commit it into `templates/<Folder>/`.
+
+## 11. Tests
 
 Existing coverage lives in [tests/](../tests/):
 - `test_cfs_generator.py` — context building, docx rendering, pagination.
 - `test_cfs_bulk_pdf.py` — bulk batch behavior, partial failures, zip output.
 - `test_cfs_page_dates.py` — default date behavior in the Streamlit page.
 - `test_pdf_utils.py` — converter detection/selection logic.
+- `test_dynamic_generator.py` — template check, field types, bulk batch, CFS parity, page smoke test.
 
 There is no equivalent test file yet for LOA or Service Agreement generators.

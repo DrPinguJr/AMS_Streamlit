@@ -23,6 +23,7 @@ st.subheader("Contracts")
 st.page_link("Contracts/pages/CFS_Generator.py", label="CFS Contract Generator", icon=":material/description:")
 st.page_link("Contracts/pages/LOA_Generator.py", label="Letter of Appointment", icon=":material/assignment:")
 st.page_link("Contracts/pages/Service_Agreement_Generator.py", label="Service Agreement", icon=":material/contract:")
+st.page_link("Contracts/pages/Bulk_Template_Generator.py", label="Bulk Template Generator", icon=":material/library_books:")
 
 st.subheader("HR")
 
