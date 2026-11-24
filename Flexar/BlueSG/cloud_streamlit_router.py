@@ -52,7 +52,7 @@ def run_bluesg_cloud_app() -> None:
         initial_sidebar_state="expanded",
     )
 
-    require_cloud_access()
+    require_cloud_access(title="BlueSG Route Optimiser")
     _stop_for_preflight_failures()
 
     st.sidebar.caption("BlueSG operations")

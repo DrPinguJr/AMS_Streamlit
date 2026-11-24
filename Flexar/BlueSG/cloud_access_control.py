@@ -40,8 +40,13 @@ def cloud_login_required() -> bool:
     return os.name != "nt" or bool(_read_secret("APP_PASSWORD"))
 
 
-def require_cloud_access() -> None:
-    """Stop the Streamlit run until the configured app password is supplied."""
+def require_cloud_access(title: str = "Antares Workspace") -> None:
+    """Stop the Streamlit run until the configured app password is supplied.
+
+    ``title`` heads the sign-in form. The root app (also embedded in
+    antares-hire's Bulk Contracts page) uses the generic default; the
+    dedicated BlueSG app passes its own.
+    """
 
     if not cloud_login_required():
         return
@@ -61,7 +66,7 @@ def require_cloud_access() -> None:
             st.rerun()
         return
 
-    st.title("BlueSG Route Optimiser")
+    st.title(title)
     st.caption("Enter the shared deployment password to continue.")
     with st.form("bluesg_cloud_sign_in", clear_on_submit=True):
         supplied_password = st.text_input(
